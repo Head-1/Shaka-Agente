@@ -1,0 +1,32 @@
+[package]
+
+name = "shaka-observability"
+
+version.workspace = true
+
+edition.workspace = true
+
+license.workspace = true
+
+rust-version.workspace = true
+
+
+
+[dependencies]
+
+serde_json.workspace = true
+
+shaka-core = { path = "../shaka-core" }
+
+shaka-memory = { path = "../shaka-memory" }
+
+tracing.workspace = true
+
+tracing-subscriber.workspace = true
+
+
+
+[lints]
+
+workspace = true
+
