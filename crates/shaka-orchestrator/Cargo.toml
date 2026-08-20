@@ -23,6 +23,7 @@ url.workspace = true
 uuid = { version = "1.11", features = ["v4", "serde"] }
 
 [dev-dependencies]
+ed25519-dalek.workspace = true
 wat.workspace = true
 
 [lints]
