@@ -15,12 +15,12 @@ Esta release eleva o Shaka de MVP para uma **produção candidata para operaçã
 | Produção | Ambiente `production` exige provedor externo, chave, HTTPS e confirmação explícita para live. |
 | Contratos | `jsonschema` valida entradas de ferramentas, incluindo campos obrigatórios e tipos. |
 | Redaction | Respostas, objetivos e registros de execução removem padrões de API key, token, senha e Bearer. |
-| Auditoria | Eventos são encadeados por hash por tenant e podem ser verificados com `verify-audit`. |
-| Dados | SQLite usa WAL e busy timeout; há integrity check, backup online e restore. |
-| Skills | Catálogo salvo atomicamente; arquivo recebe permissão restrita; aprovação por artefato calcula SHA-256 real. |
+| Auditoria | Eventos são encadeados por hash por tenant; tool calls e falhas de execução também são registrados e podem ser verificados com `verify-audit`. |
+| Dados | SQLite usa WAL e busy timeout; há integrity check, backup online, restore com verificação da origem e backup local com permissão restrita. |
+| Skills | Catálogo salvo atomicamente; arquivo recebe permissão restrita; aprovação por artefato calcula SHA-256 real; somente skills ativas e hash-verificadas entram no runtime WASM. |
 | Sandbox | Wasmtime 47.0.3, sem imports de host, sem WASI, com fuel e interrupção por epoch. |
-| Supply chain | `Cargo.lock` atualizado; `cargo audit` executado sem advisories reportados. |
-| Operação | CLI inclui `doctor`, `backup`, `restore`, `verify-audit` e `config`. |
+| Supply chain | `Cargo.lock` atualizado; `cargo audit`, secret scan e SBOM CycloneDX fazem parte da validação/release. Assinatura de artefatos e pinagem de actions ainda são pendências. |
+| Operação | CLI inclui `doctor`, `backup`, `restore`, `verify-audit` e `config`; execução possui loop multi-turno limitado por passos, chamadas, custo e deadline. |
 | Imagem | Dockerfile compila com lockfile, executa como usuário não-root e possui healthcheck. |
 
 ## Papéis
@@ -93,6 +93,6 @@ Além desses comandos, o responsável precisa validar no ambiente-alvo: injeçã
 
 ## Limitações que continuam bloqueando produção pública
 
-A release não implementa IAM remoto, multi-tenancy distribuído, filas, subagentes, webhooks, mensageria, pesquisa web, SSRF controls de crawler, cofre externo, assinatura de imagem, SBOM publicado, métricas Prometheus, tracing OTLP, backup remoto automatizado ou geração automática de skills com build sandbox completo.
+A release ainda não implementa IAM remoto, multi-tenancy distribuído, filas, subagentes, webhooks, mensageria, pesquisa web, controles SSRF de crawler, cofre externo, assinatura de imagem, métricas Prometheus, tracing OTLP, backup remoto automatizado ou geração automática de skills com pipeline completo de build/teste sandbox. O SBOM local da release e o secret scan já estão implementados; a assinatura e a proveniência verificável ainda exigem infraestrutura adicional.
 
 Esses itens são próximos incrementos, não devem ser simulados por configuração. A ausência deliberada desses adaptadores reduz a superfície de ataque da release atual.

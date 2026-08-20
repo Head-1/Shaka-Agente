@@ -49,7 +49,7 @@ O banco SQLite e o catálogo de skills são criados automaticamente quando a CLI
 A execução padrão usa o modelo local e mantém o agente em modo seguro:
 
 ```bash
-cargo run -- run "Descreva como o Shaka deve tratar uma tarefa" 
+cargo run -- run "Descreva como o Shaka deve tratar uma tarefa"
 ```
 
 Para usar o endpoint OpenAI-compatível, configure a chave somente no ambiente, nunca no código ou no repositório. Em `production`, a configuração também exige `SHAKA_ENVIRONMENT=production`, endpoint HTTPS e auditoria habilitada:

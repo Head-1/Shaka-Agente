@@ -35,6 +35,8 @@ pub struct ApprovalRecord {
     pub operator_id: OperatorId,
     pub approved_at: DateTime<Utc>,
     pub artifact_sha256: String,
+    #[serde(default)]
+    pub artifact_path: Option<PathBuf>,
     pub reason: String,
 }
 
@@ -49,6 +51,18 @@ pub struct SkillRecord {
 #[derive(Debug, Default)]
 pub struct SkillRegistry {
     skills: HashMap<String, SkillRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActiveSkillArtifact {
+    pub name: String,
+    pub version: String,
+    pub description: String,
+    pub permissions: Vec<Capability>,
+    pub input_schema: serde_json::Value,
+    pub output_schema: serde_json::Value,
+    pub artifact_path: PathBuf,
+    pub artifact_sha256: String,
 }
 
 impl SkillRegistry {
@@ -84,8 +98,9 @@ impl SkillRegistry {
         artifact_path: impl AsRef<Path>,
         reason: impl Into<String>,
     ) -> Result<SkillRecord, SkillError> {
-        let actual_sha256 = sha256_file(artifact_path)?;
-        self.approve(name, operator_id, actual_sha256, reason)
+        let canonical_path = artifact_path.as_ref().canonicalize()?;
+        let actual_sha256 = sha256_file(&canonical_path)?;
+        self.approve_with_artifact(name, operator_id, actual_sha256, canonical_path, reason)
     }
 
     pub fn register_candidate(&mut self, manifest: SkillManifest) -> Result<(), SkillError> {
@@ -156,6 +171,50 @@ impl SkillRegistry {
             operator_id,
             approved_at: Utc::now(),
             artifact_sha256,
+            artifact_path: None,
+            reason,
+        });
+        record.updated_at = Utc::now();
+        Ok(record.clone())
+    }
+
+    fn approve_with_artifact(
+        &mut self,
+        name: &str,
+        operator_id: OperatorId,
+        artifact_sha256: String,
+        artifact_path: PathBuf,
+        reason: impl Into<String>,
+    ) -> Result<SkillRecord, SkillError> {
+        let record = self
+            .skills
+            .get_mut(name)
+            .ok_or_else(|| SkillError::NotFound(name.to_owned()))?;
+        if record.manifest.status != SkillStatus::Candidate {
+            return Err(SkillError::InvalidTransition {
+                from: record.manifest.status.clone(),
+                to: SkillStatus::Active,
+            });
+        }
+        if artifact_sha256.len() != 64 || !artifact_sha256.chars().all(|ch| ch.is_ascii_hexdigit())
+        {
+            return Err(SkillError::InvalidApproval(
+                "artifact_sha256 deve conter 64 caracteres hexadecimais".to_owned(),
+            ));
+        }
+        let reason = reason.into();
+        if reason.trim().is_empty() {
+            return Err(SkillError::InvalidApproval(
+                "a aprovação precisa registrar uma justificativa".to_owned(),
+            ));
+        }
+        record.manifest.status = SkillStatus::Active;
+        record.manifest.artifact_sha256 = Some(artifact_sha256.clone());
+        record.approval = Some(ApprovalRecord {
+            operator_id,
+            approved_at: Utc::now(),
+            artifact_sha256,
+            artifact_path: Some(artifact_path),
             reason,
         });
         record.updated_at = Utc::now();
@@ -190,9 +249,32 @@ impl SkillRegistry {
             .filter(|record| record.manifest.status == SkillStatus::Active)
             .collect()
     }
+
+    #[must_use]
+    pub fn active_artifacts(&self) -> Vec<ActiveSkillArtifact> {
+        self.skills
+            .values()
+            .filter(|record| record.manifest.status == SkillStatus::Active)
+            .filter_map(|record| {
+                let approval = record.approval.as_ref()?;
+                let artifact_path = approval.artifact_path.clone()?;
+                let artifact_sha256 = record.manifest.artifact_sha256.clone()?;
+                Some(ActiveSkillArtifact {
+                    name: record.manifest.name.clone(),
+                    version: record.manifest.version.clone(),
+                    description: record.manifest.description.clone(),
+                    permissions: record.manifest.permissions.clone(),
+                    input_schema: record.manifest.input_schema.clone(),
+                    output_schema: record.manifest.output_schema.clone(),
+                    artifact_path,
+                    artifact_sha256,
+                })
+            })
+            .collect()
+    }
 }
 
-fn sha256_file(path: impl AsRef<Path>) -> Result<String, SkillError> {
+pub fn sha256_file(path: impl AsRef<Path>) -> Result<String, SkillError> {
     let mut file = File::open(path)?;
     let mut digest = Sha256::new();
     let mut buffer = [0_u8; 8192];
@@ -258,5 +340,26 @@ mod tests {
         registry.register_candidate(candidate()).unwrap();
         let operator = OperatorId::new("operator").unwrap();
         assert!(registry.approve("demo", operator, "bad", "ok").is_err());
+    }
+
+    #[test]
+    fn artifact_approval_exposes_verified_artifact() {
+        let mut registry = SkillRegistry::default();
+        registry.register_candidate(candidate()).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "shaka-skill-{}-{}.wasm",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::write(&path, b"wasm-fixture").unwrap();
+        let operator = OperatorId::new("reviewer").unwrap();
+        registry
+            .approve_artifact("demo", operator, &path, "artefato testado")
+            .unwrap();
+        let artifacts = registry.active_artifacts();
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].artifact_path, path.canonicalize().unwrap());
+        assert_eq!(artifacts[0].artifact_sha256, sha256_file(&path).unwrap());
+        let _ = std::fs::remove_file(path);
     }
 }

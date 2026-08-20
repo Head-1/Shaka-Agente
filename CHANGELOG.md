@@ -15,6 +15,21 @@ Todas as mudanças relevantes do Shaka serão registradas neste arquivo. O forma
 - IAM remoto, ABAC, cofre de segredos, multi-tenancy forte e métricas exportáveis.
 - Backup remoto automatizado, migrações formais, RPO/RTO e testes de recuperação em infraestrutura-alvo.
 
+## [0.3.0] - 2026-08-20
+
+### Adicionado
+
+- Loop multi-turno limitado por orçamento de passos, deadline global e timeout por ferramenta.
+- Auditoria de tool calls, falhas do modelo e resultados sanitizados, com revalidação de capabilities em cada chamada.
+- Execução de skills WASM somente após aprovação por hash SHA-256, validação de schema e verificação do artefato ativo.
+- Secret scan determinístico, SBOM CycloneDX, checksums de release, smoke test executado via `bash` e container runtime não-root.
+- Backup/restore com verificação de integridade e permissões restritas no Unix.
+
+### Segurança
+
+- Skills revogadas são excluídas do conjunto executável mesmo que permaneçam no histórico de aprovação.
+- O sandbox continua sem WASI, rede, filesystem ou imports do host; IAM remoto, assinatura criptográfica e observabilidade externa permanecem pendentes.
+
 ## [0.2.0] - 2026-08-20
 
 ### Adicionado

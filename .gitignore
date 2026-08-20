@@ -6,3 +6,9 @@
 .env.*
 !.env.example
 *.log
+
+# Notas locais de acompanhamento e deploy
+GITHUB_*.md
+REMOTE_*.md
+ci_*.md
+CI_STATUS_*.md

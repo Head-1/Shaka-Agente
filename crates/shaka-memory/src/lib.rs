@@ -66,6 +66,16 @@ pub struct MemoryStore {
     connection: parking_lot::Mutex<Connection>,
 }
 
+fn restrict_file_permissions(path: impl AsRef<Path>) -> Result<(), MemoryError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| MemoryError::Io(error.to_string()))?;
+    }
+    Ok(())
+}
+
 impl MemoryStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, MemoryError> {
         let connection = Connection::open(path)?;
@@ -374,10 +384,23 @@ impl MemoryStore {
         let mut target = Connection::open(destination)?;
         let backup = Backup::new(&source, &mut target)?;
         backup.run_to_completion(100, StdDuration::from_millis(25), None)?;
+        restrict_file_permissions(destination)?;
         Ok(())
     }
 
+    pub fn verify_integrity_at(path: impl AsRef<Path>) -> Result<bool, MemoryError> {
+        let connection = Connection::open(path)?;
+        let result: String =
+            connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+        Ok(result.eq_ignore_ascii_case("ok"))
+    }
+
     pub fn restore_from(&self, source_path: impl AsRef<Path>) -> Result<(), MemoryError> {
+        if !Self::verify_integrity_at(&source_path)? {
+            return Err(MemoryError::Io(
+                "integridade do backup de origem falhou".to_owned(),
+            ));
+        }
         let source = Connection::open(source_path)?;
         let mut target = self.connection.lock();
         let backup = Backup::new(&source, &mut target)?;

@@ -6,12 +6,14 @@ use clap::{Args, Parser, Subcommand};
 use serde_json::{Value, json};
 use shaka_config::{AppConfig, ModelProvider};
 use shaka_core::{
-    Action, AuditEvent, Capability, CapabilitySet, Principal, SkillManifest, SkillStatus,
+    Action, AuditEvent, Capability, CapabilitySet, Principal, Role, SkillManifest, SkillStatus,
     TaskEnvelope,
 };
 use shaka_memory::MemoryStore;
 use shaka_observability::init_tracing;
-use shaka_orchestrator::{AgentRuntime, EchoTool, LocalModel, OpenAiCompatibleModel, ToolRegistry};
+use shaka_orchestrator::{
+    AgentRuntime, EchoTool, LocalModel, OpenAiCompatibleModel, ToolRegistry, WasmSkillTool,
+};
 use shaka_sandbox::{SandboxPolicy, WasmExecutor};
 use shaka_skills::SkillRegistry;
 use std::{
@@ -210,12 +212,28 @@ async fn run_agent(cli: &Cli, args: &RunArgs) -> Result<()> {
             )?)
         }
     };
-    let mut tools = ToolRegistry::with_capabilities(CapabilitySet(vec![Capability::MemoryWrite]));
+    let mut tools = build_tool_registry(&config)?;
     tools.register(Arc::new(EchoTool))?;
     let runtime = AgentRuntime::new(model, memory, tools);
     let result = runtime.run(envelope).await?;
     println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
+}
+
+fn build_tool_registry(config: &AppConfig) -> Result<ToolRegistry> {
+    let mut capabilities = vec![Capability::MemoryWrite];
+    if matches!(&config.principal.role, Role::Administrator) {
+        capabilities.push(Capability::CodeExecution);
+    }
+    let mut tools = ToolRegistry::with_capabilities(CapabilitySet(capabilities));
+    let registry = SkillRegistry::load(&config.skills_file)?;
+    for artifact in registry.active_artifacts() {
+        let skill_name = artifact.name.clone();
+        let tool = WasmSkillTool::from_approved_artifact(artifact)
+            .with_context(|| format!("carregando skill ativa {skill_name}"))?;
+        tools.register(Arc::new(tool))?;
+    }
+    Ok(tools)
 }
 
 fn memory_command(cli: &Cli, args: &MemoryArgs) -> Result<()> {
