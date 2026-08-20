@@ -43,6 +43,9 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings -A missing_docs -A clippy::missing_errors_doc
 
+      - name: Secret scan
+        run: python3 ./scripts/secret_scan.py
+
       - name: Dependency audit
         run: cargo install cargo-audit --locked && cargo audit
 

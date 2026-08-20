@@ -1,422 +1,159 @@
 name: Shaka Release
 
-
-
 on:
-
   workflow_dispatch:
-  
     inputs:
-    
       publish_container:
-      
         description: "Publicar também a imagem no GitHub Container Registry"
-        
         required: false
-        
         default: true
-        
         type: boolean
-        
   push:
-  
     tags:
-    
       - "v[0-9]+.[0-9]+.[0-9]+"
-      
-
 
 permissions:
-
   contents: write
-  
   packages: write
-  
-
 
 concurrency:
-
   group: shaka-release-${{ github.ref }}
-  
   cancel-in-progress: false
-  
-
 
 jobs:
-
   validate:
-  
     name: Validate and package
-    
     runs-on: ubuntu-latest
-    
     outputs:
-    
       version: ${{ steps.version.outputs.version }}
-      
     steps:
-    
       - name: Checkout
-      
         uses: actions/checkout@v4
-        
         with:
-        
           fetch-depth: 0
-          
-
 
       - name: Install Rust
-      
         uses: dtolnay/rust-toolchain@stable
-        
         with:
-        
           components: rustfmt, clippy
-          
-
 
       - name: Cache Cargo
-      
         uses: actions/cache@v4
-        
         with:
-        
           path: |
-          
             ~/.cargo/registry
-            
             ~/.cargo/git
-            
             target
-            
           key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
-          
           restore-keys: |
-          
             ${{ runner.os }}-cargo-release-
-            
             ${{ runner.os }}-cargo-
-            
-
 
       - name: Read package version
-      
         id: version
-        
         shell: bash
-        
         run: |
-        
           version="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
-          
           echo "version=${version}" >> "$GITHUB_OUTPUT"
-          
           if [[ "$GITHUB_REF_TYPE" == "tag" && "$GITHUB_REF_NAME" != "v${version}" ]]; then
-          
             echo "Tag $GITHUB_REF_NAME does not match package version v${version}" >&2
-            
             exit 1
-            
           fi
-          
-
 
       - name: Format check
-      
         run: cargo fmt --all -- --check
-        
-
 
       - name: Compile workspace
-      
         run: cargo check --workspace
-        
-
 
       - name: Test workspace
-      
         run: cargo test --workspace
-        
-
 
       - name: Clippy
-      
         run: cargo clippy --workspace --all-targets -- -D warnings -A missing_docs -A clippy::missing_errors_doc
-        
 
+      - name: Secret scan
+        run: python3 ./scripts/secret_scan.py
 
       - name: Dependency audit
-      
         run: |
-        
           cargo install cargo-audit --locked
-          
           cargo audit
-          
-
 
       - name: Production smoke test
-      
-        run: ./scripts/production_smoke.sh
-        
-
+        run: bash ./scripts/production_smoke.sh
 
       - name: Build release binary
-      
         run: cargo build --release --locked -p shaka-cli
-        
 
+      - name: Generate SBOM
+        shell: bash
+        run: |
+          mkdir -p dist
+          cargo metadata --locked --format-version 1 > dist/cargo-metadata.json
+          python3 ./scripts/generate_sbom.py dist/cargo-metadata.json dist/shaka.cdx.json
+          rm dist/cargo-metadata.json
 
       - name: Package release assets
-      
         shell: bash
-        
         run: |
-        
-          rm -rf dist
-          
           mkdir -p dist
-          
           cp target/release/shaka dist/shaka-linux-x86_64
-          
-          sha256sum dist/shaka-linux-x86_64 > dist/SHA256SUMS
-          
-          tar -C dist -czf "dist/shaka-${GITHUB_REF_NAME:-v${{ steps.version.outputs.version }}}-linux-x86_64.tar.gz" shaka-linux-x86_64 SHA256SUMS
-          
-          (cd dist && zip -q "shaka-${GITHUB_REF_NAME:-v${{ steps.version.outputs.version }}}-linux-x86_64.zip" shaka-linux-x86_64 SHA256SUMS)
-          
-
+          sha256sum dist/shaka-linux-x86_64 dist/shaka.cdx.json > dist/SHA256SUMS
+          tar -C dist -czf "dist/shaka-${GITHUB_REF_NAME:-v${{ steps.version.outputs.version }}}-linux-x86_64.tar.gz" shaka-linux-x86_64 shaka.cdx.json SHA256SUMS
+          (cd dist && zip -q "shaka-${GITHUB_REF_NAME:-v${{ steps.version.outputs.version }}}-linux-x86_64.zip" shaka-linux-x86_64 shaka.cdx.json SHA256SUMS)
 
       - name: Upload workflow artifacts
-      
         uses: actions/upload-artifact@v4
-        
         with:
-        
           name: shaka-${{ steps.version.outputs.version }}-release-assets
-          
           path: dist/*
-          
           if-no-files-found: error
-          
-
 
       - name: Create or update GitHub Release
-      
         if: github.ref_type == 'tag'
-        
         env:
-        
           GH_TOKEN: ${{ github.token }}
-          
         run: |
-        
           if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-          
             gh release upload "$GITHUB_REF_NAME" dist/* \
-            
               --repo "$GITHUB_REPOSITORY" \
-              
               --clobber
-              
           else
-          
             if ! gh release create "$GITHUB_REF_NAME" dist/* \
-            
               --repo "$GITHUB_REPOSITORY" \
-              
               --title "Shaka $GITHUB_REF_NAME" \
-              
               --generate-notes; then
-              
               gh release upload "$GITHUB_REF_NAME" dist/* \
-              
                 --repo "$GITHUB_REPOSITORY" \
-                
                 --clobber
-                
             fi
-            
           fi
-          
-
 
   publish-container:
-  
     name: Publish container to GHCR
-    
     needs: validate
-    
     if: >-
-    
       github.ref_type == 'tag' ||
-      
       (github.event_name == 'workflow_dispatch' && inputs.publish_container == true)
-      
     runs-on: ubuntu-latest
-    
     steps:
-    
       - name: Checkout
-      
         uses: actions/checkout@v4
-        
-
 
       - name: Log in to GHCR
-      
         env:
-        
           GH_TOKEN: ${{ github.token }}
-          
         run: echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
-        
-
 
       - name: Build and push image
-      
         shell: bash
-        
         run: |
-        
           image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/shaka-agente:${GITHUB_REF_NAME:-latest}"
-          
           docker build --pull --tag "$image" .
-          
           docker push "$image"
-          
           if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
-          
             latest="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/shaka-agente:latest"
-            
             docker tag "$image" "$latest"
-            
             docker push "$latest"
-            
           fi
-          
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
