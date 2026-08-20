@@ -1,48 +1,29 @@
 [package]
-
 name = "shaka-orchestrator"
-
 version.workspace = true
-
 edition.workspace = true
-
 license.workspace = true
-
 rust-version.workspace = true
 
-
-
 [dependencies]
-
 async-trait.workspace = true
-
 chrono.workspace = true
-
+jsonschema.workspace = true
 reqwest.workspace = true
-
 serde.workspace = true
-
 serde_json.workspace = true
-
 shaka-core = { path = "../shaka-core" }
-
 shaka-memory = { path = "../shaka-memory" }
-
+shaka-sandbox = { path = "../shaka-sandbox" }
 shaka-skills = { path = "../shaka-skills" }
-
 thiserror.workspace = true
-
 tokio.workspace = true
-
 tracing.workspace = true
-
 url.workspace = true
-
 uuid = { version = "1.11", features = ["v4", "serde"] }
 
-
+[dev-dependencies]
+wat.workspace = true
 
 [lints]
-
 workspace = true
-
