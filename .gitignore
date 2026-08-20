@@ -1,0 +1,8 @@
+/target/
+/data/*.db
+/data/*.db-*
+/data/skills.json
+.env
+.env.*
+!.env.example
+*.log
