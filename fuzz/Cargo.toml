@@ -1,0 +1,23 @@
+[package]
+name = "shaka-fuzz"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+ed25519-dalek = "2.1"
+shaka-skills = { path = "../crates/shaka-skills" }
+shaka-core = { path = "../crates/shaka-core" }
+
+[[bin]]
+name = "approval_registry"
+path = "fuzz_targets/approval_registry.rs"
+test = false
+doc = false
+bench = false
