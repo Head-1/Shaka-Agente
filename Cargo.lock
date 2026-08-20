@@ -2256,17 +2256,20 @@ version = "0.2.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "jsonschema",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
  "shaka-core",
  "shaka-memory",
+ "shaka-sandbox",
  "shaka-skills",
  "thiserror",
  "tokio",
  "tracing",
  "url",
  "uuid",
+ "wat",
 ]
 
 [[package]]

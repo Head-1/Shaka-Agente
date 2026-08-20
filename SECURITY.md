@@ -100,7 +100,7 @@ Memória episódica pode conter conversas, objetivos e resultados. A implantaç�
 
 ## 7. Supply chain
 
-Antes de produção, a CI deve executar lockfile imutável, `cargo audit`, geração de SBOM, revisão de dependências, verificação de origem e assinatura de artefatos. O build de código gerado deve ocorrer sem credenciais, idealmente offline ou com allowlist de dependências e fontes.
+A CI executa com lockfile, `cargo audit`, secret scan e geração de SBOM CycloneDX no workflow de release. O build de código gerado deve ocorrer sem credenciais, idealmente offline ou com allowlist de dependências e fontes. Permanecem como próximos controles a assinatura/verificação criptográfica dos artefatos, pinagem das actions por commit, revisão de licenças, imagem referenciada por digest e publicação de evidência de proveniência.
 
 ## 8. Resposta a incidente
 

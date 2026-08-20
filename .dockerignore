@@ -1,0 +1,26 @@
+# Build and VCS state
+target/
+.git/
+.gitignore
+
+# Local state and credentials
+data/
+backups/
+.env
+.env.*
+!.env.example
+*.db
+*.db-*
+*.log
+
+# Local-only notes and generated reports
+GITHUB_*.md
+REMOTE_*.md
+ci_*.md
+ROADMAP_*.md
+
+# Development and documentation payload not required by the runtime image
+docs/
+examples/
+tests/
+*.md

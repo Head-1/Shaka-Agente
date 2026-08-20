@@ -74,6 +74,7 @@ Uma chamada proposta pelo modelo não é uma autorização. O host verifica cat�
   "system": "política do host",
   "user": "objetivo da tarefa",
   "tools": [],
+  "prior_tool_results": [],
   "max_output_tokens": 1024
 }
 ```
@@ -91,7 +92,7 @@ Uma chamada proposta pelo modelo não é uma autorização. O host verifica cat�
 }
 ```
 
-Argumentos malformados devem produzir erro antes da execução. O modelo não pode indicar capabilities na resposta como forma de concedê-las.
+Argumentos malformados devem produzir erro antes da execução. O modelo não pode indicar capabilities na resposta como forma de concedê-las. O runtime pode repetir o ciclo até `max_steps`; em cada ciclo, `max_tool_calls`, `max_elapsed_ms` e `max_cost_microunits` são reavaliados cumulativamente. `prior_tool_results` contém somente resultados redigidos e limitados pelo host.
 
 ## 6. SkillManifest
 
@@ -108,7 +109,7 @@ Argumentos malformados devem produzir erro antes da execução. O modelo não po
 }
 ```
 
-`status` pode ser `Specified`, `Generated`, `Tested`, `Candidate`, `Active`, `Deprecated` ou `Revoked`. Somente `Candidate` pode ser promovido mediante aprovação. A aprovação pode calcular o SHA-256 diretamente do arquivo do artefato. O catálogo é persistido atomicamente, mas o runtime não executa automaticamente o artefato associado.
+`status` pode ser `Specified`, `Generated`, `Tested`, `Candidate`, `Active`, `Deprecated` ou `Revoked`. Somente `Candidate` pode ser promovido mediante aprovação. A aprovação pode calcular o SHA-256 diretamente do arquivo do artefato. Uma skill só entra no runtime quando está `Active`, possui caminho canônico persistido por aprovação de artefato e o SHA-256 é recalculado antes do registro. Skills revogadas, hashes manuais sem arquivo verificável e artefatos alterados ficam fora do registro executável.
 
 ## 7. Aprovação de skill
 
@@ -117,11 +118,12 @@ Argumentos malformados devem produzir erro antes da execução. O modelo não po
   "operator_id": "operator",
   "approved_at": "2026-08-20T00:00:00Z",
   "artifact_sha256": "64-caracteres-hexadecimais",
+  "artifact_path": "/caminho/canonico/skill.wasm",
   "reason": "justificativa da aprovação"
 }
 ```
 
-A string de hash precisa conter exatamente 64 caracteres hexadecimais. A justificativa não pode ser vazia.
+A string de hash precisa conter exatamente 64 caracteres hexadecimais. A justificativa não pode ser vazia. `artifact_path` é opcional para aprovações legadas por hash; sem um caminho verificável, a skill permanece no catálogo, mas não é registrada para execução.
 
 ## 8. EpisodicRecord
 
@@ -169,7 +171,7 @@ Os papéis são `operator`, `reviewer` e `administrator`. A autorização é dec
 
 ## 11. Auditoria, backup e operação
 
-`AuditEvent` inclui `tenant_id`, ator, ação, outcome, metadados, `previous_hash` e `event_hash`. O `MemoryStore` reencadeia o evento por tenant e `verify_audit_chain` valida elo anterior, tenant e hash do conteúdo.
+`AuditEvent` inclui `tenant_id`, ator, ação, outcome, metadados, `previous_hash` e `event_hash`. Cada execução de ferramenta gera um evento `tool.execute`; falhas de modelo, orçamento e deadline geram um episódio e um evento `agent.run` com outcome `failure`. O `MemoryStore` reencadeia o evento por tenant e `verify_audit_chain` valida elo anterior, tenant e hash do conteúdo.
 
 A CLI oferece `doctor`, `backup`, `restore`, `verify-audit` e `config`. Backup usa a API online do SQLite; restore deve ser executado por administrador e seguido de integrity check.
 
