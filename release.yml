@@ -100,15 +100,25 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-      - name: Create GitHub Release
+      - name: Create or update GitHub Release
         if: github.ref_type == 'tag'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/* \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "Shaka $GITHUB_REF_NAME" \
-            --generate-notes
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+          else
+            if ! gh release create "$GITHUB_REF_NAME" dist/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Shaka $GITHUB_REF_NAME" \
+              --generate-notes; then
+              gh release upload "$GITHUB_REF_NAME" dist/* \
+                --repo "$GITHUB_REPOSITORY" \
+                --clobber
+            fi
+          fi
 
   publish-container:
     name: Publish container to GHCR
