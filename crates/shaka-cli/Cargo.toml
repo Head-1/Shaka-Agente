@@ -1,0 +1,60 @@
+[package]
+
+name = "shaka-cli"
+
+version.workspace = true
+
+edition.workspace = true
+
+license.workspace = true
+
+rust-version.workspace = true
+
+
+
+[[bin]]
+
+name = "shaka"
+
+path = "src/main.rs"
+
+
+
+[dependencies]
+
+anyhow.workspace = true
+
+chrono.workspace = true
+
+clap.workspace = true
+
+serde_json.workspace = true
+
+shaka-config = { path = "../shaka-config" }
+
+shaka-core = { path = "../shaka-core" }
+
+shaka-memory = { path = "../shaka-memory" }
+
+shaka-observability = { path = "../shaka-observability" }
+
+shaka-sandbox = { path = "../shaka-sandbox" }
+
+shaka-orchestrator = { path = "../shaka-orchestrator" }
+
+shaka-skills = { path = "../shaka-skills" }
+
+tokio.workspace = true
+
+tracing.workspace = true
+
+url.workspace = true
+
+wat.workspace = true
+
+
+
+[lints]
+
+workspace = true
+
