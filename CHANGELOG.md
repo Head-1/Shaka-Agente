@@ -9,11 +9,27 @@ Todas as mudanças relevantes do Shaka serão registradas neste arquivo. O forma
 - Busca semântica com embeddings e recuperação híbrida.
 - Subagentes paralelos com DAG, orçamento por filho, cancelamento e falha parcial.
 - Build sandbox separado para código gerado e verificação de dependências.
-- Assinatura e verificação criptográfica de artefatos WASM.
 - Adaptadores de mensageria com autenticação de webhook e idempotência.
 - Pesquisa web com conteúdo marcado como não confiável e mitigação de SSRF.
 - IAM remoto, ABAC, cofre de segredos, multi-tenancy forte e métricas exportáveis.
 - Backup remoto automatizado, migrações formais, RPO/RTO e testes de recuperação em infraestrutura-alvo.
+
+## [0.4.0] - 2026-08-20
+
+### Adicionado
+
+- Aprovações de skills WASM assinadas com Ed25519, usando atestação canônica vinculada ao hash SHA-256 exato do artefato.
+- `TrustStore` persistente com inclusão, revogação, verificação fail-closed, gravação atômica e permissões restritas no Unix.
+- Comandos CLI `skill trust-generate`, `skill trust-add`, `skill trust-revoke` e `skill trust-list`.
+- Fluxo `skill approve` com `--key-id` e `--signing-key-file` obrigatórios para aprovações executáveis; aprovações legadas permanecem somente para compatibilidade histórica.
+- `WasmSkillTool` revalida hash e assinatura antes de instanciar qualquer módulo WASM.
+
+### Segurança e supply chain
+
+- Todos os gates Cargo da CI usam `--locked`, o toolchain está fixado e a política de workflows valida referências, permissões e invariantes de supply chain.
+- Release preparada para attestations OIDC de binários, SBOM e imagens de container por `actions/attest@v4`, com execução condicionada à visibilidade pública do repositório.
+- Dependabot configurado para atualizações semanais de dependências Cargo e GitHub Actions.
+- Harness de fuzzing para verificação adversarial de atestações Ed25519, executado manualmente com nightly Rust datada e limite de tempo.
 
 ## [0.3.0] - 2026-08-20
 

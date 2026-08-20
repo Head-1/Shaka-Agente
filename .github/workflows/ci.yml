@@ -14,40 +14,35 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.98.0
         with:
           components: rustfmt, clippy
-
-      - name: Cache Cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
 
       - name: Format
         run: cargo fmt --all -- --check
 
       - name: Check
-        run: cargo check --workspace
+        run: cargo check --workspace --locked
 
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings -A missing_docs -A clippy::missing_errors_doc
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings -A missing_docs -A clippy::missing_errors_doc
 
       - name: Secret scan
         run: python3 ./scripts/secret_scan.py
 
+      - name: Workflow policy
+        run: python3 ./scripts/workflow_policy_check.py
+
       - name: Dependency audit
-        run: cargo install cargo-audit --locked && cargo audit
+        run: cargo install cargo-audit --version 0.22.2 --locked && cargo audit
+
 
       - name: Production smoke test
         run: bash ./scripts/production_smoke.sh

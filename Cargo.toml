@@ -14,7 +14,7 @@ members = [
 [workspace.package]
 edition = "2024"
 license = "Apache-2.0"
-version = "0.3.0"
+version = "0.4.0"
 authors = ["Shaka Contributors"]
 rust-version = "1.85"
 
@@ -22,6 +22,7 @@ rust-version = "1.85"
 anyhow = "1.0"
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde", "clock"] }
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 hex = "0.4"
 jsonschema = "0.49.9"

@@ -12,3 +12,7 @@ GITHUB_*.md
 REMOTE_*.md
 ci_*.md
 CI_STATUS_*.md
+
+# Artefatos temporários de fuzzing
+fuzz/target/
+fuzz/artifacts/

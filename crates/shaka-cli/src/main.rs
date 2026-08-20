@@ -1,8 +1,10 @@
 //! Interface operacional do Shaka.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::Duration;
 use clap::{Args, Parser, Subcommand};
+use ed25519_dalek::SigningKey;
+use rand::rngs::OsRng;
 use serde_json::{Value, json};
 use shaka_config::{AppConfig, ModelProvider};
 use shaka_core::{
@@ -15,7 +17,7 @@ use shaka_orchestrator::{
     AgentRuntime, EchoTool, LocalModel, OpenAiCompatibleModel, ToolRegistry, WasmSkillTool,
 };
 use shaka_sandbox::{SandboxPolicy, WasmExecutor};
-use shaka_skills::SkillRegistry;
+use shaka_skills::{SkillRegistry, TrustStore, load_signing_key, public_key_hex, save_signing_key};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -33,6 +35,12 @@ struct Cli {
     database: PathBuf,
     #[arg(long, default_value = "data/skills.json", env = "SHAKA_SKILLS_FILE")]
     skills_file: PathBuf,
+    #[arg(
+        long,
+        default_value = "data/trusted_keys.json",
+        env = "SHAKA_TRUST_FILE"
+    )]
+    trust_file: PathBuf,
     #[arg(long, default_value = "demo", env = "SHAKA_TENANT")]
     tenant: String,
     #[arg(long, default_value = "operator", env = "SHAKA_OPERATOR")]
@@ -134,7 +142,28 @@ enum SkillCommand {
         reason: String,
         #[arg(long, conflicts_with = "sha256")]
         artifact: Option<PathBuf>,
+        #[arg(long, requires = "artifact")]
+        key_id: Option<String>,
+        #[arg(long, requires = "artifact")]
+        signing_key_file: Option<PathBuf>,
     },
+    TrustGenerate {
+        key_id: String,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long)]
+        description: String,
+    },
+    TrustAdd {
+        key_id: String,
+        public_key: String,
+        #[arg(long)]
+        description: String,
+    },
+    TrustRevoke {
+        key_id: String,
+    },
+    TrustList,
     Revoke {
         name: String,
     },
@@ -212,7 +241,7 @@ async fn run_agent(cli: &Cli, args: &RunArgs) -> Result<()> {
             )?)
         }
     };
-    let mut tools = build_tool_registry(&config)?;
+    let mut tools = build_tool_registry(cli, &config)?;
     tools.register(Arc::new(EchoTool))?;
     let runtime = AgentRuntime::new(model, memory, tools);
     let result = runtime.run(envelope).await?;
@@ -220,16 +249,20 @@ async fn run_agent(cli: &Cli, args: &RunArgs) -> Result<()> {
     Ok(())
 }
 
-fn build_tool_registry(config: &AppConfig) -> Result<ToolRegistry> {
+fn build_tool_registry(cli: &Cli, config: &AppConfig) -> Result<ToolRegistry> {
     let mut capabilities = vec![Capability::MemoryWrite];
     if matches!(&config.principal.role, Role::Administrator) {
         capabilities.push(Capability::CodeExecution);
     }
     let mut tools = ToolRegistry::with_capabilities(CapabilitySet(capabilities));
     let registry = SkillRegistry::load(&config.skills_file)?;
-    for artifact in registry.active_artifacts() {
+    let trust_store = TrustStore::load(&cli.trust_file)?;
+    for artifact in registry
+        .active_verified_artifacts(&trust_store)
+        .with_context(|| "nenhuma skill ativa legada ou não confiável pode ser carregada")?
+    {
         let skill_name = artifact.name.clone();
-        let tool = WasmSkillTool::from_approved_artifact(artifact)
+        let tool = WasmSkillTool::from_approved_artifact(artifact, &trust_store)
             .with_context(|| format!("carregando skill ativa {skill_name}"))?;
         tools.register(Arc::new(tool))?;
     }
@@ -256,9 +289,11 @@ fn memory_command(cli: &Cli, args: &MemoryArgs) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn skill_command(cli: &Cli, command: &SkillCommand) -> Result<()> {
     let config = build_config(cli, false, false)?;
     let mut registry = SkillRegistry::load(&config.skills_file)?;
+    let mut trust_store = TrustStore::load(&cli.trust_file)?;
     match command {
         SkillCommand::List => {
             authorize(&config, &Action::RunReadOnly)?;
@@ -303,16 +338,35 @@ fn skill_command(cli: &Cli, command: &SkillCommand) -> Result<()> {
             sha256,
             reason,
             artifact,
+            key_id,
+            signing_key_file,
         } => {
             authorize(&config, &Action::ApproveSkill)?;
             let record = if let Some(artifact) = artifact {
-                registry.approve_artifact(
+                let key_id = key_id
+                    .clone()
+                    .context("--key-id é obrigatório ao aprovar um artifact")?;
+                let signing_key_file = signing_key_file
+                    .clone()
+                    .context("--signing-key-file é obrigatório ao aprovar um artifact")?;
+                let signing_key = load_signing_key(&signing_key_file).with_context(|| {
+                    format!(
+                        "carregando chave de assinatura {}",
+                        signing_key_file.display()
+                    )
+                })?;
+                registry.approve_signed_artifact(
                     name,
                     config.principal.operator_id.clone(),
                     artifact,
+                    key_id,
+                    &signing_key,
                     reason.clone(),
                 )?
             } else {
+                if key_id.is_some() || signing_key_file.is_some() {
+                    bail!("--key-id e --signing-key-file exigem --artifact");
+                }
                 registry.approve(
                     name,
                     config.principal.operator_id.clone(),
@@ -323,22 +377,96 @@ fn skill_command(cli: &Cli, command: &SkillCommand) -> Result<()> {
                 )?
             };
             registry.save(&config.skills_file)?;
+            let mut metadata = BTreeMap::from([
+                (String::from("skill"), name.clone()),
+                (
+                    String::from("sha256"),
+                    record
+                        .approval
+                        .as_ref()
+                        .map(|approval| approval.artifact_sha256.clone())
+                        .unwrap_or_default(),
+                ),
+            ]);
+            if let Some(attestation) = record
+                .approval
+                .as_ref()
+                .and_then(|approval| approval.attestation.as_ref())
+            {
+                metadata.insert(String::from("key_id"), attestation.key_id.clone());
+                metadata.insert(String::from("protocol"), attestation.protocol.clone());
+            }
             append_control_audit(
                 &open_memory(&config.database)?,
                 &config.principal,
                 "skill.approve",
                 "success",
-                BTreeMap::from([
-                    (String::from("skill"), name.clone()),
-                    (
-                        String::from("sha256"),
-                        sha256
-                            .clone()
-                            .unwrap_or_else(|| String::from("computed-from-artifact")),
-                    ),
-                ]),
+                metadata,
             )?;
             println!("{}", serde_json::to_string_pretty(&record)?);
+        }
+        SkillCommand::TrustGenerate {
+            key_id,
+            output,
+            description,
+        } => {
+            authorize(&config, &Action::ApproveSkill)?;
+            let signing_key = SigningKey::generate(&mut OsRng);
+            save_signing_key(output, &signing_key)?;
+            let trusted = trust_store.add_key(
+                key_id,
+                public_key_hex(&signing_key),
+                description,
+                config.principal.operator_id.clone(),
+            )?;
+            trust_store.save(&cli.trust_file)?;
+            append_control_audit(
+                &open_memory(&config.database)?,
+                &config.principal,
+                "skill.trust_generate",
+                "success",
+                BTreeMap::from([(String::from("key_id"), trusted.key_id.clone())]),
+            )?;
+            println!("{}", serde_json::to_string_pretty(&trusted)?);
+        }
+        SkillCommand::TrustAdd {
+            key_id,
+            public_key,
+            description,
+        } => {
+            authorize(&config, &Action::ApproveSkill)?;
+            let trusted = trust_store.add_key(
+                key_id,
+                public_key,
+                description,
+                config.principal.operator_id.clone(),
+            )?;
+            trust_store.save(&cli.trust_file)?;
+            append_control_audit(
+                &open_memory(&config.database)?,
+                &config.principal,
+                "skill.trust_add",
+                "success",
+                BTreeMap::from([(String::from("key_id"), trusted.key_id.clone())]),
+            )?;
+            println!("{}", serde_json::to_string_pretty(&trusted)?);
+        }
+        SkillCommand::TrustRevoke { key_id } => {
+            authorize(&config, &Action::ApproveSkill)?;
+            let trusted = trust_store.revoke_key(key_id)?;
+            trust_store.save(&cli.trust_file)?;
+            append_control_audit(
+                &open_memory(&config.database)?,
+                &config.principal,
+                "skill.trust_revoke",
+                "success",
+                BTreeMap::from([(String::from("key_id"), key_id.clone())]),
+            )?;
+            println!("{}", serde_json::to_string_pretty(&trusted)?);
+        }
+        SkillCommand::TrustList => {
+            authorize(&config, &Action::RunReadOnly)?;
+            println!("{}", serde_json::to_string_pretty(&trust_store.list())?);
         }
         SkillCommand::Revoke { name } => {
             authorize(&config, &Action::RevokeSkill)?;
