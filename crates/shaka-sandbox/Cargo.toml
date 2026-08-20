@@ -1,0 +1,36 @@
+[package]
+
+name = "shaka-sandbox"
+
+version.workspace = true
+
+edition.workspace = true
+
+license.workspace = true
+
+rust-version.workspace = true
+
+
+
+[dependencies]
+
+serde.workspace = true
+
+shaka-core = { path = "../shaka-core" }
+
+thiserror.workspace = true
+
+wasmtime.workspace = true
+
+
+
+[dev-dependencies]
+
+wat.workspace = true
+
+
+
+[lints]
+
+workspace = true
+
