@@ -15,7 +15,7 @@ use shaka_core::{
 };
 use shaka_memory::{EpisodicRecord, MemoryStore};
 use shaka_sandbox::{SandboxPolicy, WasmExecutor};
-use shaka_skills::{ActiveSkillArtifact, sha256_file};
+use shaka_skills::{ActiveSkillArtifact, TrustStore, sha256_file};
 use std::fs;
 use std::{
     collections::{BTreeMap, HashMap},
@@ -657,6 +657,7 @@ pub struct WasmSkillTool {
 impl WasmSkillTool {
     pub fn from_approved_artifact(
         artifact: ActiveSkillArtifact,
+        trust_store: &TrustStore,
     ) -> Result<Self, OrchestratorError> {
         let actual_sha256 = sha256_file(&artifact.artifact_path)
             .map_err(|error| OrchestratorError::ToolExecution(error.to_string()))?;
@@ -666,6 +667,16 @@ impl WasmSkillTool {
                 artifact.name
             )));
         }
+        trust_store
+            .verify_attestation(
+                &artifact.name,
+                &artifact.version,
+                &artifact.approval_operator_id,
+                &artifact.artifact_sha256,
+                &artifact.approval_reason,
+                &artifact.attestation,
+            )
+            .map_err(|error| OrchestratorError::ToolExecution(error.to_string()))?;
         let wasm = fs::read(&artifact.artifact_path)
             .map_err(|error| OrchestratorError::ToolExecution(error.to_string()))?;
         let executor = WasmExecutor::new()
@@ -880,7 +891,7 @@ mod tests {
         let wasm = wat::parse_str(r#"(module (func (export "run") (result i32) i32.const 7))"#)
             .expect("wasm");
         std::fs::write(&path, wasm).expect("write wasm");
-        let artifact = ActiveSkillArtifact {
+        let mut artifact = ActiveSkillArtifact {
             name: "demo".to_owned(),
             version: "0.1.0".to_owned(),
             description: "skill de teste".to_owned(),
@@ -889,8 +900,39 @@ mod tests {
             output_schema: json!({"type": "object"}),
             artifact_sha256: sha256_file(&path).expect("hash"),
             artifact_path: path.clone(),
+            attestation: shaka_skills::ApprovalAttestation {
+                protocol: String::new(),
+                key_id: String::new(),
+                public_key_hex: String::new(),
+                signature_hex: String::new(),
+            },
+            approval_operator_id: OperatorId::new("reviewer").expect("operator"),
+            approval_reason: "teste".to_owned(),
         };
-        let tool = WasmSkillTool::from_approved_artifact(artifact).expect("tool");
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7_u8; 32]);
+        let operator = OperatorId::new("reviewer").expect("operator");
+        let attestation = shaka_skills::sign_approval(
+            "demo",
+            "0.1.0",
+            &operator,
+            &artifact.artifact_sha256,
+            "teste",
+            "review-key".to_owned(),
+            &key,
+        );
+        artifact.attestation = attestation;
+        artifact.approval_operator_id = operator.clone();
+        artifact.approval_reason = "teste".to_owned();
+        let mut trust_store = TrustStore::default();
+        trust_store
+            .add_key(
+                "review-key",
+                shaka_skills::public_key_hex(&key),
+                "fixture",
+                operator,
+            )
+            .expect("trust");
+        let tool = WasmSkillTool::from_approved_artifact(artifact, &trust_store).expect("tool");
         let mut tools = ToolRegistry::with_capabilities(CapabilitySet(vec![
             shaka_core::Capability::CodeExecution,
         ]));
