@@ -41,7 +41,8 @@ jobs:
         run: python3 ./scripts/workflow_policy_check.py
 
       - name: Dependency audit
-        run: cargo install cargo-audit --version 0.22.2 --locked && cargo audit --locked
+        run: cargo install cargo-audit --version 0.22.2 --locked && cargo audit
+
 
       - name: Production smoke test
         run: bash ./scripts/production_smoke.sh
