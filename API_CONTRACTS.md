@@ -2,7 +2,7 @@
 
 ## 1. Convenções
 
-Os contratos abaixo representam a release 0.2.0 do núcleo do Shaka. Campos de identificação são string no JSON, embora alguns sejam wrappers tipados em Rust. Datas usam RFC 3339. O host deve rejeitar campos desconhecidos quando o contrato de integração exigir compatibilidade estrita.
+Os contratos abaixo representam o núcleo do Shaka e a API REST persistente da release 0.5.0. Campos de identificação são string no JSON, embora alguns sejam wrappers tipados em Rust. Datas usam RFC 3339. O host deve rejeitar campos desconhecidos quando o contrato de integração exigir compatibilidade estrita.
 
 ## 2. TaskEnvelope
 
@@ -188,6 +188,25 @@ A CLI oferece `doctor`, `backup`, `restore`, `verify-audit` e `config`. Backup u
 | `host_imports_denied` | WASM tentou importar host | Não |
 | `approval_required` | Efeito exige aprovação | Não até aprovação |
 
-## 13. Compatibilidade
+## 13. API REST persistente v1
+
+A API usa JSON UTF-8, prefixo `/v1` e o principal local configurado pelo operador. O cliente não escolhe `tenant_id`, `operator_id` ou `role`. O bind padrão é `127.0.0.1:8080`; binds não locais exigem chave configurada e o header `Authorization: Bearer <chave>`.
+
+| Método e rota | Entrada | Semântica |
+|---|---|---|
+| `GET /healthz` | Nenhuma | Retorna `status`, versão, quantidade de tarefas ativas e snapshot do circuito. |
+| `POST /v1/sessions` | `metadata` opcional, limitado | Cria uma sessão persistente e retorna `201`. |
+| `GET /v1/sessions/{session_id}` | UUID da sessão | Retorna a sessão somente no tenant do principal. |
+| `POST /v1/sessions/{session_id}/tasks` | `objective`, `priority`, `max_attempts`, `dry_run` e `budget` opcionais; `Idempotency-Key` obrigatório | Retorna `202` para tarefa nova ou `200` para repetição idempotente. |
+| `GET /v1/tasks/{task_id}` | UUID da tarefa | Retorna estado, tentativas, lease, erro redacted e resultado quando disponível. |
+| `DELETE /v1/tasks/{task_id}` | UUID da tarefa | Solicita cancelamento cooperativo; retorna `202` enquanto o worker ainda encerra. |
+
+Uma tarefa pode estar em `queued`, `running`, `succeeded`, `failed`, `cancel_requested` ou `cancelled`. A fila ordena prioridade descrescente e criação crescente. Um lease expirado volta para `queued` na recuperação do processo, preservando tentativas e auditoria.
+
+A chave de idempotência é única por tenant. O mesmo valor com o mesmo fingerprint devolve a tarefa existente; o mesmo valor com outro payload produz `409 Conflict`. Falhas de transporte do modelo e deadlines podem ser repetidas até `max_attempts`, com backoff exponencial limitado. Entradas inválidas, autorização, schema, capability e orçamento não são retryable.
+
+O circuit breaker persistido usa `closed`, `open` e `half_open`. Quando aberto, workers deixam tarefas em `queued` até a janela de recuperação. O cancelamento é cooperativo e é observado antes de cada passo, ferramenta e chamada assíncrona do runtime.
+
+## 14. Compatibilidade
 
 Novos campos opcionais podem ser adicionados em uma versão minor. Remoção ou alteração semântica exige versão major e ADR. Skills devem versionar separadamente de schemas de tools e do runtime. Migrações de memória devem registrar versão do schema e permitir restauração.

@@ -9,17 +9,20 @@ members = [
     "crates/shaka-observability",
     "crates/shaka-cli",
     "crates/shaka-config",
+    "crates/shaka-queue",
+    "crates/shaka-api",
 ]
 
 [workspace.package]
 edition = "2024"
 license = "Apache-2.0"
-version = "0.4.0"
+version = "0.5.0"
 authors = ["Shaka Contributors"]
 rust-version = "1.85"
 
 [workspace.dependencies]
 anyhow = "1.0"
+axum = { version = "0.8", features = ["json", "http1"] }
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde", "clock"] }
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
@@ -33,8 +36,9 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
+tower = "0.5"
 thiserror = "2.0"
-tokio = { version = "1.43", features = ["macros", "rt-multi-thread", "time", "sync"] }
+tokio = { version = "1.43", features = ["macros", "rt-multi-thread", "time", "sync", "signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 url = { version = "2.5", features = ["serde"] }

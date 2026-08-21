@@ -2,7 +2,7 @@
 
 MVP de um agente de IA **extensível, auditável e governado pelo operador**, implementado em Rust. O projeto prioriza uma fronteira segura para execução dinâmica, memória persistente, contratos tipados e documentação operável.
 
-> **Estado atual:** produção candidata para operação controlada. O modelo local continua disponível para desenvolvimento; production exige provedor externo HTTPS, chave de API, auditoria habilitada e configuração validada. Mensageria, pesquisa web e autopromoção de skills permanecem deliberadamente desabilitadas.
+> **Estado atual:** v0.5.0, produção candidata para operação controlada. Além da CLI, o Shaka oferece API HTTP persistente com sessões SQLite, fila priorizada, retry, cancelamento, idempotência e circuit breaker. O modelo local continua disponível para desenvolvimento; production exige provedor externo HTTPS, chave de API, auditoria habilitada e configuração validada. Mensageria, pesquisa web e autopromoção de skills permanecem deliberadamente desabilitadas.
 
 ## Objetivos do MVP
 
@@ -23,6 +23,9 @@ O Shaka já oferece um núcleo modular com as seguintes capacidades:
 | Catálogo de skills candidatas | Implementado e persistente em JSON |
 | Aprovação humana e revogação | Implementado |
 | Tracing estruturado | Implementado |
+| API HTTP persistente | Implementada com `shaka-api` e `shaka-queue` |
+| Sessões, fila, retry, cancelamento e idempotência | Persistentes em SQLite |
+| Circuit breaker | Persistente e fail-safe |
 | Auditoria persistente com cadeia de hashes | Implementado por tenant, com verificação CLI |
 | Mensageria externa | Não habilitada no MVP |
 | Pesquisa autônoma na web | Não habilitada no MVP |
@@ -31,7 +34,7 @@ O Shaka já oferece um núcleo modular com as seguintes capacidades:
 
 ## Requisitos locais
 
-O projeto usa Rust stable e Cargo. A versão mínima declarada no workspace é Rust 1.85, enquanto o ambiente de validação utilizado para este MVP foi Rust 1.97.1.
+O projeto usa Rust stable e Cargo. A versão mínima declarada no workspace é Rust 1.85, enquanto a validação e o container de release usam Rust 1.98.0.
 
 Para compilar e testar:
 
@@ -62,6 +65,26 @@ cargo run -- run "Responda ao objetivo usando as ferramentas disponíveis"
 ```
 
 O endpoint padrão é `https://api.openai.com/v1/chat/completions`, mas pode ser substituído por `SHAKA_MODEL_ENDPOINT`. O adaptador é genérico e deve ser validado contra o provedor escolhido antes de uso operacional.
+
+Iniciar a API persistente localmente, com bind em loopback por padrão:
+
+```bash
+cargo run -- serve --bind 127.0.0.1:8080 --workers 2
+```
+
+O serviço expõe `GET /healthz`, `POST /v1/sessions`, `GET /v1/sessions/{session_id}`, `POST /v1/sessions/{session_id}/tasks`, `GET /v1/tasks/{task_id}` e `DELETE /v1/tasks/{task_id}`. Toda submissão exige o header `Idempotency-Key`; tarefas iniciam em dry-run e são executadas por workers persistentes. Para um bind não local, configure `SHAKA_API_KEY` e use `Authorization: Bearer <chave>`.
+
+Exemplo de criação de sessão e tarefa:
+
+```bash
+SESSION=$(curl -fsS -X POST http://127.0.0.1:8080/v1/sessions \
+  -H 'content-type: application/json' \
+  -d '{"metadata":{"source":"cli"}}' | jq -r .session_id)
+curl -fsS -X POST "http://127.0.0.1:8080/v1/sessions/$SESSION/tasks" \
+  -H 'content-type: application/json' \
+  -H 'Idempotency-Key: tarefa-demo-1' \
+  -d '{"objective":"Descreva a política de execução segura","priority":5}'
+```
 
 Consultar a memória episódica:
 
@@ -135,7 +158,9 @@ Shaka/
 │   ├── shaka-sandbox/         # execução WASM deny-by-default
 │   ├── shaka-orchestrator/    # modelo, ferramentas e runtime
 │   ├── shaka-observability/   # tracing e auditoria
-│   └── shaka-cli/             # interface de operação local
+│   ├── shaka-queue/            # sessões, fila SQLite, leases e resiliência
+│   ├── shaka-api/              # HTTP REST, workers e autenticação local
+│   └── shaka-cli/              # interface de operação local e servidor
 ├── data/                      # dados locais; não versionar segredos
 ├── docs/                      # material complementar
 └── .github/workflows/         # CI mínimo
@@ -151,9 +176,9 @@ Conteúdo externo, quando uma camada futura de pesquisa web for adicionada, deve
 
 ## Produção candidata e limitações
 
-A release atual adiciona configuração tipada, RBAC mínimo, validação JSON Schema, redaction, cadeia de auditoria, backup/restore, integrity check, gravação atômica de skills, Wasmtime atualizado e cargo-audit obrigatório. O documento `PRODUCTION_RELEASE.md` contém os gates e as condições para promoção ao ambiente real.
+A release atual adiciona API HTTP persistente, sessões, fila priorizada, leases recuperáveis, retry com backoff, cancelamento cooperativo, idempotência, circuit breaker, configuração tipada, RBAC mínimo, validação JSON Schema, redaction, cadeia de auditoria, backup/restore, integrity check, gravação atômica de skills, Wasmtime atualizado e cargo-audit obrigatório. O documento `V0.5_DESIGN.md` contém os contratos e as condições para promoção ao ambiente real.
 
-O sistema ainda não é uma implantação pública pronta sem infraestrutura adicional. Faltam IAM remoto, cofre de segredos, backup externo, métricas remotas, mensageria, pesquisa web, subagentes distribuídos e multi-tenancy forte.
+O sistema ainda não é uma implantação pública pronta sem infraestrutura adicional. Faltam IAM remoto, cofre de segredos, backup externo, métricas remotas, mensageria, pesquisa web, subagentes distribuídos, rate limits distribuídos e multi-tenancy forte.
 
 ## Limitações operacionais remanescentes
 
@@ -171,7 +196,7 @@ Apache-2.0. Consulte `CHANGELOG.md` para o histórico de mudanças.
 
 O workflow `CI` executa formatação, compilação, testes, Clippy, auditoria de dependências e o smoke test em cada push e pull request. O workflow `Shaka Release` é acionado por uma tag SemVer, como `v0.2.0`, ou manualmente pela interface do GitHub.
 
-Ao criar uma tag de release, o workflow valida que a tag corresponde à versão do `Cargo.toml`, compila o binário otimizado, gera tarball, ZIP e `SHA256SUMS`, publica os artefatos em uma GitHub Release e constrói a imagem Docker no GitHub Container Registry. A publicação da imagem não inicia um servidor automaticamente; ela produz um artefato pronto para uma VM, serviço de containers ou outra infraestrutura operada pelo proprietário.
+Ao criar uma tag de release, o workflow valida que a tag corresponde à versão do `Cargo.toml`, compila o binário otimizado, gera tarball, ZIP e `SHA256SUMS`, publica os artefatos em uma GitHub Release e constrói a imagem Docker no GitHub Container Registry. A imagem publicada configura `shaka serve` como comando padrão, expõe a porta 8080 e mantém `doctor` como healthcheck. O proprietário ainda deve fornecer armazenamento persistente para `/app/data`, HTTPS na borda, autenticação adequada e políticas de operação antes de expor o serviço à rede.
 
 Depois que o repositório estiver publicado, o fluxo recomendado é:
 
