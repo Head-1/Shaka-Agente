@@ -38,6 +38,10 @@ run --role administrator backup --output "$BACKUP" > "$TMP/backup.txt"
 run --role administrator restore --input "$BACKUP" > "$TMP/restore.txt"
 run --role administrator verify-audit > "$TMP/audit.json"
 run --role administrator doctor > "$TMP/doctor.json"
+run --role administrator iam tenant-create tenant-b "Tenant B" > "$TMP/tenant-b.json"
+run --role administrator iam user-create operator-b --tenant tenant-b --role operator > "$TMP/user-b.json"
+run --role administrator iam token-issue operator-b --expires-in-seconds 3600 > "$TMP/token-b.json"
+run --role administrator iam limits-set tenant-b --max-active 8 --max-daily 100 --max-cost-microunits 10000000 --requests 2 --window-seconds 60 > "$TMP/limits-b.json"
 run --role operator sandbox-demo > "$TMP/sandbox.json"
 
 API_PORT="${SHAKA_SMOKE_API_PORT:-$((18080 + RANDOM % 1000))}"
@@ -60,6 +64,7 @@ import json
 import pathlib
 import sys
 import time
+import urllib.error
 import urllib.request
 
 root = pathlib.Path(sys.argv[1])
@@ -70,6 +75,7 @@ audit = json.loads((root / "audit.json").read_text())
 doctor = json.loads((root / "doctor.json").read_text())
 sandbox = json.loads((root / "sandbox.json").read_text())
 health = json.loads((root / "health.json").read_text())
+token = json.loads((root / "token-b.json").read_text())
 assert run["success"] is True
 assert approve["approval"]["attestation"]["protocol"] == "shaka-skill-approval-v1"
 assert approve["approval"]["attestation"]["key_id"] == "reviewer"
@@ -88,9 +94,17 @@ def request(path, method="GET", payload=None, headers=None):
         headers=request_headers,
         method=method,
     )
-    with urllib.request.urlopen(request, timeout=3) as response:
-        return response.status, json.loads(response.read())
+    try:
+        with urllib.request.urlopen(request, timeout=3) as response:
+            return response.status, json.loads(response.read())
+    except urllib.error.HTTPError as error:
+        return error.code, json.loads(error.read())
 
+iam_headers = {"Authorization": f"Bearer {token['token']}"}
+status, iam_session = request(
+    "/v1/sessions", "POST", {"metadata": {"source": "iam-smoke"}}, headers=iam_headers
+)
+assert status == 201 and iam_session["tenant_id"] == "tenant-b"
 status, session = request("/v1/sessions", "POST", {"metadata": {"source": "smoke"}})
 assert status == 201
 session_id = session["session_id"]
@@ -115,6 +129,27 @@ for _ in range(50):
         break
     time.sleep(0.1)
 assert current["status"] == "succeeded"
+status, _ = request(
+    f"/v1/sessions/{iam_session['session_id']}/tasks",
+    "POST",
+    {"objective": "iam rate one", "priority": 1},
+    headers={**iam_headers, "Idempotency-Key": "iam-task-1"},
+)
+assert status == 202
+status, _ = request(
+    f"/v1/sessions/{iam_session['session_id']}/tasks",
+    "POST",
+    {"objective": "iam rate two", "priority": 1},
+    headers={**iam_headers, "Idempotency-Key": "iam-task-2"},
+)
+assert status == 202
+status, denied = request(
+    f"/v1/sessions/{iam_session['session_id']}/tasks",
+    "POST",
+    {"objective": "iam rate three", "priority": 1},
+    headers={**iam_headers, "Idempotency-Key": "iam-task-3"},
+)
+assert status == 429 and "error" in denied
 assert (root / "backup.db").exists()
-print(json.dumps({"run": "ok", "audit": audit, "doctor": doctor, "sandbox": sandbox, "api": {"health": health, "task": current}}, indent=2, ensure_ascii=False))
+print(json.dumps({"run": "ok", "audit": audit, "doctor": doctor, "sandbox": sandbox, "iam": {"tenant": iam_session["tenant_id"], "rate_limit_status": status}, "api": {"health": health, "task": current}}, indent=2, ensure_ascii=False))
 PY

@@ -2,7 +2,7 @@
 
 ## Status
 
-Esta release eleva o Shaka para a **v0.5.0, produção candidata para operação controlada**. Além da configuração tipada, RBAC mínimo, validação JSON Schema real, redaction de credenciais, auditoria encadeada, backup/restore, verificação de integridade, catálogo de skills com escrita atômica, hash calculado de artefato e pipeline de dependências com `cargo audit` obrigatório, o código possui API REST persistente, sessões SQLite, fila priorizada, retry, cancelamento, idempotência e circuit breaker.
+Esta release eleva o Shaka para a **v0.6.0, produção candidata para operação controlada e multiusuário local**. Além da configuração tipada, RBAC mínimo, validação JSON Schema real, redaction de credenciais, auditoria encadeada, backup/restore, verificação de integridade, catálogo de skills com escrita atômica, hash calculado de artefato e pipeline de dependências com `cargo audit` obrigatório, o código possui API REST persistente, sessões SQLite, fila priorizada, retry, cancelamento, idempotência e circuit breaker.
 
 > O termo “produção candidata” é intencional. O repositório está endurecido e validado, mas uma implantação pública ainda depende de identidade externa, cofre de segredos, política de dados, provisionamento, alertas, backup fora da máquina e revisão humana do ambiente.
 
@@ -20,7 +20,9 @@ Esta release eleva o Shaka para a **v0.5.0, produção candidata para operação
 | Skills | Catálogo salvo atomicamente; arquivo recebe permissão restrita; aprovação por artefato calcula SHA-256 real; somente skills ativas e hash-verificadas entram no runtime WASM. |
 | Sandbox | Wasmtime 47.0.3, sem imports de host, sem WASI, com fuel e interrupção por epoch. |
 | Supply chain | `Cargo.lock` atualizado; `cargo audit`, secret scan e SBOM CycloneDX fazem parte da validação/release. Assinatura de artefatos e pinagem de actions ainda são pendências. |
-| Operação | CLI inclui `doctor`, `backup`, `restore`, `verify-audit`, `config` e `serve`; API possui workers, leases, retry e cancelamento cooperativo. |
+| Operação | CLI inclui `doctor`, `backup`, `restore`, `verify-audit`, `config`, `serve` e comandos IAM administrativos; API possui workers, leases, retry, cancelamento cooperativo e autenticação por request. |
+| IAM | Tenants, usuários, tokens bearer hash-only, revogação, expiração e principal resolvido por request. |
+| Quotas/rate limit | Quotas persistentes por tenant e rate limits por tenant e operador, com `429` e `Retry-After`. |
 | Fila/API | `shaka-queue` persiste sessões, tarefas, idempotência, prioridade, leases e circuit breaker; `shaka-api` expõe REST v1. |
 | Imagem | Dockerfile compila com lockfile, executa como usuário não-root, expõe 8080, inicia `serve` e possui healthcheck. |
 
@@ -32,7 +34,7 @@ Esta release eleva o Shaka para a **v0.5.0, produção candidata para operação
 | `reviewer` | Tarefas somente leitura, aprovação de skills, backup e verificação de auditoria. |
 | `administrator` | Todas as ações do host, incluindo live, revoke e restore. |
 
-A identidade ainda é fornecida por configuração local. Antes de exposição remota, substituir esse mecanismo por autenticação forte, sessão assinada ou integração com um provedor IAM.
+A v0.6.0 adiciona identidade persistente local e tokens bearer opacos; a compatibilidade por configuração local permanece disponível para loopback e API key estática. Antes de exposição pública, substituir ou complementar esse mecanismo por OIDC/OAuth2, rotação de chaves, sessão assinada e integração com um provedor IAM.
 
 ## Configuração segura
 
@@ -101,6 +103,6 @@ Além desses comandos, o responsável precisa validar no ambiente-alvo: injeçã
 
 ## Limitações que continuam bloqueando produção pública
 
-A release ainda não implementa IAM remoto, multi-tenancy distribuído, quotas e rate limits distribuídos, subagentes, webhooks, mensageria, pesquisa web, controles SSRF de crawler, cofre externo, métricas Prometheus, tracing OTLP, backup remoto automatizado ou geração automática de skills com pipeline completo de build/teste sandbox. A fila local, o SBOM, o secret scan, a assinatura de skills e a proveniência do container fazem parte da v0.5.0/v0.4.0; a operação pública ainda exige infraestrutura de borda e políticas adicionais.
+A release ainda não implementa IAM remoto OIDC/OAuth2, multi-tenancy distribuído, quotas e rate limits distribuídos, subagentes, webhooks, mensageria, pesquisa web, controles SSRF de crawler, cofre externo, métricas Prometheus, tracing OTLP, backup remoto automatizado ou geração automática de skills com pipeline completo de build/teste sandbox. A fila local, o SBOM, o secret scan, a assinatura de skills e a proveniência do container fazem parte da v0.5.0/v0.4.0; a operação pública ainda exige infraestrutura de borda e políticas adicionais.
 
 Esses itens são próximos incrementos, não devem ser simulados por configuração. A ausência deliberada desses adaptadores reduz a superfície de ataque da release atual.

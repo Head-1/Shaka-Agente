@@ -8,7 +8,8 @@ use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use shaka_core::{OperatorId, Principal, TaskEnvelope, TaskId, TenantId};
+use sha2::{Digest, Sha256};
+use shaka_core::{OperatorId, Principal, Role, TaskEnvelope, TaskId, TenantId};
 use std::sync::Arc;
 use thiserror::Error;
 use uuid::Uuid;
@@ -29,6 +30,14 @@ pub enum QueueError {
     NotFound(String),
     #[error("chave de idempotência já usada com outro payload")]
     IdempotencyConflict,
+    #[error("não autorizado")]
+    Unauthorized,
+    #[error("operação proibida")]
+    Forbidden,
+    #[error("quota excedida: {0}")]
+    QuotaExceeded(String),
+    #[error("rate limit excedido; tente novamente em {retry_after_seconds}s")]
+    RateLimited { retry_after_seconds: u64 },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -118,6 +127,65 @@ pub enum FinishOutcome {
     Requeued { next_attempt_at: DateTime<Utc> },
     Failed,
     Cancelled,
+}
+
+/// Origem de uma autenticação resolvida pelo host.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthSource {
+    Token,
+    StaticApiKey,
+}
+
+/// Principal autenticado, sem expor o segredo bearer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuthenticatedPrincipal {
+    pub principal: Principal,
+    pub token_id: String,
+    pub token_prefix: String,
+    pub source: AuthSource,
+}
+
+/// Resultado da emissão de um token. O campo `token` deve ser exibido uma única vez.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TokenIssue {
+    pub token_id: String,
+    pub token: String,
+    pub token_prefix: String,
+    pub principal: Principal,
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+/// Limites persistentes de um tenant.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TenantLimits {
+    pub tenant_id: TenantId,
+    pub max_active_tasks: u32,
+    pub max_daily_tasks: u32,
+    pub max_daily_cost_microunits: u64,
+    pub requests_per_window: u32,
+    pub window_seconds: u32,
+}
+
+/// Registro administrativo resumido de um tenant.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TenantRecord {
+    pub tenant_id: TenantId,
+    pub display_name: String,
+    pub active: bool,
+    pub created_at: DateTime<Utc>,
+    pub limits: TenantLimits,
+}
+
+/// Registro administrativo resumido de um usuário.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UserRecord {
+    pub operator_id: OperatorId,
+    pub tenant_id: TenantId,
+    pub role: Role,
+    pub active: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -249,9 +317,349 @@ impl QueueStore {
                  failure_count INTEGER NOT NULL,
                  opened_at TEXT,
                  next_probe_at TEXT
-             );",
+             );
+             CREATE TABLE IF NOT EXISTS api_tenants (
+                 tenant_id TEXT PRIMARY KEY,
+                 display_name TEXT NOT NULL,
+                 active INTEGER NOT NULL DEFAULT 1,
+                 created_at TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS api_users (
+                 operator_id TEXT PRIMARY KEY,
+                 tenant_id TEXT NOT NULL REFERENCES api_tenants(tenant_id),
+                 role TEXT NOT NULL,
+                 active INTEGER NOT NULL DEFAULT 1,
+                 created_at TEXT NOT NULL,
+                 updated_at TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_api_users_tenant
+                 ON api_users (tenant_id, active);
+             CREATE TABLE IF NOT EXISTS api_tokens (
+                 token_id TEXT PRIMARY KEY,
+                 token_hash TEXT NOT NULL UNIQUE,
+                 token_prefix TEXT NOT NULL,
+                 operator_id TEXT NOT NULL REFERENCES api_users(operator_id),
+                 created_at TEXT NOT NULL,
+                 expires_at TEXT,
+                 revoked_at TEXT,
+                 last_used_at TEXT
+             );
+             CREATE INDEX IF NOT EXISTS idx_api_tokens_operator
+                 ON api_tokens (operator_id, revoked_at);
+             CREATE TABLE IF NOT EXISTS api_tenant_limits (
+                 tenant_id TEXT PRIMARY KEY REFERENCES api_tenants(tenant_id),
+                 max_active_tasks INTEGER NOT NULL,
+                 max_daily_tasks INTEGER NOT NULL,
+                 max_daily_cost_microunits INTEGER NOT NULL,
+                 requests_per_window INTEGER NOT NULL,
+                 window_seconds INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS api_rate_windows (
+                 scope_key TEXT NOT NULL,
+                 window_start TEXT NOT NULL,
+                 request_count INTEGER NOT NULL,
+                 PRIMARY KEY(scope_key, window_start)
+             );
+             CREATE INDEX IF NOT EXISTS idx_api_rate_windows_start
+                 ON api_rate_windows (window_start);",
         )?;
         Ok(())
+    }
+
+    /// Garante que o principal legado da configuração exista no IAM persistente.
+    pub fn bootstrap_principal(&self, principal: &Principal) -> Result<(), QueueError> {
+        validate_key(&principal.tenant_id.0, "tenant_id", 128)?;
+        validate_key(&principal.operator_id.0, "operator_id", 128)?;
+        let now = Utc::now().to_rfc3339();
+        let role = serde_json::to_string(&principal.role)?;
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO api_tenants
+             (tenant_id, display_name, active, created_at) VALUES (?1, ?2, 1, ?3)",
+            params![principal.tenant_id.0, principal.tenant_id.0, now],
+        )?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO api_users
+             (operator_id, tenant_id, role, active, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 1, ?4, ?4)",
+            params![principal.operator_id.0, principal.tenant_id.0, role, now],
+        )?;
+        ensure_limits_tx(&transaction, &principal.tenant_id, &now)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Cria um tenant administrativo com limites iniciais conservadores.
+    pub fn create_tenant(
+        &self,
+        tenant_id: &TenantId,
+        display_name: &str,
+    ) -> Result<TenantRecord, QueueError> {
+        validate_key(&tenant_id.0, "tenant_id", 128)?;
+        validate_key(display_name, "display_name", 256)?;
+        let now = Utc::now();
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO api_tenants (tenant_id, display_name, active, created_at)
+             VALUES (?1, ?2, 1, ?3)",
+            params![tenant_id.0, display_name, now.to_rfc3339()],
+        )?;
+        ensure_limits_tx(&transaction, tenant_id, &now.to_rfc3339())?;
+        transaction.commit()?;
+        drop(connection);
+        self.get_tenant(tenant_id)
+    }
+
+    /// Cria ou rejeita um usuário de tenant.
+    pub fn create_user(
+        &self,
+        operator_id: &OperatorId,
+        tenant_id: &TenantId,
+        role: &Role,
+    ) -> Result<UserRecord, QueueError> {
+        validate_key(&operator_id.0, "operator_id", 128)?;
+        let now = Utc::now();
+        let role_json = serde_json::to_string(role)?;
+        let changed = self.connection.lock().execute(
+            "INSERT INTO api_users
+             (operator_id, tenant_id, role, active, created_at, updated_at)
+             SELECT ?1, ?2, ?3, 1, ?4, ?4
+             WHERE EXISTS (SELECT 1 FROM api_tenants WHERE tenant_id = ?2 AND active = 1)",
+            params![operator_id.0, tenant_id.0, role_json, now.to_rfc3339()],
+        )?;
+        if changed == 0 {
+            return Err(QueueError::InvalidInput(
+                "tenant inexistente/inativo ou usuário já existente".to_owned(),
+            ));
+        }
+        self.get_user(operator_id)
+    }
+
+    /// Emite um token bearer opaco e devolve o segredo somente nesta chamada.
+    pub fn issue_token(
+        &self,
+        operator_id: &OperatorId,
+        expires_at: Option<DateTime<Utc>>,
+    ) -> Result<TokenIssue, QueueError> {
+        let user = self.get_user(operator_id)?;
+        if !user.active {
+            return Err(QueueError::Unauthorized);
+        }
+        let token_id = format!("tok_{}", Uuid::new_v4());
+        let token = format!("shk_{}_{}", Uuid::new_v4(), Uuid::new_v4());
+        let token_prefix = token.chars().take(12).collect::<String>();
+        let token_hash = sha256_hex(&token);
+        let now = Utc::now();
+        self.connection.lock().execute(
+            "INSERT INTO api_tokens
+             (token_id, token_hash, token_prefix, operator_id, created_at, expires_at, revoked_at, last_used_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL)",
+            params![
+                token_id,
+                token_hash,
+                token_prefix,
+                operator_id.0,
+                now.to_rfc3339(),
+                expires_at.map(|value| value.to_rfc3339()),
+            ],
+        )?;
+        Ok(TokenIssue {
+            token_id,
+            token,
+            token_prefix,
+            principal: Principal {
+                operator_id: user.operator_id,
+                tenant_id: user.tenant_id,
+                role: user.role,
+            },
+            expires_at,
+        })
+    }
+
+    /// Revoga um token sem revelar se o segredo original ainda existe.
+    pub fn revoke_token(&self, token_id: &str) -> Result<(), QueueError> {
+        let changed = self.connection.lock().execute(
+            "UPDATE api_tokens SET revoked_at = ?1 WHERE token_id = ?2 AND revoked_at IS NULL",
+            params![Utc::now().to_rfc3339(), token_id],
+        )?;
+        if changed == 0 {
+            return Err(QueueError::NotFound(format!("token {token_id}")));
+        }
+        Ok(())
+    }
+
+    /// Resolve um bearer por hash, validando usuário, tenant, expiração e revogação.
+    pub fn authenticate_token(&self, token: &str) -> Result<AuthenticatedPrincipal, QueueError> {
+        if token.trim().is_empty() || token.len() > 512 {
+            return Err(QueueError::Unauthorized);
+        }
+        let token_hash = sha256_hex(token);
+        let now = Utc::now();
+        let connection = self.connection.lock();
+        let row = connection
+            .query_row(
+                "SELECT t.token_id, t.token_prefix, u.operator_id, u.tenant_id, u.role
+                 FROM api_tokens t
+                 JOIN api_users u ON u.operator_id = t.operator_id
+                 JOIN api_tenants n ON n.tenant_id = u.tenant_id
+                 WHERE t.token_hash = ?1 AND t.revoked_at IS NULL AND u.active = 1 AND n.active = 1
+                   AND (t.expires_at IS NULL OR t.expires_at > ?2)",
+                params![token_hash, now.to_rfc3339()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or(QueueError::Unauthorized)?;
+        drop(connection);
+        self.connection.lock().execute(
+            "UPDATE api_tokens SET last_used_at = ?1 WHERE token_hash = ?2",
+            params![now.to_rfc3339(), token_hash],
+        )?;
+        Ok(AuthenticatedPrincipal {
+            principal: Principal {
+                operator_id: OperatorId::new(row.2)?,
+                tenant_id: TenantId::new(row.3)?,
+                role: serde_json::from_str(&row.4)?,
+            },
+            token_id: row.0,
+            token_prefix: row.1,
+            source: AuthSource::Token,
+        })
+    }
+
+    /// Informa se existe pelo menos um token persistente ativo.
+    pub fn has_active_tokens(&self) -> Result<bool, QueueError> {
+        let connection = self.connection.lock();
+        Ok(connection.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM api_tokens t
+                 JOIN api_users u ON u.operator_id = t.operator_id
+                 JOIN api_tenants n ON n.tenant_id = u.tenant_id
+                 WHERE t.revoked_at IS NULL AND u.active = 1 AND n.active = 1
+                   AND (t.expires_at IS NULL OR t.expires_at > ?1)
+             )",
+            params![Utc::now().to_rfc3339()],
+            |row| row.get::<_, i64>(0),
+        )? != 0)
+    }
+
+    /// Lista tenants e seus limites para operações administrativas locais.
+    pub fn list_tenants(&self) -> Result<Vec<TenantRecord>, QueueError> {
+        let connection = self.connection.lock();
+        let mut statement = connection.prepare(
+            "SELECT n.tenant_id, n.display_name, n.active, n.created_at,
+                    l.max_active_tasks, l.max_daily_tasks, l.max_daily_cost_microunits,
+                    l.requests_per_window, l.window_seconds
+             FROM api_tenants n JOIN api_tenant_limits l ON l.tenant_id = n.tenant_id
+             ORDER BY n.tenant_id",
+        )?;
+        let rows = statement.query_map([], load_tenant_row)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(QueueError::from)
+    }
+
+    /// Atualiza os limites de um tenant.
+    pub fn set_limits(&self, limits: TenantLimits) -> Result<TenantLimits, QueueError> {
+        validate_limits(&limits)?;
+        let changed = self.connection.lock().execute(
+            "UPDATE api_tenant_limits SET max_active_tasks = ?1, max_daily_tasks = ?2,
+                    max_daily_cost_microunits = ?3, requests_per_window = ?4, window_seconds = ?5
+             WHERE tenant_id = ?6",
+            params![
+                limits.max_active_tasks,
+                limits.max_daily_tasks,
+                limits.max_daily_cost_microunits,
+                limits.requests_per_window,
+                limits.window_seconds,
+                limits.tenant_id.0,
+            ],
+        )?;
+        if changed == 0 {
+            return Err(QueueError::NotFound(format!(
+                "tenant {}",
+                limits.tenant_id.0
+            )));
+        }
+        Ok(limits)
+    }
+
+    /// Obtém os limites de um tenant.
+    pub fn get_limits(&self, tenant_id: &TenantId) -> Result<TenantLimits, QueueError> {
+        let connection = self.connection.lock();
+        connection
+            .query_row(
+                "SELECT max_active_tasks, max_daily_tasks, max_daily_cost_microunits,
+                        requests_per_window, window_seconds
+                 FROM api_tenant_limits WHERE tenant_id = ?1",
+                params![tenant_id.0],
+                |row| {
+                    Ok(TenantLimits {
+                        tenant_id: tenant_id.clone(),
+                        max_active_tasks: row.get(0)?,
+                        max_daily_tasks: row.get(1)?,
+                        max_daily_cost_microunits: row.get(2)?,
+                        requests_per_window: row.get(3)?,
+                        window_seconds: row.get(4)?,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or_else(|| QueueError::NotFound(format!("tenant {}", tenant_id.0)))
+    }
+
+    fn get_tenant(&self, tenant_id: &TenantId) -> Result<TenantRecord, QueueError> {
+        let connection = self.connection.lock();
+        connection
+            .query_row(
+                "SELECT n.tenant_id, n.display_name, n.active, n.created_at,
+                        l.max_active_tasks, l.max_daily_tasks, l.max_daily_cost_microunits,
+                        l.requests_per_window, l.window_seconds
+                 FROM api_tenants n JOIN api_tenant_limits l ON l.tenant_id = n.tenant_id
+                 WHERE n.tenant_id = ?1",
+                params![tenant_id.0],
+                load_tenant_row,
+            )
+            .optional()?
+            .ok_or_else(|| QueueError::NotFound(format!("tenant {}", tenant_id.0)))
+    }
+
+    fn get_user(&self, operator_id: &OperatorId) -> Result<UserRecord, QueueError> {
+        let connection = self.connection.lock();
+        let row = connection
+            .query_row(
+                "SELECT operator_id, tenant_id, role, active, created_at, updated_at
+                 FROM api_users WHERE operator_id = ?1",
+                params![operator_id.0],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| QueueError::NotFound(format!("user {}", operator_id.0)))?;
+        Ok(UserRecord {
+            operator_id: OperatorId::new(row.0)?,
+            tenant_id: TenantId::new(row.1)?,
+            role: serde_json::from_str(&row.2)?,
+            active: row.3 != 0,
+            created_at: parse_datetime(&row.4)?,
+            updated_at: parse_datetime(&row.5)?,
+        })
     }
 
     pub fn create_session(
@@ -402,6 +810,171 @@ impl QueueStore {
             ],
         )?;
         let record = load_task(&transaction, &task_id.0.to_string(), tenant_id)?;
+        transaction.commit()?;
+        Ok((SubmitOutcome::Created, record))
+    }
+
+    /// Submete uma tarefa com autorização contextual, rate limit e quotas na mesma transação.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    pub fn submit_task_governed(
+        &self,
+        session_id: Uuid,
+        principal: &Principal,
+        idempotency_key: &str,
+        request_fingerprint: &str,
+        envelope: &TaskEnvelope,
+        priority: i32,
+        max_attempts: u32,
+    ) -> Result<(SubmitOutcome, TaskRecord), QueueError> {
+        validate_key(idempotency_key, "idempotency_key", 256)?;
+        validate_key(request_fingerprint, "request_fingerprint", 128)?;
+        if max_attempts == 0 || max_attempts > 10 {
+            return Err(QueueError::InvalidInput(
+                "max_attempts deve estar entre 1 e 10".to_owned(),
+            ));
+        }
+        if envelope.tenant_id != principal.tenant_id
+            || envelope.operator_id != principal.operator_id
+        {
+            return Err(QueueError::Forbidden);
+        }
+        let now = Utc::now();
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction()?;
+        let session_operator = transaction
+            .query_row(
+                "SELECT operator_id FROM api_sessions
+                 WHERE session_id = ?1 AND tenant_id = ?2",
+                params![session_id.to_string(), principal.tenant_id.0],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or_else(|| QueueError::NotFound(format!("session {session_id}")))?;
+        if session_operator != principal.operator_id.0 {
+            return Err(QueueError::Forbidden);
+        }
+        let limits = load_limits_tx(&transaction, &principal.tenant_id)?;
+        let window_start = fixed_window_start(now, limits.window_seconds);
+        for scope in [
+            format!("tenant:{}:submit", principal.tenant_id.0),
+            format!("operator:{}:submit", principal.operator_id.0),
+        ] {
+            let count = transaction
+                .query_row(
+                    "SELECT request_count FROM api_rate_windows
+                     WHERE scope_key = ?1 AND window_start = ?2",
+                    params![scope, window_start.to_rfc3339()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+                .unwrap_or(0);
+            if count >= i64::from(limits.requests_per_window) {
+                let retry_after = u64::try_from(
+                    (window_start + Duration::seconds(i64::from(limits.window_seconds)) - now)
+                        .num_seconds()
+                        .max(1),
+                )
+                .unwrap_or(1);
+                return Err(QueueError::RateLimited {
+                    retry_after_seconds: retry_after,
+                });
+            }
+        }
+        for scope in [
+            format!("tenant:{}:submit", principal.tenant_id.0),
+            format!("operator:{}:submit", principal.operator_id.0),
+        ] {
+            transaction.execute(
+                "INSERT INTO api_rate_windows (scope_key, window_start, request_count)
+                 VALUES (?1, ?2, 1)
+                 ON CONFLICT(scope_key, window_start)
+                 DO UPDATE SET request_count = request_count + 1",
+                params![scope, window_start.to_rfc3339()],
+            )?;
+        }
+        if let Some(existing_id) = transaction
+            .query_row(
+                "SELECT task_id FROM api_tasks
+                 WHERE tenant_id = ?1 AND idempotency_key = ?2",
+                params![principal.tenant_id.0, idempotency_key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            let existing = load_task(&transaction, &existing_id, &principal.tenant_id)?;
+            if existing.request_fingerprint != request_fingerprint {
+                return Err(QueueError::IdempotencyConflict);
+            }
+            transaction.commit()?;
+            return Ok((SubmitOutcome::Existing, existing));
+        }
+        let active_count: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM api_tasks
+             WHERE tenant_id = ?1 AND status IN ('queued', 'running', 'cancel_requested')",
+            params![principal.tenant_id.0],
+            |row| row.get(0),
+        )?;
+        if active_count >= i64::from(limits.max_active_tasks) {
+            return Err(QueueError::QuotaExceeded("max_active_tasks".to_owned()));
+        }
+        let day_start = now
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .unwrap_or(now.naive_utc());
+        let day_start = DateTime::<Utc>::from_naive_utc_and_offset(day_start, Utc);
+        let daily_count: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM api_tasks WHERE tenant_id = ?1 AND created_at >= ?2",
+            params![principal.tenant_id.0, day_start.to_rfc3339()],
+            |row| row.get(0),
+        )?;
+        if daily_count >= i64::from(limits.max_daily_tasks) {
+            return Err(QueueError::QuotaExceeded("max_daily_tasks".to_owned()));
+        }
+        let mut daily_cost = 0_u64;
+        let mut statement = transaction.prepare(
+            "SELECT envelope_json FROM api_tasks WHERE tenant_id = ?1 AND created_at >= ?2",
+        )?;
+        let rows = statement.query_map(
+            params![principal.tenant_id.0, day_start.to_rfc3339()],
+            |row| row.get::<_, String>(0),
+        )?;
+        for row in rows {
+            let json = row?;
+            let stored: TaskEnvelope = serde_json::from_str(&json)?;
+            daily_cost = daily_cost.saturating_add(stored.budget.max_cost_microunits);
+        }
+        drop(statement);
+        if daily_cost.saturating_add(envelope.budget.max_cost_microunits)
+            > limits.max_daily_cost_microunits
+        {
+            return Err(QueueError::QuotaExceeded(
+                "max_daily_cost_microunits".to_owned(),
+            ));
+        }
+        let task_id = envelope.task_id.clone();
+        let envelope_json = serde_json::to_string(envelope)?;
+        transaction.execute(
+            "INSERT INTO api_tasks
+             (task_id, session_id, tenant_id, idempotency_key, request_fingerprint,
+              objective, envelope_json, status, priority, attempts, max_attempts,
+              next_attempt_at, cancel_requested, lease_until, result_json, last_error,
+              created_at, updated_at, completed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'queued', ?8, 0, ?9, ?10, 0,
+                     NULL, NULL, NULL, ?10, ?10, NULL)",
+            params![
+                task_id.0.to_string(),
+                session_id.to_string(),
+                principal.tenant_id.0,
+                idempotency_key,
+                request_fingerprint,
+                envelope.objective.clone(),
+                envelope_json,
+                priority,
+                max_attempts,
+                now.to_rfc3339(),
+            ],
+        )?;
+        let record = load_task(&transaction, &task_id.0.to_string(), &principal.tenant_id)?;
         transaction.commit()?;
         Ok((SubmitOutcome::Created, record))
     }
@@ -733,6 +1306,135 @@ fn parse_datetime(value: &str) -> Result<DateTime<Utc>, QueueError> {
         .map_err(|error| QueueError::InvalidInput(format!("timestamp inválido: {error}")))
 }
 
+fn sha256_hex(value: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(value.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn default_limits(tenant_id: &TenantId) -> TenantLimits {
+    TenantLimits {
+        tenant_id: tenant_id.clone(),
+        max_active_tasks: 32,
+        max_daily_tasks: 1_000,
+        max_daily_cost_microunits: 10_000_000,
+        requests_per_window: 120,
+        window_seconds: 60,
+    }
+}
+
+fn validate_limits(limits: &TenantLimits) -> Result<(), QueueError> {
+    if limits.max_active_tasks == 0 || limits.max_active_tasks > 100_000 {
+        return Err(QueueError::InvalidInput(
+            "max_active_tasks deve estar entre 1 e 100000".to_owned(),
+        ));
+    }
+    if limits.max_daily_tasks == 0 || limits.max_daily_tasks > 1_000_000 {
+        return Err(QueueError::InvalidInput(
+            "max_daily_tasks deve estar entre 1 e 1000000".to_owned(),
+        ));
+    }
+    if limits.max_daily_cost_microunits == 0 {
+        return Err(QueueError::InvalidInput(
+            "max_daily_cost_microunits deve ser positivo".to_owned(),
+        ));
+    }
+    if limits.requests_per_window == 0 || limits.requests_per_window > 1_000_000 {
+        return Err(QueueError::InvalidInput(
+            "requests_per_window deve estar entre 1 e 1000000".to_owned(),
+        ));
+    }
+    if limits.window_seconds == 0 || limits.window_seconds > 86_400 {
+        return Err(QueueError::InvalidInput(
+            "window_seconds deve estar entre 1 e 86400".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn fixed_window_start(now: DateTime<Utc>, window_seconds: u32) -> DateTime<Utc> {
+    let seconds = now.timestamp();
+    let window = i64::from(window_seconds.max(1));
+    let start = seconds - seconds.rem_euclid(window);
+    DateTime::<Utc>::from_timestamp(start, 0).unwrap_or(now)
+}
+
+fn load_limits_tx(
+    transaction: &rusqlite::Transaction<'_>,
+    tenant_id: &TenantId,
+) -> Result<TenantLimits, QueueError> {
+    transaction
+        .query_row(
+            "SELECT max_active_tasks, max_daily_tasks, max_daily_cost_microunits,
+                    requests_per_window, window_seconds
+             FROM api_tenant_limits WHERE tenant_id = ?1",
+            params![tenant_id.0],
+            |row| {
+                Ok(TenantLimits {
+                    tenant_id: tenant_id.clone(),
+                    max_active_tasks: row.get(0)?,
+                    max_daily_tasks: row.get(1)?,
+                    max_daily_cost_microunits: row.get(2)?,
+                    requests_per_window: row.get(3)?,
+                    window_seconds: row.get(4)?,
+                })
+            },
+        )
+        .optional()?
+        .ok_or_else(|| QueueError::NotFound(format!("tenant {}", tenant_id.0)))
+}
+
+fn ensure_limits_tx(
+    transaction: &rusqlite::Transaction<'_>,
+    tenant_id: &TenantId,
+    now: &str,
+) -> Result<(), QueueError> {
+    let limits = default_limits(tenant_id);
+    transaction.execute(
+        "INSERT OR IGNORE INTO api_tenant_limits
+         (tenant_id, max_active_tasks, max_daily_tasks, max_daily_cost_microunits,
+          requests_per_window, window_seconds)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            tenant_id.0,
+            limits.max_active_tasks,
+            limits.max_daily_tasks,
+            limits.max_daily_cost_microunits,
+            limits.requests_per_window,
+            limits.window_seconds,
+        ],
+    )?;
+    let _ = now;
+    Ok(())
+}
+
+fn load_tenant_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TenantRecord> {
+    let tenant_id = row.get::<_, String>(0)?;
+    let display_name = row.get::<_, String>(1)?;
+    let active = row.get::<_, i64>(2)? != 0;
+    let created_at = row.get::<_, String>(3)?;
+    let limits = TenantLimits {
+        tenant_id: TenantId::new(tenant_id.clone())
+            .map_err(|error| to_sql_error(QueueError::Core(error)))?,
+        max_active_tasks: row.get(4)?,
+        max_daily_tasks: row.get(5)?,
+        max_daily_cost_microunits: row.get(6)?,
+        requests_per_window: row.get(7)?,
+        window_seconds: row.get(8)?,
+    };
+    Ok(TenantRecord {
+        tenant_id: limits.tenant_id.clone(),
+        display_name,
+        active,
+        created_at: parse_datetime(&created_at).map_err(to_sql_error)?,
+        limits,
+    })
+}
+
+fn to_sql_error(error: QueueError) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
+}
+
 fn load_task(
     connection: &Connection,
     task_id: &str,
@@ -816,6 +1518,84 @@ mod tests {
             "objetivo de teste",
         )
         .unwrap()
+    }
+
+    #[test]
+    fn iam_token_is_resolved_without_persisting_plaintext_in_contract() {
+        let store = QueueStore::in_memory().unwrap();
+        let tenant = TenantId::new("tenant-iam").unwrap();
+        store.create_tenant(&tenant, "Tenant IAM").unwrap();
+        let operator = OperatorId::new("user-iam").unwrap();
+        store
+            .create_user(&operator, &tenant, &Role::Operator)
+            .unwrap();
+        let issue = store.issue_token(&operator, None).unwrap();
+        assert!(issue.token.starts_with("shk_"));
+        let authenticated = store.authenticate_token(&issue.token).unwrap();
+        assert_eq!(authenticated.principal.tenant_id, tenant);
+        assert_eq!(authenticated.principal.operator_id, operator);
+        assert_eq!(authenticated.source, AuthSource::Token);
+        store.revoke_token(&issue.token_id).unwrap();
+        assert!(matches!(
+            store.authenticate_token(&issue.token),
+            Err(QueueError::Unauthorized)
+        ));
+    }
+
+    #[test]
+    fn governed_submission_applies_quota_and_idempotency() {
+        let store = QueueStore::in_memory().unwrap();
+        let principal = principal();
+        store.bootstrap_principal(&principal).unwrap();
+        store
+            .set_limits(TenantLimits {
+                tenant_id: principal.tenant_id.clone(),
+                max_active_tasks: 1,
+                max_daily_tasks: 10,
+                max_daily_cost_microunits: 2_000_000,
+                requests_per_window: 10,
+                window_seconds: 60,
+            })
+            .unwrap();
+        let session = store
+            .create_session(principal.clone(), Value::Null)
+            .unwrap();
+        let first_envelope = envelope(&principal);
+        let (first, task) = store
+            .submit_task_governed(
+                session.session_id,
+                &principal,
+                "governed-1",
+                "fp-governed-1",
+                &first_envelope,
+                1,
+                1,
+            )
+            .unwrap();
+        assert_eq!(first, SubmitOutcome::Created);
+        let replay = store
+            .submit_task_governed(
+                session.session_id,
+                &principal,
+                "governed-1",
+                "fp-governed-1",
+                &first_envelope,
+                1,
+                1,
+            )
+            .unwrap();
+        assert_eq!(replay.0, SubmitOutcome::Existing);
+        let second = store.submit_task_governed(
+            session.session_id,
+            &principal,
+            "governed-2",
+            "fp-governed-2",
+            &envelope(&principal),
+            1,
+            1,
+        );
+        assert!(matches!(second, Err(QueueError::QuotaExceeded(_))));
+        assert_eq!(task.task_id, replay.1.task_id);
     }
 
     #[test]

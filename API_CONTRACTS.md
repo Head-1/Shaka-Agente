@@ -2,7 +2,7 @@
 
 ## 1. Convenções
 
-Os contratos abaixo representam o núcleo do Shaka e a API REST persistente da release 0.5.0. Campos de identificação são string no JSON, embora alguns sejam wrappers tipados em Rust. Datas usam RFC 3339. O host deve rejeitar campos desconhecidos quando o contrato de integração exigir compatibilidade estrita.
+Os contratos abaixo representam o núcleo do Shaka e a API REST persistente da release 0.6.0. Campos de identificação são string no JSON, embora alguns sejam wrappers tipados em Rust. Datas usam RFC 3339. O host deve rejeitar campos desconhecidos quando o contrato de integração exigir compatibilidade estrita.
 
 ## 2. TaskEnvelope
 
@@ -190,7 +190,9 @@ A CLI oferece `doctor`, `backup`, `restore`, `verify-audit` e `config`. Backup u
 
 ## 13. API REST persistente v1
 
-A API usa JSON UTF-8, prefixo `/v1` e o principal local configurado pelo operador. O cliente não escolhe `tenant_id`, `operator_id` ou `role`. O bind padrão é `127.0.0.1:8080`; binds não locais exigem chave configurada e o header `Authorization: Bearer <chave>`.
+A API usa JSON UTF-8, prefixo `/v1` e resolve o principal por `Authorization: Bearer <token>`. O cliente não escolhe `tenant_id`, `operator_id` ou `role`; esses campos vêm exclusivamente do token autenticado. Em loopback, sem `SHAKA_API_KEY`, o modo local anônimo continua disponível para compatibilidade operacional. Uma API key estática configurada continua válida como compatibilidade explícita. Binds não locais exigem API key estática ou pelo menos um token IAM persistente ativo.
+
+Tokens IAM são opacos, exibidos somente uma vez na emissão e persistidos apenas como SHA-256. Tokens expirados, revogados, associados a usuário inativo ou pertencentes a tenant inativo retornam `401`. Um principal autenticado sem ação permitida retorna `403`; quota ou rate limit excedido retorna `429`, com `Retry-After` quando aplicável.
 
 | Método e rota | Entrada | Semântica |
 |---|---|---|
@@ -201,12 +203,27 @@ A API usa JSON UTF-8, prefixo `/v1` e o principal local configurado pelo operado
 | `GET /v1/tasks/{task_id}` | UUID da tarefa | Retorna estado, tentativas, lease, erro redacted e resultado quando disponível. |
 | `DELETE /v1/tasks/{task_id}` | UUID da tarefa | Solicita cancelamento cooperativo; retorna `202` enquanto o worker ainda encerra. |
 
-Uma tarefa pode estar em `queued`, `running`, `succeeded`, `failed`, `cancel_requested` ou `cancelled`. A fila ordena prioridade descrescente e criação crescente. Um lease expirado volta para `queued` na recuperação do processo, preservando tentativas e auditoria.
+Uma tarefa pode estar em `queued`, `running`, `succeeded`, `failed`, `cancel_requested` ou `cancelled`. Cada nova submissão passa por rate limit de tenant e operador, quota de tarefas ativas, quota diária e quota de custo máximo diário. Repetições idempotentes não criam nova tarefa nem consomem quota de criação, embora continuem sujeitas ao rate limit de requests. A fila ordena prioridade descrescente e criação crescente. Um lease expirado volta para `queued` na recuperação do processo, preservando tentativas e auditoria.
 
 A chave de idempotência é única por tenant. O mesmo valor com o mesmo fingerprint devolve a tarefa existente; o mesmo valor com outro payload produz `409 Conflict`. Falhas de transporte do modelo e deadlines podem ser repetidas até `max_attempts`, com backoff exponencial limitado. Entradas inválidas, autorização, schema, capability e orçamento não são retryable.
 
 O circuit breaker persistido usa `closed`, `open` e `half_open`. Quando aberto, workers deixam tarefas em `queued` até a janela de recuperação. O cancelamento é cooperativo e é observado antes de cada passo, ferramenta e chamada assíncrona do runtime.
 
-## 14. Compatibilidade
+## 14. IAM, quotas e administração local
+
+A CLI administrativa mantém a criação e o controle fora da API pública:
+
+```text
+shaka iam tenant-create <tenant_id> <display_name>
+shaka iam user-create <operator_id> --tenant <tenant_id> --role operator|reviewer|administrator
+shaka iam token-issue <operator_id> [--expires-in-seconds N]
+shaka iam token-revoke <token_id>
+shaka iam limits-set <tenant_id> --max-active N --max-daily N --max-cost-microunits N --requests N --window-seconds N
+shaka iam list
+```
+
+A v0.6.0 implementa IAM persistente local e um contrato preparado para futura integração OIDC/OAuth2. Não há endpoint para autoemissão de token, alteração de papel, criação de tenant ou elevação de quota. Essas operações exigem o papel administrador na CLI e geram auditoria redacted.
+
+## 15. Compatibilidade
 
 Novos campos opcionais podem ser adicionados em uma versão minor. Remoção ou alteração semântica exige versão major e ADR. Skills devem versionar separadamente de schemas de tools e do runtime. Migrações de memória devem registrar versão do schema e permitir restauração.

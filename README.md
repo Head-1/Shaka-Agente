@@ -2,7 +2,7 @@
 
 MVP de um agente de IA **extensível, auditável e governado pelo operador**, implementado em Rust. O projeto prioriza uma fronteira segura para execução dinâmica, memória persistente, contratos tipados e documentação operável.
 
-> **Estado atual:** v0.5.0, produção candidata para operação controlada. Além da CLI, o Shaka oferece API HTTP persistente com sessões SQLite, fila priorizada, retry, cancelamento, idempotência e circuit breaker. O modelo local continua disponível para desenvolvimento; production exige provedor externo HTTPS, chave de API, auditoria habilitada e configuração validada. Mensageria, pesquisa web e autopromoção de skills permanecem deliberadamente desabilitadas.
+> **Estado atual:** v0.6.0, produção candidata para operação controlada e multiusuário local. Além da CLI, o Shaka oferece API HTTP persistente com sessões SQLite, fila priorizada, retry, cancelamento, idempotência, circuit breaker, IAM persistente, tokens bearer, isolamento por tenant, quotas e rate limits. O modelo local continua disponível para desenvolvimento; production exige provedor externo HTTPS, chave de API, auditoria habilitada e configuração validada. Mensageria, pesquisa web e autopromoção de skills permanecem deliberadamente desabilitadas.
 
 ## Objetivos do MVP
 
@@ -25,6 +25,8 @@ O Shaka já oferece um núcleo modular com as seguintes capacidades:
 | Tracing estruturado | Implementado |
 | API HTTP persistente | Implementada com `shaka-api` e `shaka-queue` |
 | Sessões, fila, retry, cancelamento e idempotência | Persistentes em SQLite |
+| IAM multiusuário local | Tenants, usuários, tokens hash-only, revogação e expiração |
+| Quotas e rate limits | Persistentes por tenant e operador |
 | Circuit breaker | Persistente e fail-safe |
 | Auditoria persistente com cadeia de hashes | Implementado por tenant, com verificação CLI |
 | Mensageria externa | Não habilitada no MVP |
@@ -72,7 +74,7 @@ Iniciar a API persistente localmente, com bind em loopback por padrão:
 cargo run -- serve --bind 127.0.0.1:8080 --workers 2
 ```
 
-O serviço expõe `GET /healthz`, `POST /v1/sessions`, `GET /v1/sessions/{session_id}`, `POST /v1/sessions/{session_id}/tasks`, `GET /v1/tasks/{task_id}` e `DELETE /v1/tasks/{task_id}`. Toda submissão exige o header `Idempotency-Key`; tarefas iniciam em dry-run e são executadas por workers persistentes. Para um bind não local, configure `SHAKA_API_KEY` e use `Authorization: Bearer <chave>`.
+O serviço expõe `GET /healthz`, `POST /v1/sessions`, `GET /v1/sessions/{session_id}`, `POST /v1/sessions/{session_id}/tasks`, `GET /v1/tasks/{task_id}` e `DELETE /v1/tasks/{task_id}`. Toda submissão exige o header `Idempotency-Key`; tarefas iniciam em dry-run e são executadas por workers persistentes. Em loopback, a compatibilidade anônima local continua disponível; para bind não local, configure `SHAKA_API_KEY` ou um token IAM persistente e use `Authorization: Bearer <token>`.
 
 Exemplo de criação de sessão e tarefa:
 
@@ -86,7 +88,21 @@ curl -fsS -X POST "http://127.0.0.1:8080/v1/sessions/$SESSION/tasks" \
   -d '{"objective":"Descreva a política de execução segura","priority":5}'
 ```
 
-Consultar a memória episódica:
+## Administrar identidade, tenants e quotas
+
+As operações IAM ficam fora da API pública e exigem o papel `administrator`:
+
+```bash
+cargo run -- iam tenant-create acme "Acme"
+cargo run -- iam user-create alice --tenant acme --role operator
+cargo run -- iam token-issue alice --expires-in-seconds 86400
+cargo run -- iam limits-set acme --max-active 32 --max-daily 1000 --max-cost-microunits 10000000 --requests 120 --window-seconds 60
+cargo run -- iam list
+```
+
+O token bruto é exibido somente na emissão. Armazene-o em um cofre; o banco persiste apenas seu SHA-256, e a auditoria registra somente `token_id` e prefixo público.
+
+## Consultar a memória episódica
 
 ```bash
 cargo run -- memory recent --limit 10
@@ -178,11 +194,11 @@ Conteúdo externo, quando uma camada futura de pesquisa web for adicionada, deve
 
 A release atual adiciona API HTTP persistente, sessões, fila priorizada, leases recuperáveis, retry com backoff, cancelamento cooperativo, idempotência, circuit breaker, configuração tipada, RBAC mínimo, validação JSON Schema, redaction, cadeia de auditoria, backup/restore, integrity check, gravação atômica de skills, Wasmtime atualizado e cargo-audit obrigatório. O documento `V0.5_DESIGN.md` contém os contratos e as condições para promoção ao ambiente real.
 
-O sistema ainda não é uma implantação pública pronta sem infraestrutura adicional. Faltam IAM remoto, cofre de segredos, backup externo, métricas remotas, mensageria, pesquisa web, subagentes distribuídos, rate limits distribuídos e multi-tenancy forte.
+O sistema ainda não é uma implantação pública pronta sem infraestrutura adicional. A v0.6.0 adiciona IAM persistente local e isolamento de tenants no processo, mas ainda faltam IAM remoto OIDC/OAuth2, cofre de segredos, backup externo, métricas remotas, mensageria, pesquisa web, subagentes distribuídos, rate limits distribuídos e PostgreSQL/row-level security para escala horizontal.
 
 ## Limitações operacionais remanescentes
 
-O parâmetro `--live` exige confirmação explícita e papel administrador, mas nenhuma ferramenta externa de mensageria é registrada nesta release. Portanto, ele não deve ser interpretado como autorização para enviar mensagens reais. A produção pública continua dependendo de IAM remoto, cofre de segredos, backup externo, alertas, política de dados, mensageria validada, pesquisa web isolada e multi-tenancy forte.
+O parâmetro `--live` exige confirmação explícita e papel administrador, mas nenhuma ferramenta externa de mensageria é registrada nesta release. Tokens IAM e quotas governam a API, mas não substituem um provedor IAM remoto nem um cofre de segredos. Portanto, ele não deve ser interpretado como autorização para enviar mensagens reais. A produção pública continua dependendo de IAM remoto, cofre de segredos, backup externo, alertas, política de dados, mensageria validada, pesquisa web isolada e multi-tenancy forte.
 
 ## Princípios de operação
 
