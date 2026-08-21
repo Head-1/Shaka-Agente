@@ -19,7 +19,10 @@ use shaka_skills::{ActiveSkillArtifact, TrustStore, sha256_file};
 use std::fs;
 use std::{
     collections::{BTreeMap, HashMap},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Instant,
 };
 use thiserror::Error;
@@ -44,6 +47,39 @@ pub enum OrchestratorError {
     ToolExecution(String),
     #[error("limite de tempo da tarefa excedido")]
     DeadlineExceeded,
+    #[error("execução cancelada pelo operador")]
+    Cancelled,
+}
+
+/// Handle cooperativo usado para interromper uma execução entre operações seguras.
+#[derive(Debug, Clone, Default)]
+pub struct CancellationToken {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl CancellationToken {
+    /// Cria um token inicialmente não cancelado.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Solicita o cancelamento da execução associada.
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    /// Informa se o cancelamento foi solicitado.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    async fn wait(&self) {
+        while !self.is_cancelled() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -404,6 +440,37 @@ impl AgentRuntime {
         Ok(())
     }
 
+    fn record_cancelled(
+        &self,
+        envelope: &TaskEnvelope,
+        started: Instant,
+    ) -> Result<(), shaka_memory::MemoryError> {
+        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let episode = EpisodicRecord {
+            id: Uuid::new_v4(),
+            tenant_id: envelope.tenant_id.clone(),
+            task_id: Some(envelope.task_id.clone()),
+            kind: "agent_run".to_owned(),
+            content: "execução cancelada pelo operador".to_owned(),
+            outcome: "cancelled".to_owned(),
+            cost_microunits: 0,
+            elapsed_ms,
+            created_at: Utc::now(),
+        };
+        self.memory.append_episode(&episode)?;
+        let audit = AuditEvent::new(
+            Some(envelope.task_id.clone()),
+            envelope.tenant_id.clone(),
+            envelope.operator_id.0.clone(),
+            "agent.run",
+            "cancelled",
+            BTreeMap::from([(String::from("elapsed_ms"), elapsed_ms.to_string())]),
+            None,
+        );
+        self.memory.append_audit_event(&audit)?;
+        Ok(())
+    }
+
     fn failed_tool_result(tool_name: &str, error: &OrchestratorError) -> ToolResult {
         ToolResult {
             tool_name: tool_name.to_owned(),
@@ -426,6 +493,17 @@ impl AgentRuntime {
 
     #[allow(clippy::too_many_lines)]
     pub async fn run(&self, envelope: TaskEnvelope) -> Result<AgentRunResult, OrchestratorError> {
+        self.run_with_cancellation(envelope, CancellationToken::new())
+            .await
+    }
+
+    /// Executa uma tarefa com um sinal de cancelamento cooperativo.
+    #[allow(clippy::too_many_lines)]
+    pub async fn run_with_cancellation(
+        &self,
+        envelope: TaskEnvelope,
+        cancellation: CancellationToken,
+    ) -> Result<AgentRunResult, OrchestratorError> {
         let started = Instant::now();
         if envelope.budget.max_elapsed_ms == 0 {
             let error =
@@ -441,6 +519,12 @@ impl AgentRuntime {
         let mut all_tool_results = Vec::new();
         let mut prior_tool_results = Vec::new();
         let final_content: String = loop {
+            if cancellation.is_cancelled() {
+                if let Err(record_error) = self.record_cancelled(&envelope, started) {
+                    warn!(task_id = ?envelope.task_id, ?record_error, "cancelamento não pôde ser auditado");
+                }
+                return Err(OrchestratorError::Cancelled);
+            }
             if step_count >= envelope.budget.max_steps {
                 let error =
                     OrchestratorError::Core(CoreError::BudgetExceeded("max_steps".to_owned()));
@@ -465,12 +549,17 @@ impl AgentRuntime {
                 prior_tool_results: prior_tool_results.clone(),
                 max_output_tokens: 1_024,
             };
-            let response = match timeout(
-                Duration::from_millis(remaining_ms),
-                self.model.complete(request),
-            )
-            .await
-            {
+            let response = tokio::select! {
+                () = cancellation.wait() => {
+                    if let Err(record_error) = self.record_cancelled(&envelope, started) {
+                        warn!(task_id = ?envelope.task_id, ?record_error, "cancelamento não pôde ser auditado");
+                    }
+                    return Err(OrchestratorError::Cancelled);
+                }
+                result = timeout(
+                    Duration::from_millis(remaining_ms),
+                    self.model.complete(request),
+                ) => match result {
                 Ok(Ok(response)) => response,
                 Ok(Err(error)) => {
                     if let Err(record_error) = self.record_failure(&envelope, started, &error) {
@@ -485,7 +574,7 @@ impl AgentRuntime {
                     }
                     return Err(error);
                 }
-            };
+            }};
             step_count = step_count.saturating_add(1);
             total_cost_microunits =
                 total_cost_microunits.saturating_add(response.estimated_cost_microunits);
@@ -524,13 +613,24 @@ impl AgentRuntime {
                     }
                     return Err(error);
                 }
+                if cancellation.is_cancelled() {
+                    if let Err(record_error) = self.record_cancelled(&envelope, started) {
+                        warn!(task_id = ?envelope.task_id, ?record_error, "cancelamento não pôde ser auditado");
+                    }
+                    return Err(OrchestratorError::Cancelled);
+                }
                 let tool_name = call.tool_name.clone();
-                let result = match timeout(
-                    Duration::from_millis(remaining_ms),
-                    self.tools.execute(&envelope, &tool_name, call.arguments),
-                )
-                .await
-                {
+                let result = tokio::select! {
+                    () = cancellation.wait() => {
+                        if let Err(record_error) = self.record_cancelled(&envelope, started) {
+                            warn!(task_id = ?envelope.task_id, ?record_error, "cancelamento não pôde ser auditado");
+                        }
+                        return Err(OrchestratorError::Cancelled);
+                    }
+                    result = timeout(
+                        Duration::from_millis(remaining_ms),
+                        self.tools.execute(&envelope, &tool_name, call.arguments),
+                    ) => match result {
                     Ok(Ok(result)) => result,
                     Ok(Err(error)) => {
                         warn!(task_id = ?envelope.task_id, tool = %tool_name, ?error, "ferramenta falhou");
@@ -542,7 +642,7 @@ impl AgentRuntime {
                         success: false,
                         error_code: Some("tool_deadline_exceeded".to_owned()),
                     },
-                };
+                }};
                 let safe_result = Self::sanitize_tool_result(result);
                 let mut tool_metadata = BTreeMap::new();
                 tool_metadata.insert("tool".to_owned(), safe_result.tool_name.clone());
