@@ -47,11 +47,9 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-release-v2-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-release-
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-release-v2-
 
       - name: Read package version
         id: version
@@ -82,10 +80,14 @@ jobs:
       - name: Workflow policy
         run: python3 ./scripts/workflow_policy_check.py
 
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit@0.22.2
+          fallback: none
+
       - name: Dependency audit
-        run: |
-          cargo install cargo-audit --version 0.22.2 --locked
-          cargo audit
+        run: cargo audit
 
       - name: Production smoke test
         run: bash ./scripts/production_smoke.sh
