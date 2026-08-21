@@ -1,0 +1,2242 @@
+diff --git a/API_CONTRACTS.md b/API_CONTRACTS.md
+index 8823418..ead9947 100644
+--- a/API_CONTRACTS.md
++++ b/API_CONTRACTS.md
+@@ -194,6 +194,14 @@ A API usa JSON UTF-8, prefixo `/v1` e resolve o principal por `Authorization: Be
+ 
+ Tokens IAM são opacos, exibidos somente uma vez na emissão e persistidos apenas como SHA-256. Tokens expirados, revogados, associados a usuário inativo ou pertencentes a tenant inativo retornam `401`. Um principal autenticado sem ação permitida retorna `403`; quota ou rate limit excedido retorna `429`, com `Retry-After` quando aplicável.
+ 
++### Correlação HTTP e telemetria
++
++Cada request recebe um `x-request-id` validado. O cliente pode enviar um valor com até 128 caracteres ASCII alfanuméricos ou `-`, `_`, `.`, `~`; valores inválidos são substituídos por um UUID novo. A resposta sempre devolve `x-request-id` com o identificador efetivo. Respostas de erro também incluem o mesmo valor no campo JSON `request_id`.
++
++O header `traceparent` pode propagar um contexto W3C válido para os spans internos. O Shaka aceita somente versão, trace ID, span ID e flags hexadecimais em formato válido, rejeita IDs zero e ignora o header inteiro quando inválido. O valor recebido não concede autenticação, autorização ou capacidade.
++
++A telemetria registra apenas rota normalizada, método, status, classe de status e referências técnicas. URI bruta, query string, corpo, objetivo, prompt, resposta, argumentos de ferramenta, bearer token e API keys não são registrados por padrão. A integração de exporters externos permanece fora desta etapa.
++
+ | Método e rota | Entrada | Semântica |
+ |---|---|---|
+ | `GET /healthz` | Nenhuma | Retorna `status`, versão, quantidade de tarefas ativas e snapshot do circuito. |
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 1eca8d8..614bd1f 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -4,6 +4,27 @@ Todas as mudanças relevantes do Shaka serão registradas neste arquivo. O forma
+ 
+ ## [Unreleased]
+ 
++### v0.7.0 — Etapa A: observabilidade governada
++
++- Fachada `Telemetry` com schema interno `shaka.observability` v0.7 e perfil `shaka.genai.v0.7`.
++- `CorrelationContext` com request ID validado e referências opcionais de trace, span, tarefa, sessão e tenant redacted.
++- `Redactor` central para texto, metadata e JSON recursivo, com limites de profundidade/itens/tamanho e captura de conteúdo desabilitada por padrão.
++- `AuditLogger` passa a aplicar redaction central antes de persistir metadata textual ou JSON.
++- Testes unitários de redaction, correlação, schema, limites e rejeição de captura de conteúdo.
++- Middleware HTTP com `x-request-id` validado, geração de UUID para entrada inválida e propagação do ID efetivo na resposta.
++- Propagação segura de `traceparent` W3C para spans internos, com rejeição de versões/IDs inválidos e sem efeito sobre autorização.
++- Spans de servidor HTTP e spans filhos por operação de health, sessão e tarefa, usando rotas normalizadas e referências técnicas.
++- Auditoria de API enriquecida com request/trace correlation IDs redacted, sem payload ou segredo.
++
++### Segurança e governança
++
++- Redactor endurecido contra `Authorization: Bearer`, chaves compostas de conteúdo (`prompt_text`, `model_input`, `response_content`) e truncamento que ultrapassava o limite configurado.
++- Falha interna da expressão de redaction agora degrada para marcador seguro, nunca para o texto original.
++- Tenant references em `CorrelationContext` são pseudonimizadas com prefixo SHA-256 truncado; tokens, objetivos e conteúdo GenAI não entram nos spans.
++- Spans `queue.admission`, `queue.claim`, `queue.finish`, `queue.lease.recover`, `queue.circuit.*` e `worker.task.process` para correlacionar admissão, leases, tentativas, retries e estados do circuito.
++- Taxonomias de outcome e erro de baixa cardinalidade para `created`, `existing`, `claimed`, `empty`, `succeeded`, `retry_scheduled`, `failed`, `cancelled`, `rate_limited` e classes equivalentes.
++- Registro de worker, attempt, retryability, retry delay, lease state, circuit state e quantidade de leases recuperados sem incluir payloads, mensagens livres ou IDs como labels métricas.
++
+ ### Planejado
+ 
+ - Busca semântica com embeddings e recuperação híbrida.
+diff --git a/Cargo.lock b/Cargo.lock
+index d822f50..62b55b3 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2392,7 +2392,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "shaka-api"
+-version = "0.6.0"
++version = "0.7.0"
+ dependencies = [
+  "async-trait",
+  "axum",
+@@ -2417,7 +2417,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "shaka-cli"
+-version = "0.6.0"
++version = "0.7.0"
+ dependencies = [
+  "anyhow",
+  "chrono",
+@@ -2442,7 +2442,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "shaka-config"
+-version = "0.6.0"
++version = "0.7.0"
+ dependencies = [
+  "serde",
+  "shaka-core",
+@@ -2452,7 +2452,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "shaka-core"
+-version = "0.6.0"
++version = "0.7.0"
+ dependencies = [
+  "chrono",
+  "hex",
+@@ -2467,7 +2467,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "shaka-memory"
+-version = "0.6.0"
++version = "0.7.0"
+ dependencies = [
+  "chrono",
+  "parking_lot",
+@@ -2481,18 +2481,23 @@ dependencies = [
+ 
+ [[package]]
+ name = "shaka-observability"
+-version = "0.6.0"
++version = "0.7.0"
+ dependencies = [
++ "hex",
++ "regex",
+  "serde_json",
++ "sha2",
+  "shaka-core",
+  "shaka-memory",
++ "thiserror",
+  "tracing",
+  "tracing-subscriber",
++ "uuid",
+ ]
+ 
+ [[package]]
+ name = "shaka-orchestrator"
+-version = "0.6.0"
++version = "0.7.0"
+ dependencies = [
+  "async-trait",
+  "chrono",
+@@ -2515,7 +2520,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "shaka-queue"
+-version = "0.6.0"
++version = "0.7.0"
+ dependencies = [
+  "chrono",
+  "hex",
+@@ -2531,7 +2536,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "shaka-sandbox"
+-version = "0.6.0"
++version = "0.7.0"
+ dependencies = [
+  "serde",
+  "shaka-core",
+@@ -2542,7 +2547,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "shaka-skills"
+-version = "0.6.0"
++version = "0.7.0"
+ dependencies = [
+  "chrono",
+  "ed25519-dalek",
+diff --git a/Cargo.toml b/Cargo.toml
+index 6ab7841..3b5c8f5 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -16,7 +16,7 @@ members = [
+ [workspace.package]
+ edition = "2024"
+ license = "Apache-2.0"
+-version = "0.6.0"
++version = "0.7.0"
+ authors = ["Shaka Contributors"]
+ rust-version = "1.85"
+ 
+diff --git a/V0.7_DESIGN.md b/V0.7_DESIGN.md
+new file mode 100644
+index 0000000..21b8769
+--- /dev/null
++++ b/V0.7_DESIGN.md
+@@ -0,0 +1,253 @@
++# Shaka v0.7.0 — Plano técnico de observabilidade governada
++
++**Status:** planejamento concluído; pronto para execução por etapas
++
++**Projeto:** Shaka — agente de IA governado em Rust
++
++**Princípio central:** potência sem controle não é capacidade operacional aceitável.
++
++## 1. Objetivo da versão
++
++A v0.7.0 transformará o Shaka em um agente **mensurável, explicável e diagnosticável**, sem ampliar sua autonomia operacional. O foco será responder, com evidência verificável, às perguntas: qual request originou uma tarefa, qual decisão de autorização foi tomada, quanto tempo cada etapa consumiu, qual chamada de modelo ou ferramenta falhou, por que a fila atrasou, quando o circuito abriu e se a auditoria permaneceu íntegra.
++
++A versão não habilitará pesquisa autônoma na web, mensageria externa, self-improving, autopromoção de skills, captura de prompts, live mode automático ou qualquer forma de autoexpansão. O agente continuará com **governança humana de skills**, bind padrão em loopback, tarefas em dry-run por padrão, autorização contextual por tenant e auditoria persistente.
++
++A adoção das convenções GenAI do OpenTelemetry será feita como vocabulário de interoperabilidade, mas encapsulada por um contrato interno versionado `shaka.genai.v0.7`. Isso é necessário porque as convenções GenAI oficiais ainda estão classificadas como **Development** e continuam evoluindo [1] [2]. A telemetria não poderá alterar contratos REST, RBAC, quotas ou decisões de execução.
++
++> **Decisão:** primeiro o Shaka aprenderá a demonstrar o que fez; somente em versões posteriores deverá receber mecanismos adicionais de planejamento e autonomia.
++
++## 2. Estado atual e lacunas que a v0.7.0 resolve
++
++A v0.6.0 já possui IAM persistente, isolamento por tenant, quotas, rate limits, auditoria hash-chained, fila SQLite, circuit breaker, runtime com orçamento e publicação automatizada. A base atual usa `tracing` e `tracing-subscriber`, mas ainda não possui um modelo canônico de métricas, spans, correlação, exportação incremental ou alertas locais.
++
++| Lacuna atual | Correção prevista na v0.7.0 |
++|---|---|
++| `request_id` não é propagado de forma única por HTTP, fila, worker e runtime | contexto de correlação único e propagado |
++| Logs estruturados existem, mas não há contrato de atributos | fachada de observabilidade e schema versionado |
++| Auditoria aceita metadata livre e `record_json` grava JSON arbitrário | metadata tipada, allowlist, limites e redaction central |
++| Não há métricas GenAI ou métricas operacionais padronizadas | métricas agregáveis de HTTP, fila, agente, modelo, ferramenta e auditoria |
++| Não há árvore de traces do agente | spans `invoke_agent`, `chat` e `execute_tool` correlacionados |
++| Auditoria não possui exportação incremental | manifests, cursores, export local e OTLP opcional |
++| Retenção cobre episódios, mas não há política para auditoria/telemetria | retenção separada por sinal, com purge administrativo e fail-closed |
++| Alertas não são avaliados localmente | regras limitadas, cooldown, debounce e eventos auditáveis |
++| Smoke test não valida telemetria | smoke de correlação, redaction, exportação, readiness e alertas |
++
++## 3. Princípios não negociáveis
++
++A auditoria hash-chain persistente permanecerá independente de sampling, exporters e disponibilidade de rede. Falha na persistência de um evento de governança obrigatório deverá bloquear a operação protegida. Falha de métrica, trace ou exporter externo poderá degradar a observabilidade técnica, mas não poderá apagar auditoria, conceder capability, relaxar quota ou executar efeito externo.
++
++O padrão será **não capturar conteúdo**. Prompts, objetivos, respostas, argumentos de ferramentas, resultados de ferramentas, bearer tokens, API keys, cookies, headers de autenticação e chaves privadas não deverão aparecer em logs, spans, métricas, alertas, auditoria ou arquivos exportados. As convenções OpenTelemetry também tratam a captura de conteúdo GenAI como opt-in justamente por seu potencial de conter dados sensíveis [3] [4].
++
++A telemetria deverá permanecer por tenant quando possuir relação com dados de negócio. Identificadores de alta cardinalidade, como `task_id`, `session_id`, `request_id`, `operator_id` e `tenant_id`, não serão labels de métricas. Eles poderão aparecer em traces e eventos de auditoria redacted, onde são necessários para investigação individual.
++
++## 4. Arquitetura proposta
++
++Será criada uma fachada no crate `shaka-observability`. API, fila, runtime e CLI não deverão instanciar exporters diretamente. A fachada separará quatro sinais:
++
++| Sinal | Finalidade | Persistência padrão |
++|---|---|---|
++| Auditoria governada | prova de decisões, transições e ações administrativas | `audit_events` em SQLite, hash-chained |
++| Traces | correlação temporal e diagnóstico de uma execução | SDK local/console; OTLP opt-in |
++| Métricas | agregação de latência, volume, erros e utilização | SDK local/console; OTLP opt-in |
++| Alertas | sinalização de condições anormais | SQLite local + stderr; sem mensageria externa |
++
++A fachada deverá expor tipos como `CorrelationContext`, `TelemetryPolicy`, `TelemetryEvent`, `AlertRule`, `ExportManifest` e um objeto de runtime responsável por providers, flush e shutdown. A instrumentação deverá ser possível mesmo quando o exporter externo estiver desabilitado.
++
++O perfil interno deverá registrar `schema.name=shaka.observability` e `schema.version=0.7`. A versão das convenções externas deverá ser documentada, mas não deverá ser tratada como contrato público estável do Shaka.
++
++## 5. Correlação e hierarquia de traces
++
++Cada request HTTP receberá um `request_id` no ingresso. Se o cliente enviar um valor, ele será aceito somente se passar por validação de formato e tamanho; caso contrário, será gerado um UUID. O mesmo identificador aparecerá na resposta, no span HTTP, na admissão da tarefa e nos eventos redacted de auditoria. Ele nunca será dimensão de métrica.
++
++O contexto de trace será propagado do HTTP para a admissão e para o worker. O worker criará um span próprio de processamento, ligado ao contexto da admissão, sem manter a request HTTP aberta.
++
++| Camada | Nome | Kind | Atributos essenciais |
++|---|---|---|---|
++| HTTP | `HTTP {method} {route_template}` | `SERVER` | método, rota normalizada, status, `shaka.request.id`, resultado de auth |
++| Admissão | `shaka.queue.submit` | `INTERNAL` | outcome de quota, rate limit e idempotência |
++| Worker | `shaka.task.process` | `INTERNAL` | estado, tentativa, lease, retry e dry-run |
++| Agente | `invoke_agent shaka` | `INTERNAL` | `gen_ai.operation.name=invoke_agent`, versão do agente, modo e orçamento |
++| Modelo | `chat {model}` | `CLIENT` remoto ou `INTERNAL` local | provider, modelo solicitado, modelo efetivo, finish reason e erro de baixa cardinalidade |
++| Ferramenta | `execute_tool {tool_name}` | `INTERNAL` | ferramenta aprovada, side effect, capability, schema, dry-run e outcome |
++| Auditoria | `shaka.audit.append` | `INTERNAL` | ação, outcome e obrigatoriedade |
++| Exportação | `shaka.telemetry.export` | `CLIENT` | sinal, destino lógico, outcome e erro sanitizado |
++
++A árvore esperada para uma execução com ferramenta será `HTTP -> shaka.task.process -> invoke_agent -> chat -> execute_tool -> chat`. O span lógico de modelo deverá cobrir retries automáticos e terminar apenas com resposta completa, erro ou cancelamento, em linha com a convenção de spans GenAI [5]. O span `plan` ficará reservado para a v0.8.0, quando existir um Plan Engine real.
++
++## 6. Métricas e convenções
++
++As métricas GenAI seguirão os nomes e unidades oficiais enquanto o perfil interno registrar a versão adotada. O OpenTelemetry recomenda nomes hierárquicos, unidades UCUM e dimensões cuja agregação permaneça significativa [2].
++
++| Métrica | Tipo/unidade | Dimensões permitidas |
++|---|---|---|
++| `gen_ai.client.operation.duration` | Histograma, `s` | operation, provider, modelo normalizado, erro |
++| `gen_ai.client.token.usage` | Histograma, `{token}` | operation, provider, modelo, `gen_ai.token.type` |
++| `gen_ai.invoke_agent.duration` | Histograma, `s` | agent, modo, outcome |
++| `gen_ai.invoke_agent.inference_calls` | Contador, `{call}` | agent, provider, outcome |
++| `gen_ai.invoke_agent.tool_calls` | Contador, `{call}` | agent, ferramenta aprovada, outcome |
++| `gen_ai.execute_tool.duration` | Histograma, `s` | ferramenta, side effect, dry-run, outcome |
++| `shaka.http.server.request.duration` | Histograma, `s` | método, rota normalizada, classe de status |
++| `shaka.queue.admissions` | Contador, `{admission}` | created, existing, conflict, rate_limited, quota_exceeded |
++| `shaka.queue.depth` | Gauge, `{task}` | queued, running |
++| `shaka.queue.task.duration` | Histograma, `s` | resultado, prioridade normalizada |
++| `shaka.task.transitions` | Contador, `{transition}` | estado origem, estado destino, outcome |
++| `shaka.authorization.decisions` | Contador, `{decision}` | action, allowed/denied |
++| `shaka.audit.events` | Contador, `{event}` | ação normalizada, outcome, required |
++| `shaka.audit.append.failures` | Contador, `{failure}` | fase, erro |
++| `shaka.telemetry.export.failures` | Contador, `{failure}` | sinal, exporter, erro |
++| `shaka.alerts` | Contador, `{alert}` | regra, fired/resolved/suppressed |
++
++A métrica de tokens deverá ser registrada somente quando a contagem estiver disponível de maneira confiável. A v0.7.0 não estimará tokens silenciosamente. Também não fixará dimensões de cache, reasoning ou modalidades que ainda estejam sendo discutidas no ecossistema; essas extensões ficarão atrás de um contrato futuro [6].
++
++Os histogramas de duração usarão limites documentados de `[0.01, 0.02, 0.04, 0.08, 0.16, 0.32, 0.64, 1.28, 2.56, 5.12, 10.24, 20.48, 40.96, 81.92]`, e o uso de tokens usará limites `[1, 4, 16, 64, 256, 1024, 4096, 16384, 65536, 262144, 1048576, 4194304, 16777216, 67108864]`, conforme as recomendações atuais [1].
++
++## 7. Taxonomia de auditoria
++
++Os eventos existentes serão preservados e normalizados. Novos eventos deverão ter ação, outcome, tenant efetivo, operador efetivo, task/session quando aplicável, correlation reference redacted e metadata allowlisted.
++
++| Evento | Registro obrigatório |
++|---|---|
++| `http.auth` | autenticação aceita, rejeitada, token expirado ou revogado |
++| `task.admission` | criação, idempotência, conflito, rate limit ou quota |
++| `task.state` | cada transição persistente |
++| `task.retry` | retry agendado, esgotado ou recuperado |
++| `task.cancel` | pedido e conclusão de cancelamento |
++| `task.lease.recover` | recovery de lease após expiração/restart |
++| `agent.run` | sucesso, falha, cancelamento e budget exceeded |
++| `model.call` | provider, modelo, outcome, duração, custo e tokens quando disponíveis |
++| `tool.execute` | ferramenta, side effect, capability, schema, dry-run e outcome |
++| `circuit.transition` | mudança de estado do circuito |
++| `audit.export` | manifesto, intervalo e resultado |
++| `alert.state` | fired, resolved ou suppressed |
++
++A implementação deverá substituir o uso de metadata JSON arbitrário em novos caminhos por um tipo estruturado com allowlist, limites de tamanho e redaction central. A cadeia hash continuará por tenant e deverá permanecer verificável depois de exportação e restore.
++
++## 8. Alertas locais e governados
++
++O avaliador de alertas será interno ao processo, com intervalo limitado, debounce e cooldown persistidos. O sink padrão será stderr e SQLite. Não haverá webhook, email, mensageria externa ou execução autônoma de ação.
++
++| Regra | Severidade | Comportamento |
++|---|---|---|
++| `audit_integrity_invalid` | crítica | readiness degradada e bloqueio de novas ações que exigem auditoria |
++| `audit_append_failure` | crítica | fail-closed na operação protegida |
++| `telemetry_export_failed` | aviso/crítica | continuar com armazenamento local e contabilizar falha |
++| `queue_saturation` | aviso | sinalizar; quotas e rate limits continuam decidindo |
++| `circuit_open` | aviso | sinalizar; circuito existente continua governando |
++| `model_failure_burst` | aviso | sinalizar; não adicionar retries fora do orçamento |
++| `task_stuck` | aviso | sinalizar; recovery de lease existente decide a transição |
++| `rate_limit_burst` | informativa/aviso | sinalizar; nunca relaxar limites |
++
++Nenhum alerta poderá habilitar live mode, conceder capability, aprovar ou revogar skill, alterar quota ou executar ferramenta. A única ação automática permitida será a aplicação das políticas já existentes de fail-closed e readiness para proteger governança.
++
++## 9. Segurança, privacidade e retenção
++
++A telemetria será classificada em quatro classes: auditoria de segurança, metadados operacionais, conteúdo potencialmente sensível e segredos. As duas últimas não serão capturadas na v0.7.0. A redaction será aplicada antes de qualquer emissão, não somente no formatter de logs.
++
++| Sinal | Retenção padrão proposta | Exclusão automática |
++|---|---|---|
++| Auditoria hash-chain | indefinida até decisão administrativa explícita | não |
++| Eventos operacionais | 7 dias, configurável com limite mínimo | sim, sob política |
++| Alertas resolvidos | 30 dias, configurável | sim, sob política |
++| Manifests/cursors | mínimo de 90 dias ou enquanto referenciáveis | somente após validação |
++| Traces locais | desabilitados por padrão ou janela curta | sim, sem tocar auditoria |
++| Métricas agregadas | conforme destino configurado | conforme destino |
++
++O purge de auditoria exigirá `ManageIam`, tenant explícito, janela, confirmação visível e backup/export válido cobrindo o intervalo. Antes e depois do purge serão registrados eventos e manifesto. Não haverá purge automático da auditoria hash-chain.
++
++Arquivos locais deverão usar permissões restritas (`0600` para arquivos e `0700` para diretórios em Unix). Exportação não poderá escapar da raiz configurada. Endpoints externos de OTLP, quando habilitados em staging/produção, exigirão HTTPS, timeout e headers vindos de configuração segura; o resumo público exibirá apenas host redacted e estado, nunca credenciais.
++
++## 10. Persistência e exportação incremental
++
++A migração v0.7.0 deverá criar tabelas idempotentes para `telemetry_events`, `telemetry_alerts`, `telemetry_export_cursors`, `telemetry_export_manifests` e `telemetry_policy`. A tabela `audit_events` não será reescrita nem terá sua cadeia alterada.
++
++A exportação local usará JSONL ou partições por tenant/data. Cada lote conterá `schema`, tenant, sinal, destino, cursor inicial/final, hashes inicial/final, contagem, timestamp e política de redaction. A sequência será: selecionar lote, redigir, gravar arquivo temporário, fazer flush/fsync quando possível, renomear atomicamente, persistir manifesto e somente então avançar o cursor.
++
++Se houver queda entre o arquivo e o cursor, o lote poderá ser repetido; duplicação deduplicável é preferível a perda. O cursor deverá carregar também `last_event_hash` e os limites do lote para detectar inconsistências. Falha de OTLP não poderá avançar cursor de auditoria nem apagar o arquivo local.
++
++## 11. Configuração e superfície operacional
++
++A configuração tipada deverá receber uma seção de política de observabilidade com, no mínimo, enabled/local-only, retenção, sampling, exportador, endpoint, timeout, batch limits, capture-content explicitamente proibido por default e limites de alertas. Em produção, endpoints externos inseguros serão rejeitados.
++
++A CLI deverá receber uma superfície protegida e aditiva:
++
++| Comando | Função |
++|---|---|
++| `observability status` | política efetiva, providers, exporter e estado de saúde redacted |
++| `observability verify` | schema, integridade, cursores, manifests e cadeia |
++| `observability export` | export incremental por tenant/intervalo/destino autorizado |
++| `observability purge` | purge de telemetria ou auditoria com autorização e confirmação |
++| `observability alerts` | listar regras, estado, cooldown e eventos |
++
++A API deverá manter `/healthz` público, mínimo e sem dados de tenant. Um readiness/diagnóstico detalhado poderá ser adicionado como endpoint protegido, exibindo integridade, migração, exportador e alertas sem expor segredo.
++
++## 12. Roadmap interno de implementação
++
++| Etapa | Entrega |
++|---|---|
++| A | Fachada `Telemetry`, `CorrelationContext`, redactor e schema `shaka.genai.v0.7` |
++| B | Middleware HTTP, request ID, spans HTTP e propagação para fila |
++| C | Instrumentação de admissão, worker, leases, retries, circuit breaker e transições |
++| D | Instrumentação do runtime: `invoke_agent`, `chat`, `execute_tool`, orçamento, cancelamento e erro |
++| E | Métricas GenAI e operacionais, com limites de buckets e teste de cardinalidade |
++| F | Eventos estruturados, migrações, manifests, cursores e export local |
++| G | Alert evaluator, readiness protegido e comandos CLI |
++| H | OTLP opt-in, shutdown/flush, smoke, CI/CD, documentação e release |
++
++A implementação deverá seguir pequenos commits assinados em `roadmap/v0.7.0`, com testes adicionados junto de cada etapa. Não haverá alteração de branch de produção sem CI verde e revisão do PR.
++
++## 13. Testes e critérios de aceite
++
++A versão somente será aceita quando passar pelos testes unitários, integração SQLite, API, fila, runtime, exportação e smoke real. O conjunto mínimo inclui redaction de tokens e conteúdo, schema de métricas, teste de cardinalidade, correlação HTTP/fila/runtime, fail-closed de auditoria, alert debounce/cooldown, migração de banco v0.6.0, crash simulado antes/depois do cursor, backup/restore e shutdown dos providers.
++
++O smoke de produção será ampliado para verificar `request_id`, árvore/correlação de execução, `/healthz` e readiness protegido, export local, manifesto/cursor, fired/resolved de alerta, ausência de sentinelas secretas e manutenção da autenticação bearer, isolamento por tenant, idempotência, rate limit e tarefa concluída.
++
++O CI atual já executa formato, check, testes, Clippy, secret scan, política, auditoria e smoke [7]. A v0.7.0 adicionará gates de contrato de telemetria, redaction, matriz de migração, cardinalidade e smoke de exportação. A instalação do `cargo-audit` deverá permanecer pré-compilada também no CI, evitando voltar ao caminho de compilação pesada que já causou risco de espaço no runner. O release continuará produzindo binário, SBOM, checksums e container, com attestations explicitamente marcadas como indisponíveis quando o repositório privado não suportar essa etapa [8].
++
++Os critérios de aceite são:
++
++1. Todo request possui `request_id` correlacionável, sem virar label de métrica.
++2. A execução real possui a árvore HTTP, tarefa, agente, modelo e ferramenta.
++3. Métricas usam unidades e buckets documentados, sem IDs de alta cardinalidade.
++4. Nenhum segredo ou conteúdo GenAI aparece por default em qualquer sinal.
++5. Auditoria obrigatória falha fechada; OTLP externo pode degradar sem apagar auditoria.
++6. Exportação é incremental, tenant-scoped, manifestada e tolerante a crash.
++7. Purge de auditoria é administrativo, explícito e coberto por backup/export.
++8. Alertas são locais, auditáveis e sem ações autônomas perigosas.
++9. Backup/restore preserva telemetria, política, alertas, cursores e hashes.
++10. Smoke, CI, auditoria de dependências, SBOM, checksums e container passam.
++11. A documentação explica o contrato interno e a instabilidade atual das convenções externas.
++12. Nenhum requisito fora do escopo é ativado incidentalmente.
++
++## 14. Riscos e mitigação
++
++| Risco | Mitigação |
++|---|---|
++| Convenções GenAI mudarem | perfil interno versionado e mapeamento encapsulado |
++| Cardinalidade explodir | allowlist de dimensões e testes com carga sintética |
++| Conteúdo sensível vazar | redaction antes da emissão e testes em todos os sinks |
++| Exporter externo bloquear runtime | fila limitada, timeout, backoff e auditoria local independente |
++| Corrupção ou gap de exportação | manifesto, hash de fronteira, cursor após rename e deduplicação |
++| Migração impedir rollback | recusa explícita de schema futuro e backup pré-migração |
++| Shutdown perder telemetria | providers mantidos vivos e flush/shutdown explícito |
++| Alertas virarem automação perigosa | regras somente informativas/readiness/fail-closed já autorizado |
++| Dependências aumentarem custo do release | feature gates, lockfile e auditoria antes da tag |
++
++## 15. Escopo posterior
++
++A v0.8.0 poderá consumir os spans `plan` e `invoke_workflow` para um Plan Engine com checkpoints, pré-condições, pós-condições, aprovação humana e rollback. A v0.9.0 poderá adicionar `gen_ai.evaluation.result`, regressão de prompts, cenários adversariais e quality gates. A v1.0.0 poderá tratar operação 24/7, alta disponibilidade, retenção formal, recuperação de desastre e runbooks.
++
++A observabilidade da v0.7.0 não deve ser confundida com autonomia. Ela será a camada que permitirá comprovar se as futuras capacidades estão respeitando os limites definidos.
++
++## Referências
++
++[1]: https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/gen-ai-metrics.md "OpenTelemetry GenAI metrics"
++[2]: https://opentelemetry.io/docs/specs/semconv/general/metrics/ "OpenTelemetry metrics semantic conventions"
++[3]: https://opentelemetry.io/blog/2026/genai-observability/ "OpenTelemetry GenAI observability and opt-in content capture"
++[4]: https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/gen-ai-events.md "OpenTelemetry GenAI events"
++[5]: https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/gen-ai-spans.md "OpenTelemetry GenAI model spans"
++[6]: https://github.com/open-telemetry/semantic-conventions-genai/issues/76 "OpenTelemetry discussion on detailed token usage"
++[7]: https://github.com/Head-1/Shaka-Agente/blob/main/.github/workflows/ci.yml "Shaka CI workflow"
++[8]: https://github.com/Head-1/Shaka-Agente/blob/main/.github/workflows/release.yml "Shaka release workflow"
++[9]: https://opentelemetry.io/docs/languages/rust/getting-started/ "OpenTelemetry Rust getting started"
++[10]: https://docs.rs/opentelemetry-otlp/latest/opentelemetry_otlp/ "OpenTelemetry Rust OTLP exporter"
++[11]: https://github.com/open-telemetry/opentelemetry-rust "OpenTelemetry Rust implementation and component status"
+diff --git a/V0.7_STAGE_A_IMPLEMENTATION.md b/V0.7_STAGE_A_IMPLEMENTATION.md
+new file mode 100644
+index 0000000..ac989a3
+--- /dev/null
++++ b/V0.7_STAGE_A_IMPLEMENTATION.md
+@@ -0,0 +1,44 @@
++# Shaka v0.7.0 — implementação da Etapa A
++
++**Status:** implementada localmente na branch `roadmap/v0.7.0`
++
++## Entregas
++
++A Etapa A criou a fundação de observabilidade no crate `shaka-observability` sem integrar ainda métricas/exporters aos componentes HTTP, fila ou runtime.
++
++| Componente | Implementação |
++|---|---|
++| `Telemetry` | Fachada com política estrita, schema `shaka.observability` v0.7, perfil `shaka.genai.v0.7`, criação de contexto e span inicial |
++| `CorrelationContext` | Request ID validado e referências opcionais de trace, span, tarefa, sessão e tenant redacted |
++| `Redactor` | Redaction de texto, metadata e JSON recursivo; limites de caracteres, profundidade e itens; bloqueio de conteúdo sensível |
++| `AuditLogger` | Integração do redactor antes da persistência de metadata textual e JSON, preservando as assinaturas existentes |
++| Testes | Sete testes unitários de política, redaction, JSON, campos, correlação, spans e limites |
++| Versão | Workspace e lockfile alinhados para `0.7.0` |
++| Documentação | `V0.7_DESIGN.md` e `CHANGELOG.md` atualizados |
++
++## Garantias de segurança
++
++A captura de prompts, respostas e argumentos de ferramentas é rejeitada pela política padrão. Padrões de bearer token, API key, authorization, cookie, secret, password, private key e tokens são redacted. JSONs aninhados também são tratados por nome de chave e por conteúdo textual. Limites de tamanho, profundidade e cardinalidade estrutural impedem crescimento ilimitado de dados de telemetria.
++
++O redactor não depende de `expect` ou `unwrap` em runtime. Falha de compilação da expressão regular interna degrada para o texto original somente como fallback técnico do literal estático; a expressão é validada pelos testes de redaction. O `AuditLogger` permanece compatível com a v0.6.0, mas agora protege metadata antes de criar o `AuditEvent` hash-chained.
++
++## Validação executada
++
++| Verificação | Resultado |
++|---|---|
++| `cargo fmt --all -- --check` com Cargo/Rust 1.98 | aprovado |
++| `cargo clippy --workspace --all-targets --locked -- -D warnings -A missing_docs -A clippy::missing_errors_doc` | aprovado |
++| `cargo test -p shaka-observability --lib --offline` | 7 aprovados |
++| `cargo test --workspace --locked` | todos os testes e doc-tests aprovados |
++| `bash scripts/production_smoke.sh` | aprovado; IAM, auditoria, API, tenant isolation, rate limit e tarefa concluída preservados |
++| `git diff --check` | aprovado |
++
++O smoke test exibiu uma tentativa transitória de conexão recusada durante a espera de inicialização da API, mas o script concluiu com sucesso e todas as asserções finais passaram.
++
++## Estado Git
++
++A branch local é `roadmap/v0.7.0`. Os arquivos da Etapa A estão preparados no índice local. O commit assinado não foi criado porque este sandbox não possui a chave privada GPG configurada para a identidade `Head-1`; nenhuma chave secreta estava disponível. Por segurança, não foi gerada uma chave artificial nem criado um commit não assinado. A publicação no GitHub também não foi executada nesta etapa.
++
++## Próxima etapa
++
++A próxima etapa de implementação será a **Etapa B**, com middleware HTTP, request ID real, spans HTTP e propagação de correlação para admissão, fila e worker. Ela deverá consumir a fachada criada aqui, sem reimplementar redaction nem criar exporters diretamente nos crates de domínio.
+diff --git a/V0.7_STAGE_B_IMPLEMENTATION.md b/V0.7_STAGE_B_IMPLEMENTATION.md
+new file mode 100644
+index 0000000..66805bd
+--- /dev/null
++++ b/V0.7_STAGE_B_IMPLEMENTATION.md
+@@ -0,0 +1,75 @@
++# Shaka v0.7.0 — implementação da Etapa B
++
++**Status:** implementada localmente na branch `roadmap/v0.7.0`
++
++## Escopo entregue
++
++A Etapa B implementou o middleware HTTP de correlação, o request ID efetivo e os spans de servidor/operação, além de uma revisão de segurança aprofundada da fachada `Telemetry` e do `Redactor`.
++
++| Área | Entrega |
++|---|---|
++| Middleware HTTP | `request_context_middleware` no `shaka-api`, aplicado a todas as rotas |
++| Request ID | header `x-request-id`; entrada válida preservada, entrada inválida substituída por UUID; resposta sempre devolve o ID efetivo |
++| Erros HTTP | corpo JSON e header carregam o mesmo `request_id` |
++| Trace context | parsing seguro de `traceparent`, rejeição de IDs zero, versão `ff`, formato inválido e flags inválidas |
++| Contexto | `CorrelationContext` inserido em request extensions e propagado por task-local durante o handler |
++| Spans | span de servidor com schema/perfil interno, método, rota normalizada, status e classe de status; spans filhos para health, sessão e tarefa |
++| Auditoria | eventos de API recebem `correlation_request_id` e `correlation_trace_id`, sem payload ou credencial |
++| Contrato | `API_CONTRACTS.md` documenta headers e limites de correlação |
++| Changelog | Etapa B e endurecimentos registrados em `CHANGELOG.md` |
++
++## Revisão de segurança do `Redactor`
++
++A revisão encontrou e corrigiu um risco real: uma entrada `Authorization: Bearer abc.def` podia ter o prefixo redacted pela regra genérica e deixar o token após `Bearer` exposto. A expressão agora trata o par completo antes das regras genéricas, com teste explícito.
++
++Também foram corrigidos quatro pontos adicionais:
++
++1. O truncamento agora respeita estritamente o limite configurado, incluindo o sufixo `[TRUNCATED]`.
++2. `tenant_ref` é pseudonimizado com SHA-256 truncado e nunca aparece em claro no contexto.
++3. Chaves compostas de conteúdo, como `prompt_text`, `model_input`, `response_content` e `tool_result_json`, são redacted por padrão.
++4. Falha interna na expressão de redaction degrada para `[REDACTION_FAILED]`, nunca para o texto original.
++
++O redactor continua bloqueando bearer tokens, API keys, authorization, cookies, secrets, passwords, private keys, objetivos, prompts, respostas, inputs/outputs e argumentos de ferramentas. A captura de conteúdo continua rejeitada pela política estrita.
++
++## Garantias do middleware
++
++O middleware não usa URI bruta como atributo de span. Ele usa `MatchedPath` quando disponível, que representa a rota normalizada, e recorre a `<unmatched>` em caso contrário. O corpo da request, query string, tokens, objetivos e conteúdo de negócio não são registrados.
++
++O `traceparent` é tratado exclusivamente como contexto técnico. Ele não participa de autenticação, autorização, escolha de tenant, concessão de capability, quota, rate limit ou modo live. Headers inválidos são ignorados com geração/preservação independente do request ID.
++
++O request ID recebido pelo cliente é limitado a 128 caracteres e a um conjunto ASCII restrito. Isso evita injeção de quebras de linha, controle de formato ou dados arbitrários em headers/logs. O ID efetivo é retornado tanto em sucesso quanto em erros HTTP.
++
++## Validação executada
++
++| Gate | Resultado |
++|---|---|
++| `cargo fmt --all -- --check` | aprovado |
++| `cargo clippy -p shaka-observability -p shaka-api --all-targets --locked -- -D warnings -A missing_docs -A clippy::missing_errors_doc` | aprovado |
++| `cargo clippy --workspace --all-targets --locked -- -D warnings -A missing_docs -A clippy::missing_errors_doc` | aprovado |
++| `cargo test -p shaka-observability --lib --locked` | 7 aprovados |
++| `cargo test -p shaka-api --lib --locked` | 9 aprovados |
++| `cargo test --workspace --locked` | todos os crates e doc-tests aprovados |
++| `python3 scripts/secret_scan.py` | aprovado |
++| `bash scripts/production_smoke.sh` | aprovado; IAM, auditoria, API, rate limit, tenant e tarefa preservados |
++| `git diff --check` | será confirmado antes do registro final |
++
++O smoke test exibiu uma tentativa transitória de conexão recusada durante a espera de inicialização da API, mas concluiu com status de sucesso e todas as asserções finais passaram. A resposta do health passou a reportar a versão `0.7.0`.
++
++## Arquivos principais
++
++- `crates/shaka-observability/src/lib.rs`
++- `crates/shaka-observability/Cargo.toml`
++- `crates/shaka-api/src/lib.rs`
++- `Cargo.toml`
++- `Cargo.lock`
++- `API_CONTRACTS.md`
++- `CHANGELOG.md`
++- `V0.7_DESIGN.md`
++
++## Estado Git e publicação
++
++As alterações estão na branch local `roadmap/v0.7.0`. Não foram publicadas no GitHub nesta etapa. O commit assinado da Etapa A não pôde ser criado anteriormente porque este sandbox não possui a chave privada GPG da identidade `Head-1`; por consistência e segurança, não foi gerada uma chave artificial nem criado commit não assinado.
++
++## Próxima etapa
++
++A Etapa C deverá instrumentar admissão, fila, worker, leases, retries e circuit breaker, transportando o contexto de correlação para tarefas assíncronas sem colocar IDs de alta cardinalidade em labels de métricas. O Plan Engine e exporters OTLP continuam fora do escopo desta etapa.
+diff --git a/V0.7_STAGE_C_IMPLEMENTATION.md b/V0.7_STAGE_C_IMPLEMENTATION.md
+new file mode 100644
+index 0000000..712ad2b
+--- /dev/null
++++ b/V0.7_STAGE_C_IMPLEMENTATION.md
+@@ -0,0 +1,55 @@
++# Shaka v0.7.0 — implementação da Etapa C
++
++**Status:** implementação concluída localmente; commit preparado para assinatura/publicação
++
++## Escopo entregue
++
++A Etapa C instrumentou os caminhos de admissão, claim, processamento, finalização, recuperação de leases, retries e circuit breaker sem alterar as transações SQLite, a política de quotas/rate limits ou as decisões de autorização.
++
++| Área | Entrega |
++|---|---|
++| Admissão | Span `queue.admission` com `created`, `existing` ou `rejected` |
++| Claim | Span `queue.claim` com `claimed`, `empty` ou `failed`, worker e lease held |
++| Worker | Span `worker.task.process` com worker ID, attempt, outcome, retryable e classe de erro |
++| Finalização | Span `queue.finish` com outcome, lease released, retryability e retry delay |
++| Leases | Span `queue.lease.recover` com quantidade de leases recuperados e outcome |
++| Circuit breaker | Spans `queue.circuit.allow`, `queue.circuit.record_success` e `queue.circuit.record_failure` |
++| Erros | Taxonomias estáveis de baixa cardinalidade para QueueError e OrchestratorError |
++| Segurança | Nenhum payload, objetivo, idempotency key, bearer, mensagem livre ou ID de tarefa é convertido em label métrico |
++| Testes | Teste de taxonomia estável e ausência de mensagem livre, além da regressão completa do workspace |
++| Documentação | Changelog atualizado; design e relatórios das Etapas A/B preservados |
++
++## Campos técnicos adicionados aos spans
++
++A fachada `Telemetry` agora reserva campos para `outcome`, `admission`, `retryable`, `attempt`, `lease_state`, `circuit_state`, `error_type`, `worker_id`, `queue_depth`, `retry_delay_ms` e `lease_recovered`. A quantidade de leases recuperados usa campo próprio; não é confundida com profundidade da fila.
++
++Os spans de fila usam referências técnicas por task/session somente dentro do contexto de span, não como labels de métricas. Classes de erro são fixas: `sqlite`, `serialization`, `core`, `invalid_input`, `rate_limited`, `quota_exceeded`, `http`, `invalid_model_response`, `tool_execution`, `deadline_exceeded`, `cancelled` e equivalentes.
++
++## Invariantes preservadas
++
++A admissão governada continua transacional, incluindo tenant, operador efetivo, idempotência, quota diária, quota ativa, custo e rate limit. Claim continua definindo lease e incrementando attempts na mesma transação. `finish_task` continua distinguindo sucesso, cancelamento, requeue e falha terminal. Recuperação de lease continua anterior à criação dos workers. O circuit breaker continua bloqueando o worker quando aberto e permitindo somente a transição half-open conforme a janela persistida.
++
++O span do runtime é instrumentado com `.instrument(...)`, portanto a correlação de task permanece ativa durante o `await` da execução. A finalização, circuit breaker e auditoria são spans filhos separados, sem carregar o conteúdo do resultado/erro.
++
++## Gates executados
++
++| Gate | Resultado |
++|---|---|
++| `cargo fmt --all -- --check` | aprovado |
++| `cargo clippy --workspace --all-targets --locked -- -D warnings -A missing_docs -A clippy::missing_errors_doc` | aprovado |
++| `cargo test --workspace --locked` | todos os testes e doc-tests aprovados |
++| `python3 scripts/secret_scan.py` | aprovado |
++| `bash scripts/production_smoke.sh` | aprovado; IAM, auditoria, tenant isolation, rate limit e tarefa concluída |
++| `git diff --check` | aprovado antes do preparo do commit |
++
++O smoke test exibiu uma tentativa transitória de conexão recusada durante a espera de inicialização da API, mas concluiu com sucesso e todas as asserções passaram. O health reportou versão `0.7.0` e circuito `closed`.
++
++## Estado do commit remoto
++
++A branch é `roadmap/v0.7.0`. O índice contém alterações acumuladas das Etapas A, B e C. O próximo commit deve incluir o design, os relatórios de implementação, contratos, changelog, lockfile, fachada e API.
++
++A assinatura GPG depende da chave privada da identidade `Head-1`, que não está disponível neste sandbox. O preparo pode ser feito no índice, mas o commit assinado não será forçado com chave artificial ou commit não assinado. Após a assinatura no ambiente autenticado, o commit deve ser enviado para o repositório remoto e revisado por PR antes da tag.
++
++## Próxima etapa
++
++A Etapa D poderá instrumentar o runtime interno com spans `invoke_agent`, `chat` e `execute_tool`, consumindo os mesmos campos redacted e as taxonomias desta etapa. Exporters, métricas agregadas e OTLP continuam posteriores.
+diff --git a/crates/shaka-api/src/lib.rs b/crates/shaka-api/src/lib.rs
+index 6b4141f..d8364e5 100644
+--- a/crates/shaka-api/src/lib.rs
++++ b/crates/shaka-api/src/lib.rs
+@@ -3,10 +3,13 @@
+ //! O servidor mantém a coordenação da fila no host, não no modelo. Cada
+ //! trabalho passa pelo `AgentRuntime`, pelo SQLite e pelo auditor existente.
+ 
++use axum::middleware::Next;
+ use axum::{
+     Json, Router,
+-    extract::{Path, State},
+-    http::{HeaderMap, StatusCode},
++    body::Body,
++    extract::{MatchedPath, Path, State},
++    http::{HeaderMap, HeaderValue, Request, StatusCode},
++    middleware,
+     response::{IntoResponse, Response},
+     routing::{get, post},
+ };
+@@ -15,7 +18,7 @@ use serde::{Deserialize, Serialize};
+ use serde_json::{Value, json};
+ use sha2::{Digest, Sha256};
+ use shaka_core::{Action, ExecutionBudget, Principal, TaskEnvelope, TaskId, TenantId};
+-use shaka_observability::AuditLogger;
++use shaka_observability::{AuditLogger, CorrelationContext, Telemetry};
+ use shaka_orchestrator::{AgentRuntime, CancellationToken, OrchestratorError};
+ use shaka_queue::{
+     AuthSource, AuthenticatedPrincipal, CircuitBreaker, CircuitConfig, CircuitSnapshot,
+@@ -31,9 +34,16 @@ use std::{
+ };
+ use thiserror::Error;
+ use tokio::{net::TcpListener, time::sleep};
+-use tracing::{error, info, warn};
++use tracing::{Instrument, error, info, warn};
+ use uuid::Uuid;
+ 
++/// Header HTTP usado para correlação operacional, sem carregar conteúdo de negócio.
++pub const REQUEST_ID_HEADER: &str = "x-request-id";
++
++tokio::task_local! {
++    static ACTIVE_CORRELATION: CorrelationContext;
++}
++
+ #[derive(Debug, Clone)]
+ pub struct ApiConfig {
+     pub bind_addr: SocketAddr,
+@@ -164,11 +174,13 @@ impl IntoResponse for ApiError {
+             Self::QuotaExceeded(name) => format!("quota excedida: {name}"),
+             Self::Internal => "falha interna persistente".to_owned(),
+         };
++        let request_id = active_request_id();
+         let body = Json(json!({
+             "error": message,
+-            "request_id": Uuid::new_v4(),
++            "request_id": request_id.clone(),
+         }));
+         let mut response = (status, body).into_response();
++        insert_request_id_header(&mut response, &request_id);
+         if let Some(seconds) = retry_after {
+             if let Ok(value) = seconds.to_string().parse() {
+                 response.headers_mut().insert("retry-after", value);
+@@ -207,6 +219,7 @@ pub struct ApiState {
+     breaker: Arc<CircuitBreaker>,
+     cancellations: Arc<parking_lot::Mutex<HashMap<Uuid, CancellationToken>>>,
+     shutdown: ShutdownFlag,
++    telemetry: Arc<Telemetry>,
+ }
+ 
+ impl std::fmt::Debug for ApiState {
+@@ -221,6 +234,7 @@ impl std::fmt::Debug for ApiState {
+             .field("breaker", &self.breaker)
+             .field("cancellations", &self.cancellations.lock().len())
+             .field("shutdown", &self.shutdown.is_cancelled())
++            .field("telemetry", &"Telemetry")
+             .finish()
+     }
+ }
+@@ -253,6 +267,7 @@ impl ApiState {
+             breaker,
+             cancellations: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+             shutdown: ShutdownFlag::default(),
++            telemetry: Arc::new(Telemetry::default()),
+         })
+     }
+ 
+@@ -264,6 +279,10 @@ impl ApiState {
+             .route("/v1/sessions/{session_id}/tasks", post(submit_task))
+             .route("/v1/tasks/{task_id}", get(get_task).delete(cancel_task))
+             .with_state(self.clone())
++            .layer(middleware::from_fn_with_state(
++                self.clone(),
++                request_context_middleware,
++            ))
+     }
+ 
+     #[must_use]
+@@ -276,6 +295,11 @@ impl ApiState {
+         &self.queue
+     }
+ 
++    #[must_use]
++    pub fn telemetry(&self) -> &Arc<Telemetry> {
++        &self.telemetry
++    }
++
+     fn register_cancellation(&self, task_id: &TaskId, token: CancellationToken) {
+         self.cancellations.lock().insert(task_id.0, token);
+     }
+@@ -408,6 +432,10 @@ struct HealthResponse {
+ }
+ 
+ async fn healthz(State(state): State<ApiState>) -> Result<Json<HealthResponse>, ApiError> {
++    let span = state
++        .telemetry
++        .operation_span("api.healthz", &active_correlation().unwrap_or_default());
++    let _entered = span.enter();
+     let queued_tasks = state.queue.queued_count()?;
+     Ok(Json(HealthResponse {
+         status: "ok",
+@@ -422,6 +450,11 @@ async fn create_session(
+     headers: HeaderMap,
+     Json(request): Json<CreateSessionRequest>,
+ ) -> Result<(StatusCode, Json<SessionResponse>), ApiError> {
++    let span = state.telemetry.operation_span(
++        "api.session.create",
++        &active_correlation().unwrap_or_default(),
++    );
++    let _entered = span.enter();
+     let auth = authorize(&headers, &state)?;
+     let metadata = bounded_json(request.metadata, 4_096)?;
+     let session = state
+@@ -443,6 +476,8 @@ async fn get_session(
+     headers: HeaderMap,
+     Path(session_id): Path<Uuid>,
+ ) -> Result<Json<SessionResponse>, ApiError> {
++    let span = correlation_span(&state, "api.session.get", Some(session_id), None);
++    let _entered = span.enter();
+     let auth = authorize(&headers, &state)?;
+     state
+         .queue
+@@ -459,6 +494,8 @@ async fn submit_task(
+     Path(session_id): Path<Uuid>,
+     Json(request): Json<SubmitTaskRequest>,
+ ) -> Result<(StatusCode, Json<TaskResponse>), ApiError> {
++    let span = correlation_span(&state, "api.task.submit", Some(session_id), None);
++    let _entered = span.enter();
+     let auth = authorize(&headers, &state)?;
+     let idempotency_key = headers
+         .get("idempotency-key")
+@@ -497,7 +534,13 @@ async fn submit_task(
+     }
+     let max_attempts = request.max_attempts.unwrap_or(3);
+     let fingerprint = fingerprint(&request, idempotency_key)?;
+-    let (outcome, task) = state.queue.submit_task_governed(
++    let admission_span = correlation_span(
++        &state,
++        "queue.admission",
++        Some(session_id),
++        Some(&envelope.task_id),
++    );
++    let submission = state.queue.submit_task_governed(
+         session_id,
+         &auth.principal,
+         idempotency_key,
+@@ -505,7 +548,20 @@ async fn submit_task(
+         &envelope,
+         request.priority,
+         max_attempts,
+-    )?;
++    );
++    let (outcome, task) = match submission {
++        Ok((outcome, task)) => {
++            admission_span.record("outcome", submit_outcome_name(&outcome));
++            admission_span.record("admission", submit_outcome_name(&outcome));
++            (outcome, task)
++        }
++        Err(error) => {
++            admission_span.record("outcome", "rejected");
++            admission_span.record("admission", "rejected");
++            admission_span.record("error_type", queue_error_type(&error));
++            return Err(error.into());
++        }
++    };
+     if outcome == SubmitOutcome::Created {
+         audit_principal(
+             &state,
+@@ -529,10 +585,11 @@ async fn get_task(
+     headers: HeaderMap,
+     Path(task_id): Path<Uuid>,
+ ) -> Result<Json<TaskResponse>, ApiError> {
++    let task_id = TaskId(task_id);
++    let span = correlation_span(&state, "api.task.get", None, Some(&task_id));
++    let _entered = span.enter();
+     let auth = authorize(&headers, &state)?;
+-    let record = state
+-        .queue
+-        .get_task(&TaskId(task_id), &auth.principal.tenant_id)?;
++    let record = state.queue.get_task(&task_id, &auth.principal.tenant_id)?;
+     Ok(Json(record.into()))
+ }
+ 
+@@ -541,8 +598,10 @@ async fn cancel_task(
+     headers: HeaderMap,
+     Path(task_id): Path<Uuid>,
+ ) -> Result<(StatusCode, Json<TaskResponse>), ApiError> {
+-    let auth = authorize(&headers, &state)?;
+     let task_id = TaskId(task_id);
++    let span = correlation_span(&state, "api.task.cancel", None, Some(&task_id));
++    let _entered = span.enter();
++    let auth = authorize(&headers, &state)?;
+     let record = state
+         .queue
+         .request_cancel(&task_id, &auth.principal.tenant_id)?;
+@@ -588,8 +647,19 @@ pub async fn serve(state: ApiState) -> Result<(), ApiError> {
+ }
+ 
+ fn start_workers(state: &ApiState) -> Vec<tokio::task::JoinHandle<()>> {
+-    if let Err(error) = state.queue.recover_expired_leases(Utc::now()) {
+-        warn!(?error, "não foi possível recuperar leases expirados");
++    let recovery_span = correlation_span(state, "queue.lease.recover", None, None);
++    match state.queue.recover_expired_leases(Utc::now()) {
++        Ok(recovered) => {
++            recovery_span.record("outcome", "success");
++            recovery_span.record("lease_state", "recovered");
++            recovery_span.record("lease_recovered", recovered);
++        }
++        Err(error) => {
++            recovery_span.record("outcome", "failed");
++            recovery_span.record("lease_state", "recovery_failed");
++            recovery_span.record("error_type", queue_error_type(&error));
++            warn!(?error, "não foi possível recuperar leases expirados");
++        }
+     }
+     (0..state.config.worker_count)
+         .map(|worker_id| {
+@@ -605,22 +675,41 @@ async fn worker_loop(worker_id: usize, state: ApiState) {
+             return;
+         }
+         let now = Utc::now();
++        let circuit_span = correlation_span(&state, "queue.circuit.allow", None, None);
+         match state.breaker.allow(now) {
+-            Ok(true) => {}
++            Ok(true) => {
++                circuit_span.record("outcome", "allowed");
++                circuit_span.record("circuit_state", state.breaker.snapshot().state.as_str());
++            }
+             Ok(false) => {
++                circuit_span.record("outcome", "blocked");
++                circuit_span.record("circuit_state", state.breaker.snapshot().state.as_str());
+                 sleep(Duration::milliseconds(100).to_std().unwrap_or_default()).await;
+                 continue;
+             }
+             Err(error) => {
++                circuit_span.record("outcome", "failed");
++                circuit_span.record("error_type", queue_error_type(&error));
+                 warn!(worker_id, ?error, "circuit breaker indisponível");
+                 sleep(Duration::milliseconds(250).to_std().unwrap_or_default()).await;
+                 continue;
+             }
+         }
++        let claim_span = correlation_span(&state, "queue.claim", None, None);
++        claim_span.record("worker_id", worker_id);
+         match state.queue.claim_next(now, state.config.lease_for) {
+-            Ok(Some(task)) => execute_task(worker_id, state.clone(), task).await,
+-            Ok(None) => sleep(Duration::milliseconds(50).to_std().unwrap_or_default()).await,
++            Ok(Some(task)) => {
++                claim_span.record("outcome", "claimed");
++                claim_span.record("lease_state", "held");
++                execute_task(worker_id, state.clone(), task).await;
++            }
++            Ok(None) => {
++                claim_span.record("outcome", "empty");
++                sleep(Duration::milliseconds(50).to_std().unwrap_or_default()).await;
++            }
+             Err(error) => {
++                claim_span.record("outcome", "failed");
++                claim_span.record("error_type", queue_error_type(&error));
+                 warn!(worker_id, ?error, "falha ao obter tarefa da fila");
+                 sleep(Duration::milliseconds(250).to_std().unwrap_or_default()).await;
+             }
+@@ -630,71 +719,163 @@ async fn worker_loop(worker_id: usize, state: ApiState) {
+ 
+ async fn execute_task(worker_id: usize, state: ApiState, task: TaskRecord) {
+     let task_id = task.task_id.clone();
++    let task_span = correlation_span(&state, "worker.task.process", None, Some(&task_id));
++    task_span.record("worker_id", worker_id);
++    task_span.record("attempt", task.attempts);
++    task_span.record("lease_state", "held");
+     let token = CancellationToken::new();
+     state.register_cancellation(&task_id, token.clone());
+     let execution = state
+         .runtime
+         .run_with_cancellation(task.envelope.clone(), token)
++        .instrument(task_span.clone())
+         .await;
+     state.remove_cancellation(&task_id);
+     let now = Utc::now();
+     match execution {
+         Ok(result) => {
+-            if let Err(error) = state.breaker.record_success() {
+-                warn!(
+-                    worker_id,
+-                    ?error,
+-                    "não foi possível fechar o circuit breaker após sucesso"
+-                );
+-            }
+-            let result_json = serde_json::to_value(&result).ok();
+-            match state.queue.finish_task(
++            task_span.record("outcome", "runtime_succeeded");
++            record_circuit_success(worker_id, &state);
++            finish_success(
++                worker_id,
++                &state,
++                &task,
+                 &task_id,
+-                &task.tenant_id,
+-                result_json,
+-                None,
+-                false,
++                serde_json::to_value(&result).ok(),
+                 now,
+-                state.config.retry_base_delay,
+-                state.config.retry_max_delay,
+-            ) {
+-                Ok(outcome) => audit_task_finish(&state, &task, &outcome),
+-                Err(error) => warn!(
+-                    worker_id,
+-                    ?error,
+-                    "não foi possível finalizar tarefa com sucesso"
+-                ),
+-            }
++            );
+         }
+         Err(error) => {
+             let retryable = is_retryable(&error);
++            task_span.record("outcome", "runtime_failed");
++            task_span.record("retryable", retryable);
++            task_span.record("error_type", orchestrator_error_type(&error));
+             if retryable {
+-                if let Err(record_error) = state.breaker.record_failure(now) {
+-                    warn!(
+-                        worker_id,
+-                        ?record_error,
+-                        "não foi possível registrar falha no circuit breaker"
+-                    );
+-                }
++                record_circuit_failure(worker_id, &state, now);
+             }
+-            let safe_error = shaka_core::redact_sensitive(&error.to_string());
+-            match state.queue.finish_task(
+-                &task_id,
+-                &task.tenant_id,
+-                None,
+-                Some(safe_error.as_str()),
+-                retryable,
+-                now,
+-                state.config.retry_base_delay,
+-                state.config.retry_max_delay,
+-            ) {
+-                Ok(outcome) => audit_task_finish(&state, &task, &outcome),
+-                Err(queue_error) => warn!(
+-                    worker_id,
+-                    ?queue_error,
+-                    "não foi possível finalizar falha de tarefa"
+-                ),
++            finish_failure(worker_id, &state, &task, &task_id, &error, retryable, now);
++        }
++    }
++}
++
++fn record_circuit_success(worker_id: usize, state: &ApiState) {
++    let circuit_span = correlation_span(state, "queue.circuit.record_success", None, None);
++    match state.breaker.record_success() {
++        Ok(()) => {
++            circuit_span.record("outcome", "success");
++            circuit_span.record("circuit_state", state.breaker.snapshot().state.as_str());
++        }
++        Err(error) => {
++            circuit_span.record("outcome", "failed");
++            circuit_span.record("error_type", queue_error_type(&error));
++            warn!(
++                worker_id,
++                ?error,
++                "não foi possível fechar o circuit breaker após sucesso"
++            );
++        }
++    }
++}
++
++fn record_circuit_failure(worker_id: usize, state: &ApiState, now: DateTime<Utc>) {
++    let circuit_span = correlation_span(state, "queue.circuit.record_failure", None, None);
++    match state.breaker.record_failure(now) {
++        Ok(()) => {
++            circuit_span.record("outcome", "failure");
++            circuit_span.record("circuit_state", state.breaker.snapshot().state.as_str());
++        }
++        Err(error) => {
++            circuit_span.record("outcome", "failed");
++            circuit_span.record("error_type", queue_error_type(&error));
++            warn!(
++                worker_id,
++                ?error,
++                "não foi possível registrar falha no circuit breaker"
++            );
++        }
++    }
++}
++
++fn finish_success(
++    worker_id: usize,
++    state: &ApiState,
++    task: &TaskRecord,
++    task_id: &TaskId,
++    result_json: Option<Value>,
++    now: DateTime<Utc>,
++) {
++    let finish_span = correlation_span(state, "queue.finish", None, Some(task_id));
++    match state.queue.finish_task(
++        task_id,
++        &task.tenant_id,
++        result_json,
++        None,
++        false,
++        now,
++        state.config.retry_base_delay,
++        state.config.retry_max_delay,
++    ) {
++        Ok(outcome) => {
++            finish_span.record("outcome", finish_outcome_name(&outcome));
++            finish_span.record("lease_state", "released");
++            audit_task_finish(state, task, &outcome);
++        }
++        Err(error) => {
++            finish_span.record("outcome", "failed");
++            finish_span.record("error_type", queue_error_type(&error));
++            warn!(
++                worker_id,
++                ?error,
++                "não foi possível finalizar tarefa com sucesso"
++            );
++        }
++    }
++}
++
++fn finish_failure(
++    worker_id: usize,
++    state: &ApiState,
++    task: &TaskRecord,
++    task_id: &TaskId,
++    error: &OrchestratorError,
++    retryable: bool,
++    now: DateTime<Utc>,
++) {
++    let safe_error = shaka_core::redact_sensitive(&error.to_string());
++    let finish_span = correlation_span(state, "queue.finish", None, Some(task_id));
++    match state.queue.finish_task(
++        task_id,
++        &task.tenant_id,
++        None,
++        Some(safe_error.as_str()),
++        retryable,
++        now,
++        state.config.retry_base_delay,
++        state.config.retry_max_delay,
++    ) {
++        Ok(outcome) => {
++            finish_span.record("outcome", finish_outcome_name(&outcome));
++            finish_span.record("retryable", retryable);
++            finish_span.record("lease_state", "released");
++            if let FinishOutcome::Requeued {
++                ref next_attempt_at,
++            } = outcome
++            {
++                finish_span.record(
++                    "retry_delay_ms",
++                    (*next_attempt_at - now).num_milliseconds().max(0),
++                );
+             }
++            audit_task_finish(state, task, &outcome);
++        }
++        Err(queue_error) => {
++            finish_span.record("outcome", "failed");
++            finish_span.record("error_type", queue_error_type(&queue_error));
++            warn!(
++                worker_id,
++                ?queue_error,
++                "não foi possível finalizar falha de tarefa"
++            );
+         }
+     }
+ }
+@@ -724,6 +905,176 @@ fn is_retryable(error: &OrchestratorError) -> bool {
+     )
+ }
+ 
++fn submit_outcome_name(outcome: &SubmitOutcome) -> &'static str {
++    match outcome {
++        SubmitOutcome::Created => "created",
++        SubmitOutcome::Existing => "existing",
++    }
++}
++
++fn finish_outcome_name(outcome: &FinishOutcome) -> &'static str {
++    match outcome {
++        FinishOutcome::Succeeded => "succeeded",
++        FinishOutcome::Requeued { .. } => "retry_scheduled",
++        FinishOutcome::Failed => "failed",
++        FinishOutcome::Cancelled => "cancelled",
++    }
++}
++
++fn queue_error_type(error: &QueueError) -> &'static str {
++    match error {
++        QueueError::Sqlite(_) => "sqlite",
++        QueueError::Serialization(_) => "serialization",
++        QueueError::Core(_) => "core",
++        QueueError::InvalidIdentifier(_) => "invalid_identifier",
++        QueueError::InvalidInput(_) => "invalid_input",
++        QueueError::NotFound(_) => "not_found",
++        QueueError::IdempotencyConflict => "idempotency_conflict",
++        QueueError::Unauthorized => "unauthorized",
++        QueueError::Forbidden => "forbidden",
++        QueueError::QuotaExceeded(_) => "quota_exceeded",
++        QueueError::RateLimited { .. } => "rate_limited",
++    }
++}
++
++fn orchestrator_error_type(error: &OrchestratorError) -> &'static str {
++    match error {
++        OrchestratorError::Core(_) => "core",
++        OrchestratorError::Memory(_) => "memory",
++        OrchestratorError::Http(_) => "http",
++        OrchestratorError::InvalidModelResponse(_) => "invalid_model_response",
++        OrchestratorError::ToolNotFound(_) => "tool_not_found",
++        OrchestratorError::ToolExecution(_) => "tool_execution",
++        OrchestratorError::DeadlineExceeded => "deadline_exceeded",
++        OrchestratorError::Cancelled => "cancelled",
++    }
++}
++
++async fn request_context_middleware(
++    State(state): State<ApiState>,
++    mut request: Request<Body>,
++    next: Next,
++) -> Response {
++    let context = correlation_from_request(&request);
++    request.extensions_mut().insert(context.clone());
++    let method = request.method().as_str().to_owned();
++    let route_template = request
++        .extensions()
++        .get::<MatchedPath>()
++        .map_or_else(|| "<unmatched>".to_owned(), |path| path.as_str().to_owned());
++    let span = state
++        .telemetry
++        .http_server_span(&context, &method, &route_template);
++    let response = ACTIVE_CORRELATION
++        .scope(context.clone(), next.run(request).instrument(span.clone()))
++        .await;
++    let status = response.status();
++    span.record("http_status_code", status.as_u16());
++    span.record("http_status_class", status_class(status));
++    let mut response = response;
++    insert_request_id_header(&mut response, context.request_id());
++    response
++}
++
++fn correlation_from_request(request: &Request<Body>) -> CorrelationContext {
++    let request_id = request
++        .headers()
++        .get(REQUEST_ID_HEADER)
++        .and_then(|value| value.to_str().ok())
++        .and_then(|value| CorrelationContext::with_request_id(value).ok())
++        .unwrap_or_default();
++    let Some((trace_id, span_id)) = request
++        .headers()
++        .get("traceparent")
++        .and_then(|value| value.to_str().ok())
++        .and_then(parse_traceparent)
++    else {
++        return request_id;
++    };
++    request_id
++        .with_trace_ids(Some(trace_id), Some(span_id))
++        .unwrap_or_default()
++}
++
++fn parse_traceparent(value: &str) -> Option<(String, String)> {
++    let mut parts = value.split('-');
++    let version = parts.next()?;
++    let trace_id = parts.next()?;
++    let span_id = parts.next()?;
++    let flags = parts.next()?;
++    if parts.next().is_some()
++        || version.len() != 2
++        || version.eq_ignore_ascii_case("ff")
++        || trace_id.len() != 32
++        || span_id.len() != 16
++        || flags.len() != 2
++        || !version
++            .chars()
++            .all(|character| character.is_ascii_hexdigit())
++        || !trace_id
++            .chars()
++            .all(|character| character.is_ascii_hexdigit())
++        || !span_id
++            .chars()
++            .all(|character| character.is_ascii_hexdigit())
++        || !flags.chars().all(|character| character.is_ascii_hexdigit())
++        || trace_id.chars().all(|character| character == '0')
++        || span_id.chars().all(|character| character == '0')
++    {
++        return None;
++    }
++    Some((trace_id.to_ascii_lowercase(), span_id.to_ascii_lowercase()))
++}
++
++fn active_correlation() -> Option<CorrelationContext> {
++    ACTIVE_CORRELATION.try_with(Clone::clone).ok()
++}
++
++fn active_request_id() -> String {
++    active_correlation().map_or_else(
++        || Uuid::new_v4().to_string(),
++        |context| context.request_id().to_owned(),
++    )
++}
++
++fn correlation_span(
++    state: &ApiState,
++    operation: &str,
++    session_id: Option<Uuid>,
++    task_id: Option<&TaskId>,
++) -> tracing::Span {
++    let mut context = active_correlation().unwrap_or_default();
++    if let Ok(enriched) = context
++        .clone()
++        .with_session_id(session_id.map(|id| id.to_string()))
++    {
++        context = enriched;
++    }
++    if let Ok(enriched) = context
++        .clone()
++        .with_task_id(task_id.map(|id| id.0.to_string()))
++    {
++        context = enriched;
++    }
++    state.telemetry.operation_span(operation, &context)
++}
++
++fn insert_request_id_header(response: &mut Response, request_id: &str) {
++    if let Ok(value) = HeaderValue::from_str(request_id) {
++        response.headers_mut().insert(REQUEST_ID_HEADER, value);
++    }
++}
++
++fn status_class(status: StatusCode) -> &'static str {
++    match status.as_u16() {
++        100..=199 => "1xx",
++        200..=299 => "2xx",
++        300..=399 => "3xx",
++        400..=499 => "4xx",
++        _ => "5xx",
++    }
++}
++
+ fn authorize(headers: &HeaderMap, state: &ApiState) -> Result<AuthenticatedPrincipal, ApiError> {
+     state.authenticate(headers)
+ }
+@@ -782,6 +1133,16 @@ fn audit_identity(
+     outcome: &str,
+     metadata: std::collections::BTreeMap<String, String>,
+ ) {
++    let mut metadata = metadata;
++    if let Some(context) = active_correlation() {
++        metadata.insert(
++            "correlation_request_id".to_owned(),
++            context.request_id().to_owned(),
++        );
++        if let Some(trace_id) = context.trace_id() {
++            metadata.insert("correlation_trace_id".to_owned(), trace_id.to_owned());
++        }
++    }
+     if let Err(error) = state.audit.record(
+         task_id,
+         tenant_id.clone(),
+@@ -836,6 +1197,98 @@ mod tests {
+         .unwrap()
+     }
+ 
++    #[test]
++    fn traceparent_parser_accepts_only_safe_nonzero_ids() {
++        assert_eq!(
++            parse_traceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
++            Some((
++                "4bf92f3577b34da6a3ce929d0e0e4736".to_owned(),
++                "00f067aa0ba902b7".to_owned(),
++            ))
++        );
++        assert!(
++            parse_traceparent("00-00000000000000000000000000000000-00f067aa0ba902b7-01").is_none()
++        );
++        assert!(
++            parse_traceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01").is_none()
++        );
++        assert!(
++            parse_traceparent("ff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01").is_none()
++        );
++        assert!(parse_traceparent("not-a-traceparent").is_none());
++    }
++
++    #[test]
++    fn queue_and_runtime_telemetry_taxonomies_are_stable_and_message_free() {
++        assert_eq!(submit_outcome_name(&SubmitOutcome::Created), "created");
++        assert_eq!(submit_outcome_name(&SubmitOutcome::Existing), "existing");
++        assert_eq!(finish_outcome_name(&FinishOutcome::Cancelled), "cancelled");
++        assert_eq!(
++            queue_error_type(&QueueError::RateLimited {
++                retry_after_seconds: 5,
++            }),
++            "rate_limited"
++        );
++        let runtime_error = OrchestratorError::ToolExecution("secret payload".to_owned());
++        assert_eq!(orchestrator_error_type(&runtime_error), "tool_execution");
++        assert_ne!(orchestrator_error_type(&runtime_error), "secret payload");
++    }
++
++    #[tokio::test]
++    async fn request_id_is_preserved_in_success_response() {
++        let state = state();
++        let response = state
++            .router()
++            .oneshot(
++                axum::http::Request::builder()
++                    .uri("/healthz")
++                    .header(REQUEST_ID_HEADER, "req-health-1")
++                    .body(axum::body::Body::empty())
++                    .unwrap(),
++            )
++            .await
++            .unwrap();
++        assert_eq!(response.status(), StatusCode::OK);
++        assert_eq!(
++            response
++                .headers()
++                .get(REQUEST_ID_HEADER)
++                .and_then(|value| value.to_str().ok()),
++            Some("req-health-1")
++        );
++    }
++
++    #[tokio::test]
++    async fn invalid_request_id_is_replaced_and_error_body_matches_header() {
++        let state = state();
++        let task_id = Uuid::new_v4();
++        let response = state
++            .router()
++            .oneshot(
++                axum::http::Request::builder()
++                    .uri(format!("/v1/tasks/{task_id}"))
++                    .header(REQUEST_ID_HEADER, "contains spaces")
++                    .body(axum::body::Body::empty())
++                    .unwrap(),
++            )
++            .await
++            .unwrap();
++        assert_eq!(response.status(), StatusCode::NOT_FOUND);
++        let header_id = response
++            .headers()
++            .get(REQUEST_ID_HEADER)
++            .and_then(|value| value.to_str().ok())
++            .expect("request ID header")
++            .to_owned();
++        assert_ne!(header_id, "contains spaces");
++        assert!(CorrelationContext::with_request_id(&header_id).is_ok());
++        let body = axum::body::to_bytes(response.into_body(), 1_048_576)
++            .await
++            .unwrap();
++        let payload: Value = serde_json::from_slice(&body).unwrap();
++        assert_eq!(payload["request_id"].as_str(), Some(header_id.as_str()));
++    }
++
+     #[tokio::test]
+     async fn health_and_session_routes_work_without_auth_key() {
+         let state = state();
+diff --git a/crates/shaka-observability/Cargo.toml b/crates/shaka-observability/Cargo.toml
+index c1dd2a5..9bb430a 100644
+--- a/crates/shaka-observability/Cargo.toml
++++ b/crates/shaka-observability/Cargo.toml
+@@ -6,11 +6,16 @@ license.workspace = true
+ rust-version.workspace = true
+ 
+ [dependencies]
++hex.workspace = true
++regex = "1.11"
+ serde_json.workspace = true
+ shaka-core = { path = "../shaka-core" }
+ shaka-memory = { path = "../shaka-memory" }
++sha2.workspace = true
++thiserror.workspace = true
+ tracing.workspace = true
+ tracing-subscriber.workspace = true
++uuid = { version = "1.11", features = ["v4"] }
+ 
+ [lints]
+ workspace = true
+diff --git a/crates/shaka-observability/src/lib.rs b/crates/shaka-observability/src/lib.rs
+index 8b17e1b..aca44bf 100644
+--- a/crates/shaka-observability/src/lib.rs
++++ b/crates/shaka-observability/src/lib.rs
+@@ -1,11 +1,33 @@
+-//! Observabilidade e auditoria do Shaka.
++//! Fachada de observabilidade governada do Shaka.
++//!
++//! A Etapa A fornece os contratos locais para correlação, redaction e schema.
++//! Exporters e instrumentação dos componentes serão adicionados em etapas
++//! posteriores sem permitir que telemetria altere decisões de autorização.
+ 
+-use serde_json::Value;
++use regex::Regex;
++use serde_json::{Map, Value};
++use sha2::{Digest, Sha256};
+ use shaka_core::{AuditEvent, TaskId, TenantId};
+ use shaka_memory::{MemoryError, MemoryStore};
+-use std::{collections::BTreeMap, sync::Arc};
++use std::{
++    collections::BTreeMap,
++    sync::{Arc, OnceLock},
++};
++use thiserror::Error;
+ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
++use uuid::Uuid;
+ 
++/// Nome do schema interno de telemetria do Shaka.
++pub const SCHEMA_NAME: &str = "shaka.observability";
++/// Versão do schema interno implementado nesta etapa.
++pub const SCHEMA_VERSION: &str = "0.7";
++/// Perfil de interoperabilidade `GenAI` adotado pelo Shaka.
++pub const GEN_AI_PROFILE: &str = "shaka.genai.v0.7";
++const DEFAULT_MAX_TEXT_CHARS: usize = 4_096;
++const DEFAULT_MAX_JSON_DEPTH: usize = 16;
++const DEFAULT_MAX_JSON_ITEMS: usize = 256;
++
++/// Inicializa o subscriber de logs compatível com a configuração atual do CLI.
+ pub fn init_tracing(json_logs: bool) {
+     let filter =
+         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,shaka=debug"));
+@@ -26,17 +48,588 @@ pub fn init_tracing(json_logs: bool) {
+     }
+ }
+ 
++/// Erros da fachada de observabilidade.
++#[derive(Debug, Error, Clone, PartialEq, Eq)]
++pub enum TelemetryError {
++    /// Um identificador de correlação não respeitou o formato seguro.
++    #[error("identificador de correlação inválido: {0}")]
++    InvalidCorrelationId(String),
++    /// A captura de conteúdo não faz parte da política estrita da Etapa A.
++    #[error("captura de conteúdo GenAI está desabilitada pela política estrita")]
++    ContentCaptureDisabled,
++    /// A política recebeu limites impossíveis ou excessivos.
++    #[error("política de telemetria inválida: {0}")]
++    InvalidPolicy(String),
++}
++
++/// Descritor público do schema interno usado nos sinais do Shaka.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct TelemetrySchema {
++    /// Nome estável do schema interno.
++    pub name: &'static str,
++    /// Versão do schema interno.
++    pub version: &'static str,
++    /// Perfil `GenAI` de interoperabilidade.
++    pub gen_ai_profile: &'static str,
++}
++
++impl Default for TelemetrySchema {
++    fn default() -> Self {
++        Self {
++            name: SCHEMA_NAME,
++            version: SCHEMA_VERSION,
++            gen_ai_profile: GEN_AI_PROFILE,
++        }
++    }
++}
++
++/// Política segura e local da Etapa A.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct TelemetryPolicy {
++    /// Captura de prompts, respostas e argumentos; permanece falsa por padrão.
++    pub capture_content: bool,
++    /// Limite máximo de caracteres por valor textual redacted.
++    pub max_text_chars: usize,
++    /// Profundidade máxima de um JSON redacted.
++    pub max_json_depth: usize,
++    /// Número máximo de itens por objeto ou array redacted.
++    pub max_json_items: usize,
++}
++
++impl Default for TelemetryPolicy {
++    fn default() -> Self {
++        Self {
++            capture_content: false,
++            max_text_chars: DEFAULT_MAX_TEXT_CHARS,
++            max_json_depth: DEFAULT_MAX_JSON_DEPTH,
++            max_json_items: DEFAULT_MAX_JSON_ITEMS,
++        }
++    }
++}
++
++impl TelemetryPolicy {
++    fn validate(self) -> Result<Self, TelemetryError> {
++        if self.capture_content {
++            return Err(TelemetryError::ContentCaptureDisabled);
++        }
++        if self.max_text_chars == 0 || self.max_text_chars > 64 * 1024 {
++            return Err(TelemetryError::InvalidPolicy(
++                "max_text_chars deve estar entre 1 e 65536".to_owned(),
++            ));
++        }
++        if self.max_json_depth == 0 || self.max_json_depth > 64 {
++            return Err(TelemetryError::InvalidPolicy(
++                "max_json_depth deve estar entre 1 e 64".to_owned(),
++            ));
++        }
++        if self.max_json_items == 0 || self.max_json_items > 4_096 {
++            return Err(TelemetryError::InvalidPolicy(
++                "max_json_items deve estar entre 1 e 4096".to_owned(),
++            ));
++        }
++        Ok(self)
++    }
++}
++
++/// Contexto de correlação propagado entre HTTP, fila, worker e runtime.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct CorrelationContext {
++    request_id: String,
++    trace_id: Option<String>,
++    span_id: Option<String>,
++    task_id: Option<String>,
++    session_id: Option<String>,
++    tenant_ref: Option<String>,
++}
++
++impl Default for CorrelationContext {
++    fn default() -> Self {
++        Self::new()
++    }
++}
++
++impl CorrelationContext {
++    /// Cria um contexto com um request ID aleatório e não secreto.
++    #[must_use]
++    pub fn new() -> Self {
++        Self {
++            request_id: Uuid::new_v4().to_string(),
++            trace_id: None,
++            span_id: None,
++            task_id: None,
++            session_id: None,
++            tenant_ref: None,
++        }
++    }
++
++    /// Cria um contexto usando um request ID validado e fornecido pelo chamador.
++    pub fn with_request_id(request_id: impl Into<String>) -> Result<Self, TelemetryError> {
++        let request_id = validate_correlation_id("request_id", request_id.into())?;
++        Ok(Self {
++            request_id,
++            ..Self::new()
++        })
++    }
++
++    /// Anexa trace ID e span ID validados ao contexto.
++    pub fn with_trace_ids(
++        mut self,
++        trace_id: Option<impl Into<String>>,
++        span_id: Option<impl Into<String>>,
++    ) -> Result<Self, TelemetryError> {
++        self.trace_id = validate_optional_id("trace_id", trace_id)?;
++        self.span_id = validate_optional_id("span_id", span_id)?;
++        Ok(self)
++    }
++
++    /// Anexa a referência de tarefa ao contexto.
++    pub fn with_task_id(
++        mut self,
++        task_id: Option<impl Into<String>>,
++    ) -> Result<Self, TelemetryError> {
++        self.task_id = validate_optional_id("task_id", task_id)?;
++        Ok(self)
++    }
++
++    /// Anexa a referência de sessão ao contexto.
++    pub fn with_session_id(
++        mut self,
++        session_id: Option<impl Into<String>>,
++    ) -> Result<Self, TelemetryError> {
++        self.session_id = validate_optional_id("session_id", session_id)?;
++        Ok(self)
++    }
++
++    /// Anexa uma referência de tenant já redacted/pseudonimizada.
++    pub fn with_tenant_ref(
++        mut self,
++        tenant_ref: Option<impl Into<String>>,
++    ) -> Result<Self, TelemetryError> {
++        self.tenant_ref = tenant_ref
++            .map(|value| {
++                let value = validate_correlation_id("tenant_ref", value.into())?;
++                let digest = hex::encode(Sha256::digest(value.as_bytes()));
++                Ok(format!("sha256:{}", &digest[..16]))
++            })
++            .transpose()?;
++        Ok(self)
++    }
++
++    /// Retorna o request ID correlacionável.
++    #[must_use]
++    pub fn request_id(&self) -> &str {
++        &self.request_id
++    }
++
++    /// Retorna o trace ID, quando propagado.
++    #[must_use]
++    pub fn trace_id(&self) -> Option<&str> {
++        self.trace_id.as_deref()
++    }
++
++    /// Retorna o span ID, quando propagado.
++    #[must_use]
++    pub fn span_id(&self) -> Option<&str> {
++        self.span_id.as_deref()
++    }
++
++    /// Retorna a referência de tarefa, quando disponível.
++    #[must_use]
++    pub fn task_id(&self) -> Option<&str> {
++        self.task_id.as_deref()
++    }
++
++    /// Retorna a referência de sessão, quando disponível.
++    #[must_use]
++    pub fn session_id(&self) -> Option<&str> {
++        self.session_id.as_deref()
++    }
++
++    /// Retorna a referência de tenant redacted, quando disponível.
++    #[must_use]
++    pub fn tenant_ref(&self) -> Option<&str> {
++        self.tenant_ref.as_deref()
++    }
++}
++
++fn validate_optional_id<T>(field: &str, value: Option<T>) -> Result<Option<String>, TelemetryError>
++where
++    T: Into<String>,
++{
++    value
++        .map(|value| validate_correlation_id(field, value.into()))
++        .transpose()
++}
++
++fn validate_correlation_id(field: &str, value: String) -> Result<String, TelemetryError> {
++    let valid = !value.is_empty()
++        && value.len() <= 128
++        && value.chars().all(|character| {
++            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | '~')
++        });
++    if valid {
++        Ok(value)
++    } else {
++        Err(TelemetryError::InvalidCorrelationId(field.to_owned()))
++    }
++}
++
++fn sensitive_text_pattern() -> &'static Result<Regex, regex::Error> {
++    static PATTERN: OnceLock<Result<Regex, regex::Error>> = OnceLock::new();
++    PATTERN.get_or_init(|| {
++        Regex::new(concat!(
++            r"(?i)\b(?:authorization|proxy-authorization)\s*[:=]\s*Bearer\s+[A-Za-z0-9._~+/=-]+|\bBearer\s+[A-Za-z0-9._~+/=-]+|",
++            r#"(?:[\"']?)(?:api[_-]?key|access[_-]?token|secret|password|authorization|cookie|set-cookie|private[_-]?key|token)(?:[\"']?)"#,
++            r#"\s*[:=]\s*(?:\"[^\"]*\"|'[^']*'|[^\s,;}\]]+)"#
++        ))
++    })
++}
++
++fn normalized_key(key: &str) -> String {
++    key.to_ascii_lowercase().replace('-', "_")
++}
++
++fn sensitive_key(key: &str) -> bool {
++    let normalized = normalized_key(key);
++    matches!(
++        normalized.as_str(),
++        "api_key"
++            | "apikey"
++            | "access_token"
++            | "authorization"
++            | "bearer"
++            | "cookie"
++            | "set_cookie"
++            | "secret"
++            | "password"
++            | "private_key"
++            | "token"
++    ) || normalized.ends_with("_secret")
++        || normalized.ends_with("_password")
++        || normalized.ends_with("_api_key")
++        || normalized.ends_with("_access_token")
++}
++
++fn content_key(key: &str) -> bool {
++    let normalized = normalized_key(key);
++    matches!(
++        normalized.as_str(),
++        "argument"
++            | "arguments"
++            | "completion"
++            | "content"
++            | "input"
++            | "message"
++            | "messages"
++            | "objective"
++            | "output"
++            | "prompt"
++            | "response"
++            | "result"
++            | "system"
++            | "system_instructions"
++            | "system_prompt"
++            | "tool_arguments"
++            | "tool_result"
++            | "user_message"
++    ) || [
++        "argument",
++        "completion",
++        "content",
++        "input",
++        "message",
++        "objective",
++        "output",
++        "prompt",
++        "response",
++        "result",
++    ]
++    .iter()
++    .any(|marker| normalized.contains(marker))
++}
++
++fn truncate_text(value: &str, max_chars: usize) -> String {
++    if value.chars().count() <= max_chars {
++        return value.to_owned();
++    }
++    let suffix = "…[TRUNCATED]";
++    let suffix_len = suffix.chars().count();
++    if max_chars <= suffix_len {
++        return suffix.chars().take(max_chars).collect();
++    }
++    let prefix: String = value.chars().take(max_chars - suffix_len).collect();
++    format!("{prefix}{suffix}")
++}
++
++/// Redactor central para texto, metadata e JSON estruturado.
++#[derive(Debug, Clone)]
++pub struct Redactor {
++    text: usize,
++    json_depth: usize,
++    json_items: usize,
++}
++
++impl Redactor {
++    /// Cria e valida um redactor a partir de uma política.
++    pub fn new(policy: TelemetryPolicy) -> Result<Self, TelemetryError> {
++        let policy = policy.validate()?;
++        Ok(Self::from_policy(policy))
++    }
++
++    fn from_policy(policy: TelemetryPolicy) -> Self {
++        Self {
++            text: policy.max_text_chars,
++            json_depth: policy.max_json_depth,
++            json_items: policy.max_json_items,
++        }
++    }
++
++    /// Redacta padrões conhecidos de segredo e limita o tamanho do texto.
++    #[must_use]
++    pub fn redact_text(&self, input: &str) -> String {
++        let redacted = match sensitive_text_pattern() {
++            Ok(pattern) => pattern
++                .replace_all(input, |captures: &regex::Captures<'_>| {
++                    let value = captures.get(0).map_or("", |match_| match_.as_str());
++                    if value.to_ascii_lowercase().starts_with("bearer") {
++                        "Bearer [REDACTED]".to_owned()
++                    } else {
++                        let key = value
++                            .split([':', '='])
++                            .next()
++                            .unwrap_or("secret")
++                            .trim_matches(['"', '\'']);
++                        format!("{key}=[REDACTED]")
++                    }
++                })
++                .into_owned(),
++            Err(_) => "[REDACTION_FAILED]".to_owned(),
++        };
++        truncate_text(&redacted, self.text)
++    }
++
++    /// Redacta recursivamente um valor JSON, removendo valores de chaves sensíveis.
++    #[must_use]
++    pub fn redact_json(&self, value: &Value) -> Value {
++        self.redact_json_at_depth(value, 0)
++    }
++
++    fn redact_json_at_depth(&self, value: &Value, depth: usize) -> Value {
++        if depth >= self.json_depth {
++            return Value::String("[REDACTED_DEPTH_LIMIT]".to_owned());
++        }
++        match value {
++            Value::Null | Value::Bool(_) | Value::Number(_) => value.clone(),
++            Value::String(text) => Value::String(self.redact_text(text)),
++            Value::Array(values) => {
++                let mut redacted = values
++                    .iter()
++                    .take(self.json_items)
++                    .map(|item| self.redact_json_at_depth(item, depth + 1))
++                    .collect::<Vec<_>>();
++                if values.len() > self.json_items {
++                    redacted.push(Value::String("[TRUNCATED_ITEMS]".to_owned()));
++                }
++                Value::Array(redacted)
++            }
++            Value::Object(object) => {
++                let mut redacted = Map::new();
++                for (index, (key, item)) in object.iter().enumerate() {
++                    if index >= self.json_items {
++                        redacted.insert(
++                            "_truncated".to_owned(),
++                            Value::String("[TRUNCATED_ITEMS]".to_owned()),
++                        );
++                        break;
++                    }
++                    if sensitive_key(key) {
++                        redacted.insert(key.clone(), Value::String("[REDACTED]".to_owned()));
++                    } else if content_key(key) {
++                        redacted
++                            .insert(key.clone(), Value::String("[REDACTED_CONTENT]".to_owned()));
++                    } else {
++                        redacted.insert(key.clone(), self.redact_json_at_depth(item, depth + 1));
++                    }
++                }
++                Value::Object(redacted)
++            }
++        }
++    }
++
++    fn redact_field(&self, key: &str, value: &str) -> (String, String) {
++        let normalized = normalized_key(key);
++        let safe_value = if sensitive_key(key) {
++            "[REDACTED]".to_owned()
++        } else if content_key(key) {
++            "[REDACTED_CONTENT]".to_owned()
++        } else if normalized.ends_with("_json") {
++            serde_json::from_str::<Value>(value).map_or_else(
++                |_| self.redact_text(value),
++                |json| self.redact_json(&json).to_string(),
++            )
++        } else {
++            self.redact_text(value)
++        };
++        (key.to_owned(), safe_value)
++    }
++
++    /// Redacta metadata textual preservando as chaves permitidas.
++    #[must_use]
++    pub fn redact_fields(&self, fields: &BTreeMap<String, String>) -> BTreeMap<String, String> {
++        fields
++            .iter()
++            .map(|(key, value)| self.redact_field(key, value))
++            .collect()
++    }
++
++    fn redact_owned_fields(&self, fields: BTreeMap<String, String>) -> BTreeMap<String, String> {
++        fields
++            .into_iter()
++            .map(|(key, value)| self.redact_field(&key, &value))
++            .collect()
++    }
++}
++
++/// Fachada de contratos de observabilidade da Etapa A.
++#[derive(Debug, Clone)]
++pub struct Telemetry {
++    policy: TelemetryPolicy,
++    schema: TelemetrySchema,
++    redactor: Redactor,
++}
++
++impl Default for Telemetry {
++    fn default() -> Self {
++        let policy = TelemetryPolicy::default();
++        Self {
++            redactor: Redactor::from_policy(policy),
++            policy,
++            schema: TelemetrySchema::default(),
++        }
++    }
++}
++
++impl Telemetry {
++    /// Cria a fachada a partir de uma política segura.
++    pub fn new(policy: TelemetryPolicy) -> Result<Self, TelemetryError> {
++        let policy = policy.validate()?;
++        Ok(Self {
++            redactor: Redactor::from_policy(policy),
++            policy,
++            schema: TelemetrySchema::default(),
++        })
++    }
++
++    /// Retorna a política efetiva.
++    #[must_use]
++    pub const fn policy(&self) -> TelemetryPolicy {
++        self.policy
++    }
++
++    /// Retorna o descritor do schema interno.
++    #[must_use]
++    pub const fn schema(&self) -> TelemetrySchema {
++        self.schema
++    }
++
++    /// Retorna o redactor compartilhável da fachada.
++    #[must_use]
++    pub const fn redactor(&self) -> &Redactor {
++        &self.redactor
++    }
++
++    /// Cria um novo contexto de correlação.
++    #[must_use]
++    pub fn new_correlation_context(&self) -> CorrelationContext {
++        CorrelationContext::new()
++    }
++
++    /// Cria um span inicial com campos de schema e correlação redacted.
++    #[must_use]
++    pub fn operation_span(&self, operation: &str, context: &CorrelationContext) -> tracing::Span {
++        let operation = self.redactor.redact_text(operation);
++        tracing::span!(
++            target: "shaka.telemetry",
++            tracing::Level::INFO,
++            "shaka.operation",
++            schema = SCHEMA_NAME,
++            schema_version = SCHEMA_VERSION,
++            gen_ai_profile = GEN_AI_PROFILE,
++            operation = %operation,
++            request_id = %context.request_id(),
++            trace_id = ?context.trace_id(),
++            span_id = ?context.span_id(),
++            task_id = ?context.task_id(),
++            session_id = ?context.session_id(),
++            tenant_ref = ?context.tenant_ref(),
++            http_method = tracing::field::Empty,
++            http_route = tracing::field::Empty,
++            http_status_code = tracing::field::Empty,
++            http_status_class = tracing::field::Empty,
++            outcome = tracing::field::Empty,
++            admission = tracing::field::Empty,
++            retryable = tracing::field::Empty,
++            attempt = tracing::field::Empty,
++            lease_state = tracing::field::Empty,
++            circuit_state = tracing::field::Empty,
++            error_type = tracing::field::Empty,
++            worker_id = tracing::field::Empty,
++            queue_depth = tracing::field::Empty,
++            retry_delay_ms = tracing::field::Empty,
++            lease_recovered = tracing::field::Empty,
++        )
++    }
++
++    /// Cria um span de servidor HTTP sem registrar a URI bruta.
++    #[must_use]
++    pub fn http_server_span(
++        &self,
++        context: &CorrelationContext,
++        method: &str,
++        route_template: &str,
++    ) -> tracing::Span {
++        let span = self.operation_span("http.server", context);
++        let method = self.redactor.redact_text(method);
++        let route = self.redactor.redact_text(route_template);
++        span.record("http_method", method.as_str());
++        span.record("http_route", route.as_str());
++        span
++    }
++
++    /// Impede explicitamente a captura de conteúdo na política estrita.
++    pub fn ensure_content_capture_disabled(&self, requested: bool) -> Result<(), TelemetryError> {
++        if requested {
++            Err(TelemetryError::ContentCaptureDisabled)
++        } else {
++            Ok(())
++        }
++    }
++}
++
++/// Logger de auditoria persistente compatível com a v0.6.0.
+ #[derive(Debug, Clone)]
+ pub struct AuditLogger {
+     memory: Arc<MemoryStore>,
++    redactor: Redactor,
+ }
+ 
+ impl AuditLogger {
++    /// Cria um logger ligado ao armazenamento de memória/auditoria.
+     #[must_use]
+     pub fn new(memory: Arc<MemoryStore>) -> Self {
+-        Self { memory }
++        Self {
++            memory,
++            redactor: Redactor::from_policy(TelemetryPolicy::default()),
++        }
++    }
++
++    /// Cria um logger usando um redactor fornecido pela política do runtime.
++    #[must_use]
++    pub fn with_redactor(memory: Arc<MemoryStore>, redactor: Redactor) -> Self {
++        Self { memory, redactor }
+     }
+ 
++    /// Registra um evento de auditoria com metadata textual.
+     pub fn record(
+         &self,
+         task_id: Option<TaskId>,
+@@ -46,11 +639,13 @@ impl AuditLogger {
+         outcome: impl Into<String>,
+         metadata: BTreeMap<String, String>,
+     ) -> Result<AuditEvent, MemoryError> {
++        let metadata = self.redactor.redact_owned_fields(metadata);
+         let event = AuditEvent::new(task_id, tenant_id, actor, action, outcome, metadata, None);
+         let chained = self.memory.append_audit_event(&event)?;
+         Ok(chained)
+     }
+ 
++    /// Registra metadata JSON legada como campo textual.
+     pub fn record_json(
+         &self,
+         task_id: Option<TaskId>,
+@@ -61,7 +656,172 @@ impl AuditLogger {
+         metadata: &Value,
+     ) -> Result<AuditEvent, MemoryError> {
+         let mut fields = BTreeMap::new();
+-        fields.insert("metadata_json".to_owned(), metadata.to_string());
++        let redacted = self.redactor.redact_json(metadata);
++        fields.insert("metadata_json".to_owned(), redacted.to_string());
+         self.record(task_id, tenant_id, actor, action, outcome, fields)
+     }
+ }
++
++#[cfg(test)]
++#[allow(clippy::unwrap_used, clippy::expect_used)]
++mod tests {
++    use super::*;
++    use serde_json::json;
++
++    #[test]
++    fn default_policy_is_strict_and_content_capture_is_rejected() {
++        let telemetry = Telemetry::default();
++        assert!(!telemetry.policy().capture_content);
++        assert_eq!(telemetry.schema().version, "0.7");
++        assert!(matches!(
++            Telemetry::new(TelemetryPolicy {
++                capture_content: true,
++                ..TelemetryPolicy::default()
++            }),
++            Err(TelemetryError::ContentCaptureDisabled)
++        ));
++        assert!(telemetry.ensure_content_capture_disabled(false).is_ok());
++        assert!(matches!(
++            telemetry.ensure_content_capture_disabled(true),
++            Err(TelemetryError::ContentCaptureDisabled)
++        ));
++    }
++
++    #[test]
++    fn text_redaction_removes_common_secrets_and_bounds_output() {
++        let telemetry = Telemetry::default();
++        let result = telemetry
++            .redactor()
++            .redact_text("api_key=secret Authorization: Bearer abc.def password='hidden'");
++        assert!(!result.contains("secret"));
++        assert!(!result.contains("abc.def"));
++        assert!(!result.contains("Bearer"));
++        assert!(!result.contains("hidden"));
++        assert!(result.contains("REDACTED"));
++
++        let bounded = Telemetry::new(TelemetryPolicy {
++            max_text_chars: 24,
++            ..TelemetryPolicy::default()
++        })
++        .expect("policy")
++        .redactor()
++        .redact_text("prefix with a very long safe value");
++        assert!(bounded.chars().count() <= 24);
++    }
++
++    #[test]
++    fn json_redaction_is_recursive_and_key_aware() {
++        let telemetry = Telemetry::default();
++        let value = json!({
++            "safe": "api_key=embedded-secret",
++            "api_key": "top-secret",
++            "objective": "private objective",
++            "prompt_text": "private prompt",
++            "model_input": "private model input",
++            "nested": {"authorization": "Bearer abc.def", "value": "ok"},
++            "items": ["password=hidden", {"private_key": "pem-secret"}]
++        });
++        let redacted = telemetry.redactor().redact_json(&value);
++        let serialized = redacted.to_string();
++        assert!(!serialized.contains("top-secret"));
++        assert!(!serialized.contains("abc.def"));
++        assert!(!serialized.contains("pem-secret"));
++        assert!(!serialized.contains("embedded-secret"));
++        assert!(!serialized.contains("private prompt"));
++        assert!(!serialized.contains("private model input"));
++        assert!(serialized.contains("REDACTED"));
++        assert_eq!(redacted["nested"]["value"], "ok");
++    }
++
++    #[test]
++    fn fields_redaction_preserves_safe_metadata_and_masks_sensitive_keys() {
++        let telemetry = Telemetry::default();
++        let fields = BTreeMap::from([
++            ("outcome".to_owned(), "success".to_owned()),
++            ("api_key".to_owned(), "secret".to_owned()),
++            ("objective".to_owned(), "private objective".to_owned()),
++            (
++                "metadata_json".to_owned(),
++                "{\"prompt\":\"private\",\"ok\":\"yes\"}".to_owned(),
++            ),
++            ("error".to_owned(), "password=hidden".to_owned()),
++        ]);
++        let redacted = telemetry.redactor().redact_fields(&fields);
++        assert_eq!(redacted["outcome"], "success");
++        assert_eq!(redacted["api_key"], "[REDACTED]");
++        assert_eq!(redacted["objective"], "[REDACTED_CONTENT]");
++        assert!(!redacted["metadata_json"].contains("private"));
++        assert!(redacted["metadata_json"].contains("REDACTED_CONTENT"));
++        assert!(!redacted["error"].contains("hidden"));
++    }
++
++    #[test]
++    fn correlation_context_validates_ids_and_is_chainable() {
++        let context = CorrelationContext::with_request_id("request-1")
++            .expect("request")
++            .with_trace_ids(Some("trace-1"), Some("span-1"))
++            .expect("trace")
++            .with_task_id(Some("task-1"))
++            .expect("task")
++            .with_session_id(Some("session-1"))
++            .expect("session")
++            .with_tenant_ref(Some("tenant-ref"))
++            .expect("tenant");
++        assert_eq!(context.request_id(), "request-1");
++        assert_eq!(context.trace_id(), Some("trace-1"));
++        assert_eq!(context.task_id(), Some("task-1"));
++        assert!(
++            context
++                .tenant_ref()
++                .is_some_and(|value| value.starts_with("sha256:"))
++        );
++        assert!(
++            !context
++                .tenant_ref()
++                .is_some_and(|value| value.contains("tenant-ref"))
++        );
++        assert_eq!(
++            CorrelationContext::with_request_id("request id"),
++            Err(TelemetryError::InvalidCorrelationId(
++                "request_id".to_owned()
++            ))
++        );
++        assert_eq!(
++            CorrelationContext::with_request_id(""),
++            Err(TelemetryError::InvalidCorrelationId(
++                "request_id".to_owned()
++            ))
++        );
++    }
++
++    #[test]
++    fn operation_span_has_stable_name_and_schema_metadata() {
++        let telemetry = Telemetry::default();
++        let context = telemetry
++            .new_correlation_context()
++            .with_task_id(Some("task-1"))
++            .expect("task");
++        let subscriber = tracing_subscriber::registry();
++        let _guard = tracing::subscriber::set_default(subscriber);
++        let span = telemetry.operation_span("invoke_agent", &context);
++        assert_eq!(span.metadata().expect("metadata").name(), "shaka.operation");
++        assert!(!context.request_id().is_empty());
++    }
++
++    #[test]
++    fn json_depth_and_item_limits_are_enforced() {
++        let telemetry = Telemetry::new(TelemetryPolicy {
++            max_json_depth: 2,
++            max_json_items: 1,
++            ..TelemetryPolicy::default()
++        })
++        .expect("policy");
++        let nested = json!({"one": {"two": {"three": "secret"}}});
++        let redacted_nested = telemetry.redactor().redact_json(&nested);
++        assert_eq!(redacted_nested["one"]["two"], "[REDACTED_DEPTH_LIMIT]");
++
++        let items = json!({"first": "value", "second": "value"});
++        let redacted_items = telemetry.redactor().redact_json(&items);
++        assert_eq!(redacted_items["_truncated"], "[TRUNCATED_ITEMS]");
++    }
++}
