@@ -159,7 +159,7 @@ jobs:
               --repo "$GITHUB_REPOSITORY" \
               --title "Shaka $release_tag" \
               --generate-notes; then
-              gh release upload "$GITHUB_REF_NAME" dist/* \
+              gh release upload "$release_tag" dist/* \
                 --repo "$GITHUB_REPOSITORY" \
                 --clobber
             fi
