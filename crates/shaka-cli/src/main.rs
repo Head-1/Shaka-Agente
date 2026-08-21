@@ -17,7 +17,7 @@ use shaka_observability::{AuditLogger, init_tracing};
 use shaka_orchestrator::{
     AgentRuntime, EchoTool, LocalModel, OpenAiCompatibleModel, ToolRegistry, WasmSkillTool,
 };
-use shaka_queue::QueueStore;
+use shaka_queue::{QueueStore, TenantLimits};
 use shaka_sandbox::{SandboxPolicy, WasmExecutor};
 use shaka_skills::{SkillRegistry, TrustStore, load_signing_key, public_key_hex, save_signing_key};
 use std::{
@@ -96,6 +96,47 @@ enum Command {
     },
     VerifyAudit,
     Config,
+    Iam {
+        #[command(subcommand)]
+        command: IamCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum IamCommand {
+    TenantCreate {
+        tenant_id: String,
+        display_name: String,
+    },
+    UserCreate {
+        operator_id: String,
+        #[arg(long)]
+        tenant: String,
+        #[arg(long)]
+        role: String,
+    },
+    TokenIssue {
+        operator_id: String,
+        #[arg(long)]
+        expires_in_seconds: Option<i64>,
+    },
+    TokenRevoke {
+        token_id: String,
+    },
+    LimitsSet {
+        tenant_id: String,
+        #[arg(long)]
+        max_active: u32,
+        #[arg(long)]
+        max_daily: u32,
+        #[arg(long)]
+        max_cost_microunits: u64,
+        #[arg(long)]
+        requests: u32,
+        #[arg(long)]
+        window_seconds: u32,
+    },
+    List,
 }
 
 #[derive(Debug, Args)]
@@ -202,6 +243,7 @@ async fn main() -> Result<()> {
         Command::Restore { input } => restore_command(&cli, input),
         Command::VerifyAudit => verify_audit_command(&cli),
         Command::Config => config_command(&cli),
+        Command::Iam { command } => iam_command(&cli, command),
     }
 }
 
@@ -538,6 +580,107 @@ fn skill_command(cli: &Cli, command: &SkillCommand) -> Result<()> {
     Ok(())
 }
 
+fn iam_command(cli: &Cli, command: &IamCommand) -> Result<()> {
+    let config = build_config(cli, false, false)?;
+    authorize(&config, &Action::ManageIam)?;
+    let queue = QueueStore::open(&config.database)?;
+    queue.bootstrap_principal(&config.principal)?;
+    match command {
+        IamCommand::TenantCreate {
+            tenant_id,
+            display_name,
+        } => {
+            let tenant_id = shaka_core::TenantId::new(tenant_id.clone())?;
+            let record = queue.create_tenant(&tenant_id, display_name)?;
+            append_control_audit(
+                &open_memory(&config.database)?,
+                &config.principal,
+                "iam.tenant.create",
+                "success",
+                BTreeMap::from([(String::from("tenant_id"), tenant_id.0.clone())]),
+            )?;
+            println!("{}", serde_json::to_string_pretty(&record)?);
+        }
+        IamCommand::UserCreate {
+            operator_id,
+            tenant,
+            role,
+        } => {
+            let operator_id = shaka_core::OperatorId::new(operator_id.clone())?;
+            let tenant_id = shaka_core::TenantId::new(tenant.clone())?;
+            let role =
+                parse_role(role).context("role deve ser operator, reviewer ou administrator")?;
+            let record = queue.create_user(&operator_id, &tenant_id, &role)?;
+            append_control_audit(
+                &open_memory(&config.database)?,
+                &config.principal,
+                "iam.user.create",
+                "success",
+                BTreeMap::from([(String::from("operator_id"), operator_id.0.clone())]),
+            )?;
+            println!("{}", serde_json::to_string_pretty(&record)?);
+        }
+        IamCommand::TokenIssue {
+            operator_id,
+            expires_in_seconds,
+        } => {
+            let operator_id = shaka_core::OperatorId::new(operator_id.clone())?;
+            let expires_at =
+                expires_in_seconds.map(|seconds| chrono::Utc::now() + Duration::seconds(seconds));
+            let issue = queue.issue_token(&operator_id, expires_at)?;
+            append_control_audit(
+                &open_memory(&config.database)?,
+                &config.principal,
+                "iam.token.issue",
+                "success",
+                BTreeMap::from([(String::from("token_id"), issue.token_id.clone())]),
+            )?;
+            println!("{}", serde_json::to_string_pretty(&issue)?);
+        }
+        IamCommand::TokenRevoke { token_id } => {
+            queue.revoke_token(token_id)?;
+            append_control_audit(
+                &open_memory(&config.database)?,
+                &config.principal,
+                "iam.token.revoke",
+                "success",
+                BTreeMap::from([(String::from("token_id"), token_id.clone())]),
+            )?;
+            println!("{{\"revoked\":true}}");
+        }
+        IamCommand::LimitsSet {
+            tenant_id,
+            max_active,
+            max_daily,
+            max_cost_microunits,
+            requests,
+            window_seconds,
+        } => {
+            let tenant_id = shaka_core::TenantId::new(tenant_id.clone())?;
+            let limits = queue.set_limits(TenantLimits {
+                tenant_id,
+                max_active_tasks: *max_active,
+                max_daily_tasks: *max_daily,
+                max_daily_cost_microunits: *max_cost_microunits,
+                requests_per_window: *requests,
+                window_seconds: *window_seconds,
+            })?;
+            append_control_audit(
+                &open_memory(&config.database)?,
+                &config.principal,
+                "iam.limits.set",
+                "success",
+                BTreeMap::from([(String::from("tenant_id"), limits.tenant_id.0.clone())]),
+            )?;
+            println!("{}", serde_json::to_string_pretty(&limits)?);
+        }
+        IamCommand::List => {
+            println!("{}", serde_json::to_string_pretty(&queue.list_tenants()?)?);
+        }
+    }
+    Ok(())
+}
+
 fn doctor(cli: &Cli) -> Result<()> {
     let config = build_config(cli, false, false);
     let mut report = serde_json::Map::new();
@@ -649,6 +792,15 @@ fn open_memory(path: &Path) -> Result<MemoryStore> {
         std::fs::create_dir_all(parent).with_context(|| format!("criando {}", parent.display()))?;
     }
     Ok(MemoryStore::open(path)?)
+}
+
+fn parse_role(value: &str) -> Option<Role> {
+    match value {
+        "operator" => Some(Role::Operator),
+        "reviewer" => Some(Role::Reviewer),
+        "administrator" => Some(Role::Administrator),
+        _ => None,
+    }
 }
 
 fn parse_capability(value: &str) -> Option<Capability> {
