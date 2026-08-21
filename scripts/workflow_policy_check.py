@@ -43,8 +43,15 @@ def main() -> None:
             fail(f"cargo test sem --locked em {workflow.name}")
         if "cargo clippy --workspace --all-targets --locked" not in text:
             fail(f"cargo clippy sem --locked em {workflow.name}")
-        if "cargo install cargo-audit --version 0.22.2 --locked" not in text:
-            fail(f"cargo-audit deve usar versão fixada em {workflow.name}")
+        cargo_audit_pinned = (
+            "cargo install cargo-audit --version 0.22.2 --locked" in text
+            or (
+                "tool: cargo-audit@0.22.2" in text
+                and "fallback: none" in text
+            )
+        )
+        if not cargo_audit_pinned:
+            fail(f"cargo-audit deve usar versão fixada e sem fallback de compilação em {workflow.name}")
     release = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
     for permission in ("contents: write", "packages: write", "id-token: write", "attestations: write"):
         if permission not in release:
