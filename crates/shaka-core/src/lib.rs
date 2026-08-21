@@ -72,6 +72,7 @@ pub enum Action {
     Restore,
     VerifyAudit,
     PurgeMemory,
+    ManageIam,
 }
 
 /// Identidade autenticada e escopo de tenant usado nas decisões do host.
