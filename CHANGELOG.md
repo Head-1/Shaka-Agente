@@ -14,6 +14,26 @@ Todas as mudanças relevantes do Shaka serão registradas neste arquivo. O forma
 - IAM remoto, ABAC, cofre de segredos, multi-tenancy forte e métricas exportáveis.
 - Backup remoto automatizado, migrações formais, RPO/RTO e testes de recuperação em infraestrutura-alvo.
 
+## [0.6.0] - 2026-08-21
+
+### Adicionado
+
+- IAM persistente local com tenants, usuários, papéis, tokens bearer opacos e revogação/expiração.
+- Resolução de principal por request na API, sem confiar em `tenant_id`, `operator_id` ou `role` enviados pelo cliente.
+- Comandos administrativos `iam tenant`, `iam user`, `iam token`, `iam limits` e `iam list` protegidos por `ManageIam`.
+- Quotas persistentes por tenant para tarefas ativas, volume diário e custo diário estimado.
+- Rate limits transacionais por tenant e operador, com resposta HTTP `429` e `Retry-After`.
+- Isolamento de sessões e tarefas por tenant e operador autenticado, incluindo submissão governada e idempotência.
+- Desenho técnico `V0.6_DESIGN.md` com migração, contratos, compatibilidade e critérios de aceite.
+
+### Segurança e governança
+
+- Segredos bearer nunca são persistidos; somente SHA-256, `token_id` e prefixo operacional são armazenados.
+- Tokens expirados, revogados, usuários inativos e tenants inativos falham com `401`.
+- Ações IAM não possuem endpoint público e exigem papel administrador na CLI.
+- A API mantém loopback e dry-run como defaults; OIDC/OAuth2 remoto, mensageria, web e escala distribuída permanecem fora do escopo.
+- Auditoria de API e término de workers passa a usar a identidade efetiva do principal/tarefa.
+
 ## [0.5.0] - 2026-08-20
 
 ### Adicionado
