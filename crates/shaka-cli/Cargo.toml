@@ -16,9 +16,11 @@ ed25519-dalek.workspace = true
 clap.workspace = true
 serde_json.workspace = true
 rand.workspace = true
+shaka-api = { path = "../shaka-api" }
 shaka-config = { path = "../shaka-config" }
 shaka-core = { path = "../shaka-core" }
 shaka-memory = { path = "../shaka-memory" }
+shaka-queue = { path = "../shaka-queue" }
 shaka-observability = { path = "../shaka-observability" }
 shaka-sandbox = { path = "../shaka-sandbox" }
 shaka-orchestrator = { path = "../shaka-orchestrator" }
