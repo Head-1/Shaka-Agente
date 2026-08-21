@@ -18,8 +18,8 @@ use shaka_core::{Action, ExecutionBudget, Principal, TaskEnvelope, TaskId, Tenan
 use shaka_observability::AuditLogger;
 use shaka_orchestrator::{AgentRuntime, CancellationToken, OrchestratorError};
 use shaka_queue::{
-    CircuitBreaker, CircuitConfig, CircuitSnapshot, FinishOutcome, QueueError, QueueStore,
-    SessionRecord, SubmitOutcome, TaskRecord, TaskStatus,
+    AuthSource, AuthenticatedPrincipal, CircuitBreaker, CircuitConfig, CircuitSnapshot,
+    FinishOutcome, QueueError, QueueStore, SessionRecord, SubmitOutcome, TaskRecord, TaskStatus,
 };
 use std::{
     collections::{BTreeMap, HashMap},
@@ -82,10 +82,10 @@ impl ApiConfig {
             && self
                 .api_key
                 .as_ref()
-                .is_none_or(|value| value.trim().is_empty())
+                .is_some_and(|value| value.trim().is_empty())
         {
             return Err(ApiError::BadRequest(
-                "bind não local exige SHAKA_API_KEY".to_owned(),
+                "SHAKA_API_KEY não pode ser vazia".to_owned(),
             ));
         }
         Ok(())
@@ -96,12 +96,18 @@ impl ApiConfig {
 pub enum ApiError {
     #[error("não autorizado")]
     Unauthorized,
+    #[error("operação proibida")]
+    Forbidden,
     #[error("recurso não encontrado")]
     NotFound,
     #[error("entrada inválida: {0}")]
     BadRequest(String),
     #[error("conflito de idempotência")]
     Conflict(String),
+    #[error("rate limit excedido")]
+    RateLimited { retry_after_seconds: u64 },
+    #[error("quota excedida: {0}")]
+    QuotaExceeded(String),
     #[error("falha interna persistente")]
     Internal,
 }
@@ -110,6 +116,14 @@ impl From<QueueError> for ApiError {
     fn from(error: QueueError) -> Self {
         match error {
             QueueError::NotFound(_) => Self::NotFound,
+            QueueError::Unauthorized => Self::Unauthorized,
+            QueueError::Forbidden => Self::Forbidden,
+            QueueError::RateLimited {
+                retry_after_seconds,
+            } => Self::RateLimited {
+                retry_after_seconds,
+            },
+            QueueError::QuotaExceeded(name) => Self::QuotaExceeded(name),
             QueueError::IdempotencyConflict => {
                 Self::Conflict("Idempotency-Key já foi usada com outro payload".to_owned())
             }
@@ -128,22 +142,39 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = match self {
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
+            Self::Forbidden => StatusCode::FORBIDDEN,
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Conflict(_) => StatusCode::CONFLICT,
+            Self::RateLimited { .. } | Self::QuotaExceeded(_) => StatusCode::TOO_MANY_REQUESTS,
             Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        let retry_after = match &self {
+            Self::RateLimited {
+                retry_after_seconds,
+            } => Some(*retry_after_seconds),
+            _ => None,
         };
         let message = match &self {
             Self::Unauthorized => "não autorizado".to_owned(),
+            Self::Forbidden => "operação proibida".to_owned(),
             Self::NotFound => "recurso não encontrado".to_owned(),
             Self::BadRequest(value) | Self::Conflict(value) => value.clone(),
+            Self::RateLimited { .. } => "rate limit excedido".to_owned(),
+            Self::QuotaExceeded(name) => format!("quota excedida: {name}"),
             Self::Internal => "falha interna persistente".to_owned(),
         };
         let body = Json(json!({
             "error": message,
             "request_id": Uuid::new_v4(),
         }));
-        (status, body).into_response()
+        let mut response = (status, body).into_response();
+        if let Some(seconds) = retry_after {
+            if let Ok(value) = seconds.to_string().parse() {
+                response.headers_mut().insert("retry-after", value);
+            }
+        }
+        response
     }
 }
 
@@ -203,6 +234,15 @@ impl ApiState {
         config: ApiConfig,
     ) -> Result<Self, ApiError> {
         config.validate()?;
+        queue.bootstrap_principal(&principal)?;
+        if !config.bind_addr.ip().is_loopback()
+            && config.api_key.is_none()
+            && !queue.has_active_tokens()?
+        {
+            return Err(ApiError::BadRequest(
+                "bind não local exige SHAKA_API_KEY ou token IAM ativo".to_owned(),
+            ));
+        }
         let breaker = Arc::new(queue.circuit_breaker("agent-runtime", config.circuit)?);
         Ok(Self {
             queue,
@@ -249,6 +289,36 @@ impl ApiState {
     fn remove_cancellation(&self, task_id: &TaskId) {
         self.cancellations.lock().remove(&task_id.0);
     }
+
+    fn authenticate(&self, headers: &HeaderMap) -> Result<AuthenticatedPrincipal, ApiError> {
+        let provided = headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "));
+        match provided {
+            Some(token) => {
+                if self.config.api_key.as_deref() == Some(token) {
+                    Ok(AuthenticatedPrincipal {
+                        principal: self.principal.clone(),
+                        token_id: "static-api-key".to_owned(),
+                        token_prefix: "static".to_owned(),
+                        source: AuthSource::StaticApiKey,
+                    })
+                } else {
+                    Ok(self.queue.authenticate_token(token)?)
+                }
+            }
+            None if self.config.bind_addr.ip().is_loopback() && self.config.api_key.is_none() => {
+                Ok(AuthenticatedPrincipal {
+                    principal: self.principal.clone(),
+                    token_id: "local-loopback".to_owned(),
+                    token_prefix: "local".to_owned(),
+                    source: AuthSource::StaticApiKey,
+                })
+            }
+            None => Err(ApiError::Unauthorized),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -257,7 +327,7 @@ pub struct CreateSessionRequest {
     pub metadata: Value,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct SessionResponse {
     pub session_id: Uuid,
     pub tenant_id: TenantId,
@@ -352,13 +422,14 @@ async fn create_session(
     headers: HeaderMap,
     Json(request): Json<CreateSessionRequest>,
 ) -> Result<(StatusCode, Json<SessionResponse>), ApiError> {
-    authorize(&headers, &state)?;
+    let auth = authorize(&headers, &state)?;
     let metadata = bounded_json(request.metadata, 4_096)?;
     let session = state
         .queue
-        .create_session(state.principal.clone(), metadata)?;
-    audit(
+        .create_session(auth.principal.clone(), metadata)?;
+    audit_principal(
         &state,
+        &auth.principal,
         None,
         "api.session.create",
         "success",
@@ -372,13 +443,13 @@ async fn get_session(
     headers: HeaderMap,
     Path(session_id): Path<Uuid>,
 ) -> Result<Json<SessionResponse>, ApiError> {
-    authorize(&headers, &state)?;
+    let auth = authorize(&headers, &state)?;
     state
         .queue
-        .touch_session(session_id, &state.principal.tenant_id)?;
+        .touch_session(session_id, &auth.principal.tenant_id)?;
     let session = state
         .queue
-        .get_session(session_id, &state.principal.tenant_id)?;
+        .get_session(session_id, &auth.principal.tenant_id)?;
     Ok(Json(session.into()))
 }
 
@@ -388,14 +459,14 @@ async fn submit_task(
     Path(session_id): Path<Uuid>,
     Json(request): Json<SubmitTaskRequest>,
 ) -> Result<(StatusCode, Json<TaskResponse>), ApiError> {
-    authorize(&headers, &state)?;
+    let auth = authorize(&headers, &state)?;
     let idempotency_key = headers
         .get("idempotency-key")
         .and_then(|value| value.to_str().ok())
         .ok_or_else(|| ApiError::BadRequest("header Idempotency-Key é obrigatório".to_owned()))?;
     state
         .queue
-        .touch_session(session_id, &state.principal.tenant_id)?;
+        .touch_session(session_id, &auth.principal.tenant_id)?;
     if request.objective.trim().is_empty() || request.objective.len() > 32_000 {
         return Err(ApiError::BadRequest(
             "objective vazio ou maior que 32000 caracteres".to_owned(),
@@ -408,15 +479,15 @@ async fn submit_task(
     if !dry_run
         && (!state.config.live_enabled
             || !state.config.live_confirmation
-            || !state.principal.allows(&Action::RunExternal))
+            || !auth.principal.allows(&Action::RunExternal))
     {
         return Err(ApiError::BadRequest(
             "execução live exige configuração explícita e principal administrador".to_owned(),
         ));
     }
     let mut envelope = TaskEnvelope::new(
-        state.principal.tenant_id.clone(),
-        state.principal.operator_id.clone(),
+        auth.principal.tenant_id.clone(),
+        auth.principal.operator_id.clone(),
         request.objective.clone(),
     )
     .map_err(|error| ApiError::BadRequest(error.to_string()))?;
@@ -426,9 +497,9 @@ async fn submit_task(
     }
     let max_attempts = request.max_attempts.unwrap_or(3);
     let fingerprint = fingerprint(&request, idempotency_key)?;
-    let (outcome, task) = state.queue.submit_task(
+    let (outcome, task) = state.queue.submit_task_governed(
         session_id,
-        &state.principal.tenant_id,
+        &auth.principal,
         idempotency_key,
         &fingerprint,
         &envelope,
@@ -436,8 +507,9 @@ async fn submit_task(
         max_attempts,
     )?;
     if outcome == SubmitOutcome::Created {
-        audit(
+        audit_principal(
             &state,
+            &auth.principal,
             Some(task.task_id.clone()),
             "api.task.submit",
             "success",
@@ -457,10 +529,10 @@ async fn get_task(
     headers: HeaderMap,
     Path(task_id): Path<Uuid>,
 ) -> Result<Json<TaskResponse>, ApiError> {
-    authorize(&headers, &state)?;
+    let auth = authorize(&headers, &state)?;
     let record = state
         .queue
-        .get_task(&TaskId(task_id), &state.principal.tenant_id)?;
+        .get_task(&TaskId(task_id), &auth.principal.tenant_id)?;
     Ok(Json(record.into()))
 }
 
@@ -469,19 +541,20 @@ async fn cancel_task(
     headers: HeaderMap,
     Path(task_id): Path<Uuid>,
 ) -> Result<(StatusCode, Json<TaskResponse>), ApiError> {
-    authorize(&headers, &state)?;
+    let auth = authorize(&headers, &state)?;
     let task_id = TaskId(task_id);
     let record = state
         .queue
-        .request_cancel(&task_id, &state.principal.tenant_id)?;
+        .request_cancel(&task_id, &auth.principal.tenant_id)?;
     state.cancel_running(&task_id);
     let status = if record.status == TaskStatus::CancelRequested {
         StatusCode::ACCEPTED
     } else {
         StatusCode::OK
     };
-    audit(
+    audit_principal(
         &state,
+        &auth.principal,
         Some(task_id),
         "api.task.cancel",
         "success",
@@ -585,7 +658,7 @@ async fn execute_task(worker_id: usize, state: ApiState, task: TaskRecord) {
                 state.config.retry_base_delay,
                 state.config.retry_max_delay,
             ) {
-                Ok(outcome) => audit_task_finish(&state, &task_id, &outcome),
+                Ok(outcome) => audit_task_finish(&state, &task, &outcome),
                 Err(error) => warn!(
                     worker_id,
                     ?error,
@@ -615,7 +688,7 @@ async fn execute_task(worker_id: usize, state: ApiState, task: TaskRecord) {
                 state.config.retry_base_delay,
                 state.config.retry_max_delay,
             ) {
-                Ok(outcome) => audit_task_finish(&state, &task_id, &outcome),
+                Ok(outcome) => audit_task_finish(&state, &task, &outcome),
                 Err(queue_error) => warn!(
                     worker_id,
                     ?queue_error,
@@ -626,16 +699,18 @@ async fn execute_task(worker_id: usize, state: ApiState, task: TaskRecord) {
     }
 }
 
-fn audit_task_finish(state: &ApiState, task_id: &TaskId, outcome: &FinishOutcome) {
+fn audit_task_finish(state: &ApiState, task: &TaskRecord, outcome: &FinishOutcome) {
     let outcome_name = match outcome {
         FinishOutcome::Succeeded => "succeeded",
         FinishOutcome::Requeued { .. } => "retry_scheduled",
         FinishOutcome::Failed => "failed",
         FinishOutcome::Cancelled => "cancelled",
     };
-    audit(
+    audit_identity(
         state,
-        Some(task_id.clone()),
+        &task.tenant_id,
+        &task.envelope.operator_id,
+        Some(task.task_id.clone()),
         "api.task.finish",
         outcome_name,
         BTreeMap::new(),
@@ -649,19 +724,8 @@ fn is_retryable(error: &OrchestratorError) -> bool {
     )
 }
 
-fn authorize(headers: &HeaderMap, state: &ApiState) -> Result<(), ApiError> {
-    let Some(expected) = state.config.api_key.as_deref() else {
-        return Ok(());
-    };
-    let provided = headers
-        .get("authorization")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "));
-    if provided == Some(expected) {
-        Ok(())
-    } else {
-        Err(ApiError::Unauthorized)
-    }
+fn authorize(headers: &HeaderMap, state: &ApiState) -> Result<AuthenticatedPrincipal, ApiError> {
+    state.authenticate(headers)
 }
 
 fn bounded_json(value: Value, max_bytes: usize) -> Result<Value, ApiError> {
@@ -690,8 +754,29 @@ fn fingerprint(request: &SubmitTaskRequest, idempotency_key: &str) -> Result<Str
     Ok(hex::encode(hasher.finalize()))
 }
 
-fn audit(
+fn audit_principal(
     state: &ApiState,
+    principal: &Principal,
+    task_id: Option<TaskId>,
+    action: &str,
+    outcome: &str,
+    metadata: std::collections::BTreeMap<String, String>,
+) {
+    audit_identity(
+        state,
+        &principal.tenant_id,
+        &principal.operator_id,
+        task_id,
+        action,
+        outcome,
+        metadata,
+    );
+}
+
+fn audit_identity(
+    state: &ApiState,
+    tenant_id: &TenantId,
+    operator_id: &shaka_core::OperatorId,
     task_id: Option<TaskId>,
     action: &str,
     outcome: &str,
@@ -699,8 +784,8 @@ fn audit(
 ) {
     if let Err(error) = state.audit.record(
         task_id,
-        state.principal.tenant_id.clone(),
-        state.principal.operator_id.0.clone(),
+        tenant_id.clone(),
+        operator_id.0.clone(),
         action,
         outcome,
         metadata,
@@ -858,13 +943,60 @@ mod tests {
         assert!(matches!(result, Err(OrchestratorError::Cancelled)));
     }
 
+    #[tokio::test]
+    async fn bearer_token_selects_tenant_and_revocation_denies() {
+        let state = state();
+        let tenant = TenantId::new("tenant-two").unwrap();
+        state.queue.create_tenant(&tenant, "Tenant Two").unwrap();
+        let operator = shaka_core::OperatorId::new("operator-two").unwrap();
+        state
+            .queue
+            .create_user(&operator, &tenant, &shaka_core::Role::Operator)
+            .unwrap();
+        let issue = state.queue.issue_token(&operator, None).unwrap();
+        let response = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/sessions")
+                    .header("authorization", format!("Bearer {}", issue.token))
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(r#"{"metadata":{"source":"iam"}}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = axum::body::to_bytes(response.into_body(), 1_048_576)
+            .await
+            .unwrap();
+        let session: SessionResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(session.tenant_id, tenant);
+        state.queue.revoke_token(&issue.token_id).unwrap();
+        let response = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/sessions")
+                    .header("authorization", format!("Bearer {}", issue.token))
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
     #[test]
-    fn non_local_bind_requires_authentication_key() {
+    fn non_local_bind_allows_persistent_iam_configuration() {
         let config = ApiConfig {
             bind_addr: "0.0.0.0:8080".parse().unwrap(),
             ..ApiConfig::default()
         };
-        assert!(config.validate().is_err());
+        assert!(config.validate().is_ok());
         let config_with_key = ApiConfig {
             bind_addr: "0.0.0.0:8080".parse().unwrap(),
             api_key: Some("local-test-key".to_owned()),
