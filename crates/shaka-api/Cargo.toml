@@ -1,0 +1,32 @@
+[package]
+name = "shaka-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+axum.workspace = true
+chrono.workspace = true
+hex.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+shaka-config = { path = "../shaka-config" }
+shaka-core = { path = "../shaka-core" }
+shaka-memory = { path = "../shaka-memory" }
+shaka-observability = { path = "../shaka-observability" }
+shaka-orchestrator = { path = "../shaka-orchestrator" }
+shaka-queue = { path = "../shaka-queue" }
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid = { version = "1.11", features = ["v4", "serde"] }
+
+[dev-dependencies]
+async-trait.workspace = true
+tower.workspace = true
+
+[lints]
+workspace = true
