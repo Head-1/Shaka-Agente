@@ -6,11 +6,16 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+hex.workspace = true
+regex = "1.11"
 serde_json.workspace = true
 shaka-core = { path = "../shaka-core" }
 shaka-memory = { path = "../shaka-memory" }
+sha2.workspace = true
+thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+uuid = { version = "1.11", features = ["v4"] }
 
 [lints]
 workspace = true

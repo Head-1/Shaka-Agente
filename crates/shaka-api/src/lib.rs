@@ -3,10 +3,13 @@
 //! O servidor mantém a coordenação da fila no host, não no modelo. Cada
 //! trabalho passa pelo `AgentRuntime`, pelo SQLite e pelo auditor existente.
 
+use axum::middleware::Next;
 use axum::{
     Json, Router,
-    extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    body::Body,
+    extract::{MatchedPath, Path, State},
+    http::{HeaderMap, HeaderValue, Request, StatusCode},
+    middleware,
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -15,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use shaka_core::{Action, ExecutionBudget, Principal, TaskEnvelope, TaskId, TenantId};
-use shaka_observability::AuditLogger;
+use shaka_observability::{AuditLogger, CorrelationContext, Telemetry};
 use shaka_orchestrator::{AgentRuntime, CancellationToken, OrchestratorError};
 use shaka_queue::{
     AuthSource, AuthenticatedPrincipal, CircuitBreaker, CircuitConfig, CircuitSnapshot,
@@ -31,8 +34,15 @@ use std::{
 };
 use thiserror::Error;
 use tokio::{net::TcpListener, time::sleep};
-use tracing::{error, info, warn};
+use tracing::{Instrument, error, info, warn};
 use uuid::Uuid;
+
+/// Header HTTP usado para correlação operacional, sem carregar conteúdo de negócio.
+pub const REQUEST_ID_HEADER: &str = "x-request-id";
+
+tokio::task_local! {
+    static ACTIVE_CORRELATION: CorrelationContext;
+}
 
 #[derive(Debug, Clone)]
 pub struct ApiConfig {
@@ -164,11 +174,13 @@ impl IntoResponse for ApiError {
             Self::QuotaExceeded(name) => format!("quota excedida: {name}"),
             Self::Internal => "falha interna persistente".to_owned(),
         };
+        let request_id = active_request_id();
         let body = Json(json!({
             "error": message,
-            "request_id": Uuid::new_v4(),
+            "request_id": request_id.clone(),
         }));
         let mut response = (status, body).into_response();
+        insert_request_id_header(&mut response, &request_id);
         if let Some(seconds) = retry_after {
             if let Ok(value) = seconds.to_string().parse() {
                 response.headers_mut().insert("retry-after", value);
@@ -207,6 +219,7 @@ pub struct ApiState {
     breaker: Arc<CircuitBreaker>,
     cancellations: Arc<parking_lot::Mutex<HashMap<Uuid, CancellationToken>>>,
     shutdown: ShutdownFlag,
+    telemetry: Arc<Telemetry>,
 }
 
 impl std::fmt::Debug for ApiState {
@@ -221,6 +234,7 @@ impl std::fmt::Debug for ApiState {
             .field("breaker", &self.breaker)
             .field("cancellations", &self.cancellations.lock().len())
             .field("shutdown", &self.shutdown.is_cancelled())
+            .field("telemetry", &"Telemetry")
             .finish()
     }
 }
@@ -253,6 +267,7 @@ impl ApiState {
             breaker,
             cancellations: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             shutdown: ShutdownFlag::default(),
+            telemetry: Arc::new(Telemetry::default()),
         })
     }
 
@@ -264,6 +279,10 @@ impl ApiState {
             .route("/v1/sessions/{session_id}/tasks", post(submit_task))
             .route("/v1/tasks/{task_id}", get(get_task).delete(cancel_task))
             .with_state(self.clone())
+            .layer(middleware::from_fn_with_state(
+                self.clone(),
+                request_context_middleware,
+            ))
     }
 
     #[must_use]
@@ -274,6 +293,11 @@ impl ApiState {
     #[must_use]
     pub fn queue(&self) -> &Arc<QueueStore> {
         &self.queue
+    }
+
+    #[must_use]
+    pub fn telemetry(&self) -> &Arc<Telemetry> {
+        &self.telemetry
     }
 
     fn register_cancellation(&self, task_id: &TaskId, token: CancellationToken) {
@@ -408,6 +432,10 @@ struct HealthResponse {
 }
 
 async fn healthz(State(state): State<ApiState>) -> Result<Json<HealthResponse>, ApiError> {
+    let span = state
+        .telemetry
+        .operation_span("api.healthz", &active_correlation().unwrap_or_default());
+    let _entered = span.enter();
     let queued_tasks = state.queue.queued_count()?;
     Ok(Json(HealthResponse {
         status: "ok",
@@ -422,6 +450,11 @@ async fn create_session(
     headers: HeaderMap,
     Json(request): Json<CreateSessionRequest>,
 ) -> Result<(StatusCode, Json<SessionResponse>), ApiError> {
+    let span = state.telemetry.operation_span(
+        "api.session.create",
+        &active_correlation().unwrap_or_default(),
+    );
+    let _entered = span.enter();
     let auth = authorize(&headers, &state)?;
     let metadata = bounded_json(request.metadata, 4_096)?;
     let session = state
@@ -443,6 +476,8 @@ async fn get_session(
     headers: HeaderMap,
     Path(session_id): Path<Uuid>,
 ) -> Result<Json<SessionResponse>, ApiError> {
+    let span = correlation_span(&state, "api.session.get", Some(session_id), None);
+    let _entered = span.enter();
     let auth = authorize(&headers, &state)?;
     state
         .queue
@@ -459,6 +494,8 @@ async fn submit_task(
     Path(session_id): Path<Uuid>,
     Json(request): Json<SubmitTaskRequest>,
 ) -> Result<(StatusCode, Json<TaskResponse>), ApiError> {
+    let span = correlation_span(&state, "api.task.submit", Some(session_id), None);
+    let _entered = span.enter();
     let auth = authorize(&headers, &state)?;
     let idempotency_key = headers
         .get("idempotency-key")
@@ -497,7 +534,13 @@ async fn submit_task(
     }
     let max_attempts = request.max_attempts.unwrap_or(3);
     let fingerprint = fingerprint(&request, idempotency_key)?;
-    let (outcome, task) = state.queue.submit_task_governed(
+    let admission_span = correlation_span(
+        &state,
+        "queue.admission",
+        Some(session_id),
+        Some(&envelope.task_id),
+    );
+    let submission = state.queue.submit_task_governed(
         session_id,
         &auth.principal,
         idempotency_key,
@@ -505,7 +548,20 @@ async fn submit_task(
         &envelope,
         request.priority,
         max_attempts,
-    )?;
+    );
+    let (outcome, task) = match submission {
+        Ok((outcome, task)) => {
+            admission_span.record("outcome", submit_outcome_name(&outcome));
+            admission_span.record("admission", submit_outcome_name(&outcome));
+            (outcome, task)
+        }
+        Err(error) => {
+            admission_span.record("outcome", "rejected");
+            admission_span.record("admission", "rejected");
+            admission_span.record("error_type", queue_error_type(&error));
+            return Err(error.into());
+        }
+    };
     if outcome == SubmitOutcome::Created {
         audit_principal(
             &state,
@@ -529,10 +585,11 @@ async fn get_task(
     headers: HeaderMap,
     Path(task_id): Path<Uuid>,
 ) -> Result<Json<TaskResponse>, ApiError> {
+    let task_id = TaskId(task_id);
+    let span = correlation_span(&state, "api.task.get", None, Some(&task_id));
+    let _entered = span.enter();
     let auth = authorize(&headers, &state)?;
-    let record = state
-        .queue
-        .get_task(&TaskId(task_id), &auth.principal.tenant_id)?;
+    let record = state.queue.get_task(&task_id, &auth.principal.tenant_id)?;
     Ok(Json(record.into()))
 }
 
@@ -541,8 +598,10 @@ async fn cancel_task(
     headers: HeaderMap,
     Path(task_id): Path<Uuid>,
 ) -> Result<(StatusCode, Json<TaskResponse>), ApiError> {
-    let auth = authorize(&headers, &state)?;
     let task_id = TaskId(task_id);
+    let span = correlation_span(&state, "api.task.cancel", None, Some(&task_id));
+    let _entered = span.enter();
+    let auth = authorize(&headers, &state)?;
     let record = state
         .queue
         .request_cancel(&task_id, &auth.principal.tenant_id)?;
@@ -588,8 +647,19 @@ pub async fn serve(state: ApiState) -> Result<(), ApiError> {
 }
 
 fn start_workers(state: &ApiState) -> Vec<tokio::task::JoinHandle<()>> {
-    if let Err(error) = state.queue.recover_expired_leases(Utc::now()) {
-        warn!(?error, "não foi possível recuperar leases expirados");
+    let recovery_span = correlation_span(state, "queue.lease.recover", None, None);
+    match state.queue.recover_expired_leases(Utc::now()) {
+        Ok(recovered) => {
+            recovery_span.record("outcome", "success");
+            recovery_span.record("lease_state", "recovered");
+            recovery_span.record("lease_recovered", recovered);
+        }
+        Err(error) => {
+            recovery_span.record("outcome", "failed");
+            recovery_span.record("lease_state", "recovery_failed");
+            recovery_span.record("error_type", queue_error_type(&error));
+            warn!(?error, "não foi possível recuperar leases expirados");
+        }
     }
     (0..state.config.worker_count)
         .map(|worker_id| {
@@ -605,22 +675,41 @@ async fn worker_loop(worker_id: usize, state: ApiState) {
             return;
         }
         let now = Utc::now();
+        let circuit_span = correlation_span(&state, "queue.circuit.allow", None, None);
         match state.breaker.allow(now) {
-            Ok(true) => {}
+            Ok(true) => {
+                circuit_span.record("outcome", "allowed");
+                circuit_span.record("circuit_state", state.breaker.snapshot().state.as_str());
+            }
             Ok(false) => {
+                circuit_span.record("outcome", "blocked");
+                circuit_span.record("circuit_state", state.breaker.snapshot().state.as_str());
                 sleep(Duration::milliseconds(100).to_std().unwrap_or_default()).await;
                 continue;
             }
             Err(error) => {
+                circuit_span.record("outcome", "failed");
+                circuit_span.record("error_type", queue_error_type(&error));
                 warn!(worker_id, ?error, "circuit breaker indisponível");
                 sleep(Duration::milliseconds(250).to_std().unwrap_or_default()).await;
                 continue;
             }
         }
+        let claim_span = correlation_span(&state, "queue.claim", None, None);
+        claim_span.record("worker_id", worker_id);
         match state.queue.claim_next(now, state.config.lease_for) {
-            Ok(Some(task)) => execute_task(worker_id, state.clone(), task).await,
-            Ok(None) => sleep(Duration::milliseconds(50).to_std().unwrap_or_default()).await,
+            Ok(Some(task)) => {
+                claim_span.record("outcome", "claimed");
+                claim_span.record("lease_state", "held");
+                execute_task(worker_id, state.clone(), task).await;
+            }
+            Ok(None) => {
+                claim_span.record("outcome", "empty");
+                sleep(Duration::milliseconds(50).to_std().unwrap_or_default()).await;
+            }
             Err(error) => {
+                claim_span.record("outcome", "failed");
+                claim_span.record("error_type", queue_error_type(&error));
                 warn!(worker_id, ?error, "falha ao obter tarefa da fila");
                 sleep(Duration::milliseconds(250).to_std().unwrap_or_default()).await;
             }
@@ -630,71 +719,163 @@ async fn worker_loop(worker_id: usize, state: ApiState) {
 
 async fn execute_task(worker_id: usize, state: ApiState, task: TaskRecord) {
     let task_id = task.task_id.clone();
+    let task_span = correlation_span(&state, "worker.task.process", None, Some(&task_id));
+    task_span.record("worker_id", worker_id);
+    task_span.record("attempt", task.attempts);
+    task_span.record("lease_state", "held");
     let token = CancellationToken::new();
     state.register_cancellation(&task_id, token.clone());
     let execution = state
         .runtime
         .run_with_cancellation(task.envelope.clone(), token)
+        .instrument(task_span.clone())
         .await;
     state.remove_cancellation(&task_id);
     let now = Utc::now();
     match execution {
         Ok(result) => {
-            if let Err(error) = state.breaker.record_success() {
-                warn!(
-                    worker_id,
-                    ?error,
-                    "não foi possível fechar o circuit breaker após sucesso"
-                );
-            }
-            let result_json = serde_json::to_value(&result).ok();
-            match state.queue.finish_task(
+            task_span.record("outcome", "runtime_succeeded");
+            record_circuit_success(worker_id, &state);
+            finish_success(
+                worker_id,
+                &state,
+                &task,
                 &task_id,
-                &task.tenant_id,
-                result_json,
-                None,
-                false,
+                serde_json::to_value(&result).ok(),
                 now,
-                state.config.retry_base_delay,
-                state.config.retry_max_delay,
-            ) {
-                Ok(outcome) => audit_task_finish(&state, &task, &outcome),
-                Err(error) => warn!(
-                    worker_id,
-                    ?error,
-                    "não foi possível finalizar tarefa com sucesso"
-                ),
-            }
+            );
         }
         Err(error) => {
             let retryable = is_retryable(&error);
+            task_span.record("outcome", "runtime_failed");
+            task_span.record("retryable", retryable);
+            task_span.record("error_type", orchestrator_error_type(&error));
             if retryable {
-                if let Err(record_error) = state.breaker.record_failure(now) {
-                    warn!(
-                        worker_id,
-                        ?record_error,
-                        "não foi possível registrar falha no circuit breaker"
-                    );
-                }
+                record_circuit_failure(worker_id, &state, now);
             }
-            let safe_error = shaka_core::redact_sensitive(&error.to_string());
-            match state.queue.finish_task(
-                &task_id,
-                &task.tenant_id,
-                None,
-                Some(safe_error.as_str()),
-                retryable,
-                now,
-                state.config.retry_base_delay,
-                state.config.retry_max_delay,
-            ) {
-                Ok(outcome) => audit_task_finish(&state, &task, &outcome),
-                Err(queue_error) => warn!(
-                    worker_id,
-                    ?queue_error,
-                    "não foi possível finalizar falha de tarefa"
-                ),
+            finish_failure(worker_id, &state, &task, &task_id, &error, retryable, now);
+        }
+    }
+}
+
+fn record_circuit_success(worker_id: usize, state: &ApiState) {
+    let circuit_span = correlation_span(state, "queue.circuit.record_success", None, None);
+    match state.breaker.record_success() {
+        Ok(()) => {
+            circuit_span.record("outcome", "success");
+            circuit_span.record("circuit_state", state.breaker.snapshot().state.as_str());
+        }
+        Err(error) => {
+            circuit_span.record("outcome", "failed");
+            circuit_span.record("error_type", queue_error_type(&error));
+            warn!(
+                worker_id,
+                ?error,
+                "não foi possível fechar o circuit breaker após sucesso"
+            );
+        }
+    }
+}
+
+fn record_circuit_failure(worker_id: usize, state: &ApiState, now: DateTime<Utc>) {
+    let circuit_span = correlation_span(state, "queue.circuit.record_failure", None, None);
+    match state.breaker.record_failure(now) {
+        Ok(()) => {
+            circuit_span.record("outcome", "failure");
+            circuit_span.record("circuit_state", state.breaker.snapshot().state.as_str());
+        }
+        Err(error) => {
+            circuit_span.record("outcome", "failed");
+            circuit_span.record("error_type", queue_error_type(&error));
+            warn!(
+                worker_id,
+                ?error,
+                "não foi possível registrar falha no circuit breaker"
+            );
+        }
+    }
+}
+
+fn finish_success(
+    worker_id: usize,
+    state: &ApiState,
+    task: &TaskRecord,
+    task_id: &TaskId,
+    result_json: Option<Value>,
+    now: DateTime<Utc>,
+) {
+    let finish_span = correlation_span(state, "queue.finish", None, Some(task_id));
+    match state.queue.finish_task(
+        task_id,
+        &task.tenant_id,
+        result_json,
+        None,
+        false,
+        now,
+        state.config.retry_base_delay,
+        state.config.retry_max_delay,
+    ) {
+        Ok(outcome) => {
+            finish_span.record("outcome", finish_outcome_name(&outcome));
+            finish_span.record("lease_state", "released");
+            audit_task_finish(state, task, &outcome);
+        }
+        Err(error) => {
+            finish_span.record("outcome", "failed");
+            finish_span.record("error_type", queue_error_type(&error));
+            warn!(
+                worker_id,
+                ?error,
+                "não foi possível finalizar tarefa com sucesso"
+            );
+        }
+    }
+}
+
+fn finish_failure(
+    worker_id: usize,
+    state: &ApiState,
+    task: &TaskRecord,
+    task_id: &TaskId,
+    error: &OrchestratorError,
+    retryable: bool,
+    now: DateTime<Utc>,
+) {
+    let safe_error = shaka_core::redact_sensitive(&error.to_string());
+    let finish_span = correlation_span(state, "queue.finish", None, Some(task_id));
+    match state.queue.finish_task(
+        task_id,
+        &task.tenant_id,
+        None,
+        Some(safe_error.as_str()),
+        retryable,
+        now,
+        state.config.retry_base_delay,
+        state.config.retry_max_delay,
+    ) {
+        Ok(outcome) => {
+            finish_span.record("outcome", finish_outcome_name(&outcome));
+            finish_span.record("retryable", retryable);
+            finish_span.record("lease_state", "released");
+            if let FinishOutcome::Requeued {
+                ref next_attempt_at,
+            } = outcome
+            {
+                finish_span.record(
+                    "retry_delay_ms",
+                    (*next_attempt_at - now).num_milliseconds().max(0),
+                );
             }
+            audit_task_finish(state, task, &outcome);
+        }
+        Err(queue_error) => {
+            finish_span.record("outcome", "failed");
+            finish_span.record("error_type", queue_error_type(&queue_error));
+            warn!(
+                worker_id,
+                ?queue_error,
+                "não foi possível finalizar falha de tarefa"
+            );
         }
     }
 }
@@ -722,6 +903,176 @@ fn is_retryable(error: &OrchestratorError) -> bool {
         error,
         OrchestratorError::Http(_) | OrchestratorError::DeadlineExceeded
     )
+}
+
+fn submit_outcome_name(outcome: &SubmitOutcome) -> &'static str {
+    match outcome {
+        SubmitOutcome::Created => "created",
+        SubmitOutcome::Existing => "existing",
+    }
+}
+
+fn finish_outcome_name(outcome: &FinishOutcome) -> &'static str {
+    match outcome {
+        FinishOutcome::Succeeded => "succeeded",
+        FinishOutcome::Requeued { .. } => "retry_scheduled",
+        FinishOutcome::Failed => "failed",
+        FinishOutcome::Cancelled => "cancelled",
+    }
+}
+
+fn queue_error_type(error: &QueueError) -> &'static str {
+    match error {
+        QueueError::Sqlite(_) => "sqlite",
+        QueueError::Serialization(_) => "serialization",
+        QueueError::Core(_) => "core",
+        QueueError::InvalidIdentifier(_) => "invalid_identifier",
+        QueueError::InvalidInput(_) => "invalid_input",
+        QueueError::NotFound(_) => "not_found",
+        QueueError::IdempotencyConflict => "idempotency_conflict",
+        QueueError::Unauthorized => "unauthorized",
+        QueueError::Forbidden => "forbidden",
+        QueueError::QuotaExceeded(_) => "quota_exceeded",
+        QueueError::RateLimited { .. } => "rate_limited",
+    }
+}
+
+fn orchestrator_error_type(error: &OrchestratorError) -> &'static str {
+    match error {
+        OrchestratorError::Core(_) => "core",
+        OrchestratorError::Memory(_) => "memory",
+        OrchestratorError::Http(_) => "http",
+        OrchestratorError::InvalidModelResponse(_) => "invalid_model_response",
+        OrchestratorError::ToolNotFound(_) => "tool_not_found",
+        OrchestratorError::ToolExecution(_) => "tool_execution",
+        OrchestratorError::DeadlineExceeded => "deadline_exceeded",
+        OrchestratorError::Cancelled => "cancelled",
+    }
+}
+
+async fn request_context_middleware(
+    State(state): State<ApiState>,
+    mut request: Request<Body>,
+    next: Next,
+) -> Response {
+    let context = correlation_from_request(&request);
+    request.extensions_mut().insert(context.clone());
+    let method = request.method().as_str().to_owned();
+    let route_template = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map_or_else(|| "<unmatched>".to_owned(), |path| path.as_str().to_owned());
+    let span = state
+        .telemetry
+        .http_server_span(&context, &method, &route_template);
+    let response = ACTIVE_CORRELATION
+        .scope(context.clone(), next.run(request).instrument(span.clone()))
+        .await;
+    let status = response.status();
+    span.record("http_status_code", status.as_u16());
+    span.record("http_status_class", status_class(status));
+    let mut response = response;
+    insert_request_id_header(&mut response, context.request_id());
+    response
+}
+
+fn correlation_from_request(request: &Request<Body>) -> CorrelationContext {
+    let request_id = request
+        .headers()
+        .get(REQUEST_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| CorrelationContext::with_request_id(value).ok())
+        .unwrap_or_default();
+    let Some((trace_id, span_id)) = request
+        .headers()
+        .get("traceparent")
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_traceparent)
+    else {
+        return request_id;
+    };
+    request_id
+        .with_trace_ids(Some(trace_id), Some(span_id))
+        .unwrap_or_default()
+}
+
+fn parse_traceparent(value: &str) -> Option<(String, String)> {
+    let mut parts = value.split('-');
+    let version = parts.next()?;
+    let trace_id = parts.next()?;
+    let span_id = parts.next()?;
+    let flags = parts.next()?;
+    if parts.next().is_some()
+        || version.len() != 2
+        || version.eq_ignore_ascii_case("ff")
+        || trace_id.len() != 32
+        || span_id.len() != 16
+        || flags.len() != 2
+        || !version
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+        || !trace_id
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+        || !span_id
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+        || !flags.chars().all(|character| character.is_ascii_hexdigit())
+        || trace_id.chars().all(|character| character == '0')
+        || span_id.chars().all(|character| character == '0')
+    {
+        return None;
+    }
+    Some((trace_id.to_ascii_lowercase(), span_id.to_ascii_lowercase()))
+}
+
+fn active_correlation() -> Option<CorrelationContext> {
+    ACTIVE_CORRELATION.try_with(Clone::clone).ok()
+}
+
+fn active_request_id() -> String {
+    active_correlation().map_or_else(
+        || Uuid::new_v4().to_string(),
+        |context| context.request_id().to_owned(),
+    )
+}
+
+fn correlation_span(
+    state: &ApiState,
+    operation: &str,
+    session_id: Option<Uuid>,
+    task_id: Option<&TaskId>,
+) -> tracing::Span {
+    let mut context = active_correlation().unwrap_or_default();
+    if let Ok(enriched) = context
+        .clone()
+        .with_session_id(session_id.map(|id| id.to_string()))
+    {
+        context = enriched;
+    }
+    if let Ok(enriched) = context
+        .clone()
+        .with_task_id(task_id.map(|id| id.0.to_string()))
+    {
+        context = enriched;
+    }
+    state.telemetry.operation_span(operation, &context)
+}
+
+fn insert_request_id_header(response: &mut Response, request_id: &str) {
+    if let Ok(value) = HeaderValue::from_str(request_id) {
+        response.headers_mut().insert(REQUEST_ID_HEADER, value);
+    }
+}
+
+fn status_class(status: StatusCode) -> &'static str {
+    match status.as_u16() {
+        100..=199 => "1xx",
+        200..=299 => "2xx",
+        300..=399 => "3xx",
+        400..=499 => "4xx",
+        _ => "5xx",
+    }
 }
 
 fn authorize(headers: &HeaderMap, state: &ApiState) -> Result<AuthenticatedPrincipal, ApiError> {
@@ -782,6 +1133,16 @@ fn audit_identity(
     outcome: &str,
     metadata: std::collections::BTreeMap<String, String>,
 ) {
+    let mut metadata = metadata;
+    if let Some(context) = active_correlation() {
+        metadata.insert(
+            "correlation_request_id".to_owned(),
+            context.request_id().to_owned(),
+        );
+        if let Some(trace_id) = context.trace_id() {
+            metadata.insert("correlation_trace_id".to_owned(), trace_id.to_owned());
+        }
+    }
     if let Err(error) = state.audit.record(
         task_id,
         tenant_id.clone(),
@@ -834,6 +1195,98 @@ mod tests {
             ApiConfig::default(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn traceparent_parser_accepts_only_safe_nonzero_ids() {
+        assert_eq!(
+            parse_traceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
+            Some((
+                "4bf92f3577b34da6a3ce929d0e0e4736".to_owned(),
+                "00f067aa0ba902b7".to_owned(),
+            ))
+        );
+        assert!(
+            parse_traceparent("00-00000000000000000000000000000000-00f067aa0ba902b7-01").is_none()
+        );
+        assert!(
+            parse_traceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01").is_none()
+        );
+        assert!(
+            parse_traceparent("ff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01").is_none()
+        );
+        assert!(parse_traceparent("not-a-traceparent").is_none());
+    }
+
+    #[test]
+    fn queue_and_runtime_telemetry_taxonomies_are_stable_and_message_free() {
+        assert_eq!(submit_outcome_name(&SubmitOutcome::Created), "created");
+        assert_eq!(submit_outcome_name(&SubmitOutcome::Existing), "existing");
+        assert_eq!(finish_outcome_name(&FinishOutcome::Cancelled), "cancelled");
+        assert_eq!(
+            queue_error_type(&QueueError::RateLimited {
+                retry_after_seconds: 5,
+            }),
+            "rate_limited"
+        );
+        let runtime_error = OrchestratorError::ToolExecution("secret payload".to_owned());
+        assert_eq!(orchestrator_error_type(&runtime_error), "tool_execution");
+        assert_ne!(orchestrator_error_type(&runtime_error), "secret payload");
+    }
+
+    #[tokio::test]
+    async fn request_id_is_preserved_in_success_response() {
+        let state = state();
+        let response = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/healthz")
+                    .header(REQUEST_ID_HEADER, "req-health-1")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(REQUEST_ID_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("req-health-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_request_id_is_replaced_and_error_body_matches_header() {
+        let state = state();
+        let task_id = Uuid::new_v4();
+        let response = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/v1/tasks/{task_id}"))
+                    .header(REQUEST_ID_HEADER, "contains spaces")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let header_id = response
+            .headers()
+            .get(REQUEST_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("request ID header")
+            .to_owned();
+        assert_ne!(header_id, "contains spaces");
+        assert!(CorrelationContext::with_request_id(&header_id).is_ok());
+        let body = axum::body::to_bytes(response.into_body(), 1_048_576)
+            .await
+            .unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["request_id"].as_str(), Some(header_id.as_str()));
     }
 
     #[tokio::test]

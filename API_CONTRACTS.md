@@ -194,6 +194,14 @@ A API usa JSON UTF-8, prefixo `/v1` e resolve o principal por `Authorization: Be
 
 Tokens IAM são opacos, exibidos somente uma vez na emissão e persistidos apenas como SHA-256. Tokens expirados, revogados, associados a usuário inativo ou pertencentes a tenant inativo retornam `401`. Um principal autenticado sem ação permitida retorna `403`; quota ou rate limit excedido retorna `429`, com `Retry-After` quando aplicável.
 
+### Correlação HTTP e telemetria
+
+Cada request recebe um `x-request-id` validado. O cliente pode enviar um valor com até 128 caracteres ASCII alfanuméricos ou `-`, `_`, `.`, `~`; valores inválidos são substituídos por um UUID novo. A resposta sempre devolve `x-request-id` com o identificador efetivo. Respostas de erro também incluem o mesmo valor no campo JSON `request_id`.
+
+O header `traceparent` pode propagar um contexto W3C válido para os spans internos. O Shaka aceita somente versão, trace ID, span ID e flags hexadecimais em formato válido, rejeita IDs zero e ignora o header inteiro quando inválido. O valor recebido não concede autenticação, autorização ou capacidade.
+
+A telemetria registra apenas rota normalizada, método, status, classe de status e referências técnicas. URI bruta, query string, corpo, objetivo, prompt, resposta, argumentos de ferramenta, bearer token e API keys não são registrados por padrão. A integração de exporters externos permanece fora desta etapa.
+
 | Método e rota | Entrada | Semântica |
 |---|---|---|
 | `GET /healthz` | Nenhuma | Retorna `status`, versão, quantidade de tarefas ativas e snapshot do circuito. |

@@ -4,6 +4,27 @@ Todas as mudanças relevantes do Shaka serão registradas neste arquivo. O forma
 
 ## [Unreleased]
 
+### v0.7.0 — Etapa A: observabilidade governada
+
+- Fachada `Telemetry` com schema interno `shaka.observability` v0.7 e perfil `shaka.genai.v0.7`.
+- `CorrelationContext` com request ID validado e referências opcionais de trace, span, tarefa, sessão e tenant redacted.
+- `Redactor` central para texto, metadata e JSON recursivo, com limites de profundidade/itens/tamanho e captura de conteúdo desabilitada por padrão.
+- `AuditLogger` passa a aplicar redaction central antes de persistir metadata textual ou JSON.
+- Testes unitários de redaction, correlação, schema, limites e rejeição de captura de conteúdo.
+- Middleware HTTP com `x-request-id` validado, geração de UUID para entrada inválida e propagação do ID efetivo na resposta.
+- Propagação segura de `traceparent` W3C para spans internos, com rejeição de versões/IDs inválidos e sem efeito sobre autorização.
+- Spans de servidor HTTP e spans filhos por operação de health, sessão e tarefa, usando rotas normalizadas e referências técnicas.
+- Auditoria de API enriquecida com request/trace correlation IDs redacted, sem payload ou segredo.
+
+### Segurança e governança
+
+- Redactor endurecido contra `Authorization: Bearer`, chaves compostas de conteúdo (`prompt_text`, `model_input`, `response_content`) e truncamento que ultrapassava o limite configurado.
+- Falha interna da expressão de redaction agora degrada para marcador seguro, nunca para o texto original.
+- Tenant references em `CorrelationContext` são pseudonimizadas com prefixo SHA-256 truncado; tokens, objetivos e conteúdo GenAI não entram nos spans.
+- Spans `queue.admission`, `queue.claim`, `queue.finish`, `queue.lease.recover`, `queue.circuit.*` e `worker.task.process` para correlacionar admissão, leases, tentativas, retries e estados do circuito.
+- Taxonomias de outcome e erro de baixa cardinalidade para `created`, `existing`, `claimed`, `empty`, `succeeded`, `retry_scheduled`, `failed`, `cancelled`, `rate_limited` e classes equivalentes.
+- Registro de worker, attempt, retryability, retry delay, lease state, circuit state e quantidade de leases recuperados sem incluir payloads, mensagens livres ou IDs como labels métricas.
+
 ### Planejado
 
 - Busca semântica com embeddings e recuperação híbrida.
