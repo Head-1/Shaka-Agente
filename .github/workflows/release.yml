@@ -8,6 +8,11 @@ on:
         required: false
         default: true
         type: boolean
+      release_tag:
+        description: "Tag SemVer a ser publicada em execução manual"
+        required: false
+        default: ""
+        type: string
   push:
     tags:
       - "v[0-9]+.[0-9]+.[0-9]+"
@@ -57,10 +62,16 @@ jobs:
         run: |
           version="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
+          release_tag="${{ inputs.release_tag }}"
+          if [[ -n "$release_tag" && "$release_tag" != "v${version}" ]]; then
+            echo "Input release_tag $release_tag does not match package version v${version}" >&2
+            exit 1
+          fi
           if [[ "$GITHUB_REF_TYPE" == "tag" && "$GITHUB_REF_NAME" != "v${version}" ]]; then
             echo "Tag $GITHUB_REF_NAME does not match package version v${version}" >&2
             exit 1
           fi
+          echo "release_tag=${release_tag}" >> "$GITHUB_OUTPUT"
 
       - name: Format check
         run: cargo fmt --all -- --check
@@ -109,8 +120,15 @@ jobs:
           mkdir -p dist
           cp target/release/shaka dist/shaka-linux-x86_64
           sha256sum dist/shaka-linux-x86_64 dist/shaka.cdx.json > dist/SHA256SUMS
-          tar -C dist -czf "dist/shaka-${GITHUB_REF_NAME:-v${{ steps.version.outputs.version }}}-linux-x86_64.tar.gz" shaka-linux-x86_64 shaka.cdx.json SHA256SUMS
-          (cd dist && zip -q "shaka-${GITHUB_REF_NAME:-v${{ steps.version.outputs.version }}}-linux-x86_64.zip" shaka-linux-x86_64 shaka.cdx.json SHA256SUMS)
+          release_tag="${{ inputs.release_tag }}"
+          if [[ -z "$release_tag" && "$GITHUB_REF_TYPE" == "tag" ]]; then
+            release_tag="$GITHUB_REF_NAME"
+          fi
+          if [[ -z "$release_tag" ]]; then
+            release_tag="v${{ steps.version.outputs.version }}"
+          fi
+          tar -C dist -czf "dist/shaka-${release_tag}-linux-x86_64.tar.gz" shaka-linux-x86_64 shaka.cdx.json SHA256SUMS
+          (cd dist && zip -q "shaka-${release_tag}-linux-x86_64.zip" shaka-linux-x86_64 shaka.cdx.json SHA256SUMS)
 
       - name: Attest binary and SBOM
         if: github.event.repository.visibility == 'public' && github.ref_type == 'tag'
@@ -127,18 +145,19 @@ jobs:
           if-no-files-found: error
 
       - name: Create or update GitHub Release
-        if: github.ref_type == 'tag'
+        if: github.ref_type == 'tag' || inputs.release_tag != ''
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" dist/* \
+          release_tag="${{ inputs.release_tag || github.ref_name }}"
+          if gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$release_tag" dist/* \
               --repo "$GITHUB_REPOSITORY" \
               --clobber
           else
-            if ! gh release create "$GITHUB_REF_NAME" dist/* \
+            if ! gh release create "$release_tag" dist/* \
               --repo "$GITHUB_REPOSITORY" \
-              --title "Shaka $GITHUB_REF_NAME" \
+              --title "Shaka $release_tag" \
               --generate-notes; then
               gh release upload "$GITHUB_REF_NAME" dist/* \
                 --repo "$GITHUB_REPOSITORY" \
@@ -174,7 +193,14 @@ jobs:
         id: push
         shell: bash
         run: |
-          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/shaka-agente:${GITHUB_REF_NAME:-latest}"
+          release_tag="${{ inputs.release_tag }}"
+          if [[ -z "$release_tag" && "$GITHUB_REF_TYPE" == "tag" ]]; then
+            release_tag="$GITHUB_REF_NAME"
+          fi
+          if [[ -z "$release_tag" ]]; then
+            release_tag="latest"
+          fi
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/shaka-agente:$release_tag"
           docker build --pull --tag "$image" .
           docker push "$image"
           digest="$(docker image inspect "$image" --format '{{index .RepoDigests 0}}' | sed 's/.*@//')"
