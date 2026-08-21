@@ -14,6 +14,26 @@ Todas as mudanças relevantes do Shaka serão registradas neste arquivo. O forma
 - IAM remoto, ABAC, cofre de segredos, multi-tenancy forte e métricas exportáveis.
 - Backup remoto automatizado, migrações formais, RPO/RTO e testes de recuperação em infraestrutura-alvo.
 
+## [0.5.0] - 2026-08-20
+
+### Adicionado
+
+- Crates `shaka-api` e `shaka-queue` para API HTTP/REST persistente, sessões SQLite e fila de tarefas priorizada.
+- Endpoints `GET /healthz`, sessões, submissão idempotente por `Idempotency-Key`, consulta de tarefas e cancelamento.
+- Persistência de leases, recuperação de tarefas após reinicialização, limites de tentativas e backoff exponencial saturante.
+- Circuit breaker persistente com estados `closed`, `open` e `half_open` para impedir falhas em cascata.
+- Cancelamento cooperativo integrado ao `AgentRuntime`, com auditoria e redaction mantidas no host.
+- Subcomando CLI `serve` com bind local por padrão, workers configuráveis e autenticação Bearer opcional para binds não locais.
+- Documento `V0.5_DESIGN.md` com contratos, transições, critérios de aceite, riscos e limites deliberados.
+
+### Segurança e governança
+
+- O cliente não pode escolher tenant, operador ou papel; a API usa o principal local validado pelo `shaka-config`.
+- Tarefas permanecem em dry-run por padrão; modo live exige configuração explícita, confirmação e papel administrador.
+- Repetição de uma chave de idempotência com payload diferente é rejeitada com conflito, evitando reuso ambíguo.
+- Objetivos, resultados e erros de fila são limitados e redacted antes de persistência, logs e respostas.
+- A API não aprova skills nem cria autoridade adicional para o modelo; TrustStore e aprovação humana da v0.4.0 permanecem obrigatórios.
+
 ## [0.4.0] - 2026-08-20
 
 ### Adicionado

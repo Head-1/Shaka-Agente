@@ -1,5 +1,5 @@
 # Build reproducível do binário Shaka.
-FROM rust:1.97-bookworm AS builder
+FROM rust:1.98-bookworm AS builder
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
@@ -23,7 +23,10 @@ USER 10001:10001
 ENV SHAKA_DATABASE=/app/data/shaka.db
 ENV SHAKA_SKILLS_FILE=/app/data/skills.json
 ENV SHAKA_AUDIT_REQUIRED=true
+ENV SHAKA_API_BIND=0.0.0.0:8080
+EXPOSE 8080
 STOPSIGNAL SIGTERM
 VOLUME ["/app/data"]
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 CMD ["/usr/local/bin/shaka", "doctor"]
 ENTRYPOINT ["/usr/local/bin/shaka"]
+CMD ["serve"]

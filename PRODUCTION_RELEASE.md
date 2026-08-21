@@ -2,7 +2,7 @@
 
 ## Status
 
-Esta release eleva o Shaka de MVP para uma **produção candidata para operação controlada**. O código agora possui configuração tipada, RBAC mínimo, validação JSON Schema real, redaction de credenciais, auditoria encadeada, backup/restore, verificação de integridade, catálogo de skills com escrita atômica, hash calculado de artefato e pipeline de dependências com `cargo audit` obrigatório.
+Esta release eleva o Shaka para a **v0.5.0, produção candidata para operação controlada**. Além da configuração tipada, RBAC mínimo, validação JSON Schema real, redaction de credenciais, auditoria encadeada, backup/restore, verificação de integridade, catálogo de skills com escrita atômica, hash calculado de artefato e pipeline de dependências com `cargo audit` obrigatório, o código possui API REST persistente, sessões SQLite, fila priorizada, retry, cancelamento, idempotência e circuit breaker.
 
 > O termo “produção candidata” é intencional. O repositório está endurecido e validado, mas uma implantação pública ainda depende de identidade externa, cofre de segredos, política de dados, provisionamento, alertas, backup fora da máquina e revisão humana do ambiente.
 
@@ -20,8 +20,9 @@ Esta release eleva o Shaka de MVP para uma **produção candidata para operaçã
 | Skills | Catálogo salvo atomicamente; arquivo recebe permissão restrita; aprovação por artefato calcula SHA-256 real; somente skills ativas e hash-verificadas entram no runtime WASM. |
 | Sandbox | Wasmtime 47.0.3, sem imports de host, sem WASI, com fuel e interrupção por epoch. |
 | Supply chain | `Cargo.lock` atualizado; `cargo audit`, secret scan e SBOM CycloneDX fazem parte da validação/release. Assinatura de artefatos e pinagem de actions ainda são pendências. |
-| Operação | CLI inclui `doctor`, `backup`, `restore`, `verify-audit` e `config`; execução possui loop multi-turno limitado por passos, chamadas, custo e deadline. |
-| Imagem | Dockerfile compila com lockfile, executa como usuário não-root e possui healthcheck. |
+| Operação | CLI inclui `doctor`, `backup`, `restore`, `verify-audit`, `config` e `serve`; API possui workers, leases, retry e cancelamento cooperativo. |
+| Fila/API | `shaka-queue` persiste sessões, tarefas, idempotência, prioridade, leases e circuit breaker; `shaka-api` expõe REST v1. |
+| Imagem | Dockerfile compila com lockfile, executa como usuário não-root, expõe 8080, inicia `serve` e possui healthcheck. |
 
 ## Papéis
 
@@ -34,6 +35,13 @@ Esta release eleva o Shaka de MVP para uma **produção candidata para operaçã
 A identidade ainda é fornecida por configuração local. Antes de exposição remota, substituir esse mecanismo por autenticação forte, sessão assinada ou integração com um provedor IAM.
 
 ## Configuração segura
+
+Iniciar a API local, limitada a loopback:
+
+```bash
+cargo run -- serve --bind 127.0.0.1:8080 --workers 2
+curl -fsS http://127.0.0.1:8080/healthz
+```
 
 Em desenvolvimento:
 
@@ -93,6 +101,6 @@ Além desses comandos, o responsável precisa validar no ambiente-alvo: injeçã
 
 ## Limitações que continuam bloqueando produção pública
 
-A release ainda não implementa IAM remoto, multi-tenancy distribuído, filas, subagentes, webhooks, mensageria, pesquisa web, controles SSRF de crawler, cofre externo, assinatura de imagem, métricas Prometheus, tracing OTLP, backup remoto automatizado ou geração automática de skills com pipeline completo de build/teste sandbox. O SBOM local da release e o secret scan já estão implementados; a assinatura e a proveniência verificável ainda exigem infraestrutura adicional.
+A release ainda não implementa IAM remoto, multi-tenancy distribuído, quotas e rate limits distribuídos, subagentes, webhooks, mensageria, pesquisa web, controles SSRF de crawler, cofre externo, métricas Prometheus, tracing OTLP, backup remoto automatizado ou geração automática de skills com pipeline completo de build/teste sandbox. A fila local, o SBOM, o secret scan, a assinatura de skills e a proveniência do container fazem parte da v0.5.0/v0.4.0; a operação pública ainda exige infraestrutura de borda e políticas adicionais.
 
 Esses itens são próximos incrementos, não devem ser simulados por configuração. A ausência deliberada desses adaptadores reduz a superfície de ataque da release atual.

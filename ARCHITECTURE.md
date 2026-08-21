@@ -11,7 +11,11 @@ A arquitetura separa contratos, persistência, execução dinâmica, orquestraç
 ```mermaid
 flowchart TD
     Operator[Operador autenticado] --> CLI[shaka-cli]
+    Operator --> API[shaka-api: REST + auth local]
     CLI --> Config[shaka-config: environment + RBAC]
+    API --> Queue[shaka-queue: SQLite + leases]
+    Queue --> Workers[Workers Tokio]
+    Workers --> Config
     Config --> Runtime[AgentRuntime]
     Runtime --> Model[AgentModel]
     Model --> Local[LocalModel]
@@ -36,6 +40,8 @@ flowchart TD
     Policy --> Wasm[Autocontained WASM module]
     Runtime --> Observability[Tracing + AuditLogger]
     Observability --> Audit
+    API --> Observability
+    Queue --> Circuit[Circuit breaker persistente]
 ```
 
 ## 3. Workspace e responsabilidades
@@ -48,8 +54,10 @@ flowchart TD
 | `shaka-sandbox` | Compilação/instanciação do módulo Wasmtime, limite de fuel e rejeição de imports. | Wasmtime; sem WASI no MVP. |
 | `shaka-orchestrator` | Abstração de modelo, function calling, validação pré-execução, orçamento e registro de execução. | Tokio, HTTP opcional para provedor de modelo. |
 | `shaka-observability` | Inicialização de tracing e gravação de eventos de auditoria. | `tracing` e SQLite via `shaka-memory`. |
-| `shaka-cli` | Interface operacional, RBAC, tarefas, memória, skills, backup, restore, auditoria e doctor. | Clap e filesystem local. |
+| `shaka-cli` | Interface operacional, RBAC, tarefas, memória, skills, backup, restore, auditoria, doctor e `serve`. | Clap e filesystem local. |
 | `shaka-config` | Configuração tipada, validação de ambiente, provedor, credenciais e modo live. | URL/Serde e políticas do núcleo. |
+| `shaka-queue` | Sessões, fila priorizada, idempotência, leases, retry, cancelamento persistente e circuit breaker. | SQLite embutido e Tokio host. |
+| `shaka-api` | Rotas REST, autenticação Bearer opcional, workers, integração com runtime e auditoria. | Axum, Tokio e crates do Shaka. |
 
 ## 4. Fluxo de execução de uma tarefa
 
@@ -61,6 +69,9 @@ flowchart TD
 6. Em `dry_run`, efeitos externos não são executados. Ferramentas somente leitura podem continuar em execução controlada.
 7. O resultado e o resumo da execução são gravados na memória episódica.
 8. Tracing fornece correlação por tarefa; auditoria registra efeitos relevantes em cadeia de hashes por tenant.
+9. Na API, `shaka-queue` persiste a tarefa com chave de idempotência, prioridade e lease antes de responder `202`.
+10. Um worker faz claim transacional, executa o runtime com cancelamento cooperativo e persiste sucesso, falha, retry ou cancelamento.
+11. Reinicialização recupera leases expirados; o circuit breaker pode manter tarefas em `queued` até a janela de recuperação.
 
 ## 5. Três camadas de memória
 
@@ -92,18 +103,18 @@ A consolidação é explícita e associada a um episódio de origem. O MVP mant�
 
 O runtime usa Tokio para chamadas assíncronas ao modelo e às ferramentas. A conexão SQLite é protegida por `parking_lot::Mutex`, permitindo que o `MemoryStore` seja compartilhado por tarefas sem expor a conexão diretamente. Locks são mantidos somente durante operações locais de persistência; chamadas externas não ocorrem sob o lock.
 
-A release ainda executa uma única tarefa por invocação da CLI, mas também oferece doctor, integrity check, backup online, restore e verificação de auditoria. A extensão para subagentes deverá adicionar `parent_task_id`, limite de fan-out, budget por filho, deadline, cancelamento e política de falha parcial antes de habilitar paralelismo real.
+A v0.5.0 oferece múltiplos workers Tokio em um processo, com claim transacional, prioridade, leases, retry, cancelamento cooperativo e circuito de falhas. O SQLite continua protegido por mutex e WAL; chamadas externas nunca ocorrem sob o lock. Escala horizontal, quotas distribuídas e subagentes com DAG permanecem fora do escopo.
 
 ## 8. Decisões fora do MVP
 
 A arquitetura deixa pontos de extensão para:
 
 - busca vetorial e híbrida;
-- fila de tarefas e subagentes;
+- subagentes paralelos com DAG, budget por filho e falha parcial;
 - adaptadores de Telegram, Discord, Slack e WhatsApp Business API;
 - pesquisa web com marcação de conteúdo não confiável;
 - WASI Preview 2 ou componentes WASM com interfaces explícitas;
-- assinatura e verificação de artefatos;
+- assinatura e verificação de artefatos (implementada para skills na v0.4.0);
 - RBAC/ABAC, multi-tenancy forte e cofre de segredos;
 - métricas Prometheus e exportação OTLP.
 

@@ -6,20 +6,23 @@ use clap::{Args, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use serde_json::{Value, json};
+use shaka_api::{ApiConfig, ApiState, serve as serve_api};
 use shaka_config::{AppConfig, ModelProvider};
 use shaka_core::{
     Action, AuditEvent, Capability, CapabilitySet, Principal, Role, SkillManifest, SkillStatus,
     TaskEnvelope,
 };
 use shaka_memory::MemoryStore;
-use shaka_observability::init_tracing;
+use shaka_observability::{AuditLogger, init_tracing};
 use shaka_orchestrator::{
     AgentRuntime, EchoTool, LocalModel, OpenAiCompatibleModel, ToolRegistry, WasmSkillTool,
 };
+use shaka_queue::QueueStore;
 use shaka_sandbox::{SandboxPolicy, WasmExecutor};
 use shaka_skills::{SkillRegistry, TrustStore, load_signing_key, public_key_hex, save_signing_key};
 use std::{
     collections::BTreeMap,
+    net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -75,6 +78,7 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     Run(RunArgs),
+    Serve(ServeArgs),
     Memory(MemoryArgs),
     Skill {
         #[command(subcommand)]
@@ -102,6 +106,20 @@ struct RunArgs {
         default_value_t = false,
         help = "Solicita efeitos externos; exige administrador e confirmação explícita"
     )]
+    live: bool,
+    #[arg(long, env = "SHAKA_CONFIRM_LIVE", default_value_t = false, hide = true)]
+    confirm_live: bool,
+}
+
+#[derive(Debug, Args)]
+struct ServeArgs {
+    #[arg(long, default_value = "127.0.0.1:8080", env = "SHAKA_API_BIND")]
+    bind: String,
+    #[arg(long, default_value_t = 2, env = "SHAKA_API_WORKERS")]
+    workers: usize,
+    #[arg(long, env = "SHAKA_API_KEY", hide_env_values = true)]
+    api_key: Option<String>,
+    #[arg(long, env = "SHAKA_API_LIVE", default_value_t = false)]
     live: bool,
     #[arg(long, env = "SHAKA_CONFIRM_LIVE", default_value_t = false, hide = true)]
     confirm_live: bool,
@@ -175,6 +193,7 @@ async fn main() -> Result<()> {
     init_tracing(cli.json_logs);
     match &cli.command {
         Command::Run(args) => run_agent(&cli, args).await,
+        Command::Serve(args) => serve_agent(&cli, args).await,
         Command::Memory(args) => memory_command(&cli, args),
         Command::Skill { command } => skill_command(&cli, command),
         Command::SandboxDemo => sandbox_demo(),
@@ -204,6 +223,24 @@ fn build_config(cli: &Cli, live: bool, live_confirmation: bool) -> Result<AppCon
     )?)
 }
 
+fn build_model(config: &AppConfig) -> Result<Arc<dyn shaka_orchestrator::AgentModel>> {
+    let model: Arc<dyn shaka_orchestrator::AgentModel> = match config.model_provider {
+        ModelProvider::Local => Arc::new(LocalModel),
+        ModelProvider::OpenAiCompatible => {
+            let key = config
+                .api_key
+                .clone()
+                .context("SHAKA_MODEL_API_KEY é obrigatório para openai-compatible")?;
+            Arc::new(OpenAiCompatibleModel::new(
+                config.model_endpoint.clone(),
+                key,
+                config.model_name.clone(),
+            )?)
+        }
+    };
+    Ok(model)
+}
+
 fn authorize(config: &AppConfig, action: &Action) -> Result<()> {
     if config.principal.allows(action) {
         Ok(())
@@ -227,26 +264,42 @@ async fn run_agent(cli: &Cli, args: &RunArgs) -> Result<()> {
         args.objective.clone(),
     )?;
     envelope.dry_run = !config.live_requested;
-    let model: Arc<dyn shaka_orchestrator::AgentModel> = match config.model_provider {
-        ModelProvider::Local => Arc::new(LocalModel),
-        ModelProvider::OpenAiCompatible => {
-            let key = config
-                .api_key
-                .clone()
-                .context("SHAKA_MODEL_API_KEY é obrigatório para openai-compatible")?;
-            Arc::new(OpenAiCompatibleModel::new(
-                config.model_endpoint.clone(),
-                key,
-                config.model_name.clone(),
-            )?)
-        }
-    };
+    let model = build_model(&config)?;
     let mut tools = build_tool_registry(cli, &config)?;
     tools.register(Arc::new(EchoTool))?;
     let runtime = AgentRuntime::new(model, memory, tools);
     let result = runtime.run(envelope).await?;
     println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
+}
+
+async fn serve_agent(cli: &Cli, args: &ServeArgs) -> Result<()> {
+    let config = build_config(cli, args.live, args.confirm_live)?;
+    authorize(&config, &Action::RunReadOnly)?;
+    let memory = Arc::new(open_memory(&config.database)?);
+    let model = build_model(&config)?;
+    let mut tools = build_tool_registry(cli, &config)?;
+    tools.register(Arc::new(EchoTool))?;
+    let runtime = Arc::new(AgentRuntime::new(model, Arc::clone(&memory), tools));
+    let audit = Arc::new(AuditLogger::new(memory));
+    let queue = Arc::new(QueueStore::open(&config.database)?);
+    let bind_addr: SocketAddr = args
+        .bind
+        .parse()
+        .with_context(|| format!("bind HTTP inválido: {}", args.bind))?;
+    let api_config = ApiConfig {
+        bind_addr,
+        worker_count: args.workers,
+        api_key: args.api_key.clone(),
+        live_enabled: config.live_requested,
+        live_confirmation: config.live_confirmation,
+        ..ApiConfig::default()
+    };
+    let state = ApiState::new(queue, runtime, audit, config.principal, api_config)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    serve_api(state)
+        .await
+        .map_err(|error| anyhow::anyhow!(error.to_string()))
 }
 
 fn build_tool_registry(cli: &Cli, config: &AppConfig) -> Result<ToolRegistry> {
