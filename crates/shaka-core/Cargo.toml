@@ -1,40 +1,20 @@
 [package]
-
 name = "shaka-core"
-
 version.workspace = true
-
 edition.workspace = true
-
 license.workspace = true
-
 rust-version.workspace = true
 
-
-
 [dependencies]
-
 chrono.workspace = true
-
 hex.workspace = true
-
 jsonschema.workspace = true
-
 regex = "1.11"
-
 serde.workspace = true
-
 serde_json.workspace = true
-
 sha2.workspace = true
-
 thiserror.workspace = true
-
 uuid = { version = "1.11", features = ["v4", "serde"] }
 
-
-
 [lints]
-
 workspace = true
-
