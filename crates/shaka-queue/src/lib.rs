@@ -14,6 +14,13 @@ use std::sync::Arc;
 use thiserror::Error;
 use uuid::Uuid;
 
+pub mod plan_store;
+
+pub use plan_store::{
+    PersistedPlan, PlanCheckpoint, PlanCheckpointPhase, PlanCheckpointStatus, PlanResumeReport,
+    PlanResumeStatus, PlanStoreTransition, PlanTransitionEntity, PlanTransitionState,
+};
+
 #[derive(Debug, Error)]
 pub enum QueueError {
     #[error("erro SQLite: {0}")]
@@ -266,6 +273,7 @@ impl QueueStore {
         Ok(store)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn migrate(&self) -> Result<(), QueueError> {
         self.connection.lock().execute_batch(
             "PRAGMA foreign_keys = ON;
@@ -361,8 +369,116 @@ impl QueueStore {
                  PRIMARY KEY(scope_key, window_start)
              );
              CREATE INDEX IF NOT EXISTS idx_api_rate_windows_start
-                 ON api_rate_windows (window_start);",
+                 ON api_rate_windows (window_start);
+
+             CREATE TABLE IF NOT EXISTS shaka_schema_versions (
+                 component TEXT PRIMARY KEY,
+                 version INTEGER NOT NULL
+             );
+             INSERT OR IGNORE INTO shaka_schema_versions (component, version)
+                 VALUES ('plan_store', 1);
+
+             CREATE TABLE IF NOT EXISTS plans (
+                 plan_id TEXT NOT NULL,
+                 tenant_id TEXT NOT NULL,
+                 task_id TEXT NOT NULL,
+                 revision INTEGER NOT NULL,
+                 plan_json TEXT NOT NULL,
+                 state TEXT NOT NULL,
+                 mode TEXT NOT NULL,
+                 risk TEXT NOT NULL,
+                 digest TEXT NOT NULL,
+                 created_at TEXT NOT NULL,
+                 updated_at TEXT NOT NULL,
+                 PRIMARY KEY (plan_id, revision)
+             );
+             CREATE INDEX IF NOT EXISTS idx_plans_tenant_updated
+                 ON plans (tenant_id, updated_at DESC);
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_plans_tenant_digest
+                 ON plans (tenant_id, plan_id, revision, digest);
+
+             CREATE TABLE IF NOT EXISTS plan_steps (
+                 plan_id TEXT NOT NULL,
+                 revision INTEGER NOT NULL,
+                 step_id TEXT NOT NULL,
+                 depends_json TEXT NOT NULL,
+                 action_json TEXT NOT NULL,
+                 preconditions_json TEXT NOT NULL,
+                 postconditions_json TEXT NOT NULL,
+                 state TEXT NOT NULL,
+                 attempts INTEGER NOT NULL DEFAULT 0,
+                 max_attempts INTEGER NOT NULL,
+                 compensation_step_id TEXT,
+                 PRIMARY KEY (plan_id, revision, step_id),
+                 FOREIGN KEY (plan_id, revision) REFERENCES plans(plan_id, revision)
+             );
+
+             CREATE TABLE IF NOT EXISTS plan_checkpoints (
+                 plan_id TEXT NOT NULL,
+                 revision INTEGER NOT NULL,
+                 sequence INTEGER NOT NULL,
+                 step_id TEXT,
+                 phase TEXT NOT NULL,
+                 status TEXT NOT NULL,
+                 state_digest TEXT,
+                 created_at TEXT NOT NULL,
+                 PRIMARY KEY (plan_id, revision, sequence),
+                 FOREIGN KEY (plan_id, revision) REFERENCES plans(plan_id, revision)
+             );
+
+             CREATE TABLE IF NOT EXISTS plan_approvals (
+                 approval_id TEXT PRIMARY KEY,
+                 plan_id TEXT NOT NULL,
+                 revision INTEGER NOT NULL,
+                 tenant_id TEXT NOT NULL,
+                 step_id TEXT,
+                 approval_json TEXT NOT NULL,
+                 revoked INTEGER NOT NULL DEFAULT 0,
+                 expires_at TEXT NOT NULL,
+                 created_at TEXT NOT NULL,
+                 FOREIGN KEY (plan_id, revision) REFERENCES plans(plan_id, revision)
+             );
+             CREATE INDEX IF NOT EXISTS idx_plan_approvals_scope
+                 ON plan_approvals (plan_id, revision, step_id, revoked, expires_at);
+
+             CREATE TABLE IF NOT EXISTS plan_transitions (
+                 transition_id TEXT PRIMARY KEY,
+                 plan_id TEXT NOT NULL,
+                 revision INTEGER NOT NULL,
+                 sequence INTEGER NOT NULL,
+                 entity TEXT NOT NULL,
+                 entity_id TEXT,
+                 transition_json TEXT NOT NULL,
+                 idempotency_key TEXT NOT NULL,
+                 previous_hash TEXT,
+                 event_hash TEXT NOT NULL,
+                 created_at TEXT NOT NULL,
+                 UNIQUE (plan_id, revision, idempotency_key),
+                 UNIQUE (plan_id, revision, sequence),
+                 FOREIGN KEY (plan_id, revision) REFERENCES plans(plan_id, revision)
+             );
+             CREATE INDEX IF NOT EXISTS idx_plan_transitions_scope
+                 ON plan_transitions (plan_id, revision, sequence);
+
+             CREATE TABLE IF NOT EXISTS plan_compensations (
+                 plan_id TEXT NOT NULL,
+                 revision INTEGER NOT NULL,
+                 step_id TEXT NOT NULL,
+                 compensation_step_id TEXT NOT NULL,
+                 PRIMARY KEY (plan_id, revision, step_id),
+                 FOREIGN KEY (plan_id, revision) REFERENCES plans(plan_id, revision)
+             );",
         )?;
+        let schema_version = self.connection.lock().query_row(
+            "SELECT version FROM shaka_schema_versions WHERE component = 'plan_store'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if schema_version > 1 {
+            return Err(QueueError::InvalidInput(
+                "schema plan_store mais novo que o suportado".to_owned(),
+            ));
+        }
         Ok(())
     }
 

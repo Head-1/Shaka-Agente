@@ -1,5 +1,12 @@
 //! Contratos centrais e tipos compartilhados do agente Shaka.
 
+pub mod plan_verifier;
+
+pub use plan_verifier::{
+    PlanVerificationContext, PlanVerificationPhase, PlanVerificationReport, PlanVerificationStatus,
+    PlanVerifier, PlanViolation, PlanViolationCode,
+};
+
 use chrono::{DateTime, Utc};
 use regex::Regex;
 use serde::{Deserialize, Serialize};

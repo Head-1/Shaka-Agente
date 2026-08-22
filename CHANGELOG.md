@@ -4,6 +4,26 @@ Todas as mudanças relevantes do Shaka serão registradas neste arquivo. O forma
 
 ## [Unreleased]
 
+### v0.8.0 — Etapa 3: persistência SQLite do Plan Engine
+
+- Migração SQLite idempotente e versionada para planos, etapas, checkpoints, aprovações, transições e compensações.
+- `plan_store` com persistência append-only por revisão, isolamento por tenant e validação de digest canônico.
+- Transições do reducer com sequência, idempotência e cadeia SHA-256 vinculada por `previous_hash`/`event_hash`.
+- Checkpoints monotônicos de preflight, execução e recuperação com digest de estado validado.
+- Retomada após reinício com reconciliação fail-closed; inconsistências e fronteiras ativas são convertidas em `unknown` sem retry automático.
+- Aprovações persistidas somente após revalidação de tenant, revisão, digest, escopo, expiração, revogação e separação de funções.
+- 6 testes unitários de persistência, integridade, isolamento e recovery; workspace completo e Clippy aprovados.
+
+### v0.8.0 — Etapa 2: verificador determinístico
+
+- `PlanVerifier` público no `shaka-core` com fases `preflight`, `step_ready` e `post_step`.
+- Relatório bounded com estados `valid`, `requires_approval` e `invalid`, códigos de violação estáveis e detalhes sem payload.
+- Verificação fail-closed de digest, estrutura, terminalidade, limites, referências, dependências e condições.
+- Avaliação allowlisted de tarefa, etapas, capabilities, circuito, orçamento, artefatos, idempotência e digest de estado.
+- Aprovação global ou por etapa revalidada com tenant, revisão, digest, papel, expiração e revogação.
+- Limite configurável de violações para evitar relatórios patológicos.
+- Testes de digest adulterado, dependências, condições, aprovação, pós-condições, contexto ausente, alvo inexistente e bounded report.
+
 ### v0.8.0 — Etapa 1: contratos do Plan Engine governado
 
 - `PlanId`, `PlanStepId`, `PlanSpec` e `PlanStep` adicionados ao `shaka-core`.
