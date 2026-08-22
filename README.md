@@ -1,165 +1,196 @@
 # Shaka
 
-MVP de um agente de IA **extensível, auditável e governado pelo operador**, implementado em Rust. O projeto prioriza uma fronteira segura para execução dinâmica, memória persistente, contratos tipados e documentação operável.
+O Shaka é um agente de IA **extensível, auditável e governado pelo operador**, implementado em Rust. A arquitetura prioriza contratos tipados, execução mediada pelo host, memória persistente, rastreabilidade e uma fronteira segura para capacidades dinâmicas.
 
-> **Estado atual:** v0.6.0, produção candidata para operação controlada e multiusuário local. Além da CLI, o Shaka oferece API HTTP persistente com sessões SQLite, fila priorizada, retry, cancelamento, idempotência, circuit breaker, IAM persistente, tokens bearer, isolamento por tenant, quotas e rate limits. O modelo local continua disponível para desenvolvimento; production exige provedor externo HTTPS, chave de API, auditoria habilitada e configuração validada. Mensageria, pesquisa web e autopromoção de skills permanecem deliberadamente desabilitadas.
+> **Estado atual:** a release estável mais recente é a **v0.8.0**, validada para operação local controlada em `dry-run`. A linha de desenvolvimento da próxima manutenção é `roadmap/v0.8.1`. A API HTTP usa loopback por padrão; planos `live`, mensageria externa, pesquisa autônoma na web, autopromoção de skills e controle irrestrito de subagentes permanecem fora dos limites desta versão.
 
-## Objetivos do MVP
+## O que a v0.8.0 entrega
 
-O Shaka já oferece um núcleo modular com as seguintes capacidades:
+A v0.8.0 consolida o **Plan Engine governado**: planos possuem contratos tipados, digest canônico, verificação determinística, persistência SQLite, aprovações humanas, compensações declaradas, exposição HTTP/CLI e recuperação fail-closed.
 
-| Capacidade | Estado |
+| Capacidade | Estado na v0.8.0 |
 |---|---|
 | Workspace Cargo com crates separados | Implementado |
-| Memória de trabalho com TTL | Implementado em SQLite |
-| Memória episódica persistente | Implementado em SQLite |
-| Memória semântica versionada | Implementado como consolidação explícita; busca vetorial fica para fase posterior |
-| Orquestração de uma tarefa | Implementada |
+| Memória de trabalho e episódica | Persistente em SQLite |
 | Provedor local determinístico | Implementado |
-| Provedor OpenAI-compatível | Implementado como adaptador opcional |
-| Function calling com validação mínima de schema | Implementado |
-| Dry-run para efeitos colaterais | Implementado |
-| Sandbox WASM com Wasmtime | Implementado com deny-by-default e sem imports de host |
-| Catálogo de skills candidatas | Implementado e persistente em JSON |
-| Aprovação humana e revogação | Implementado |
-| Tracing estruturado | Implementado |
-| API HTTP persistente | Implementada com `shaka-api` e `shaka-queue` |
-| Sessões, fila, retry, cancelamento e idempotência | Persistentes em SQLite |
-| IAM multiusuário local | Tenants, usuários, tokens hash-only, revogação e expiração |
+| Provedor OpenAI-compatível | Adaptador opcional; credencial somente pelo ambiente/cofre |
+| Function calling | Mediado pelo host e validado por schema |
+| Dry-run | Padrão para tarefas e caminho seguro de execução |
+| Sandbox WASM | Wasmtime, deny-by-default, sem WASI, rede, filesystem ou imports do host |
+| Catálogo de skills | Persistente, com estados candidata, ativa e revogada |
+| Aprovação de skills | Humana, vinculada a hash SHA-256 e justificativa |
+| API HTTP | Sessões, fila, workers, health check, cancelamento e idempotência |
+| IAM local | Tenants, usuários, papéis, tokens hash-only, revogação e expiração |
 | Quotas e rate limits | Persistentes por tenant e operador |
-| Circuit breaker | Persistente e fail-safe |
-| Auditoria persistente com cadeia de hashes | Implementado por tenant, com verificação CLI |
-| Mensageria externa | Não habilitada no MVP |
-| Pesquisa autônoma na web | Não habilitada no MVP |
-| Subagentes paralelos | Fora do caminho de produção candidata; implementação posterior |
-| Autoevolução/autopromoção | **Proibida por decisão de governança** |
+| Auditoria | Cadeia de hashes por tenant, com redaction e verificação administrativa |
+| Plan Engine | Contratos, verifier, reducer SQLite, checkpoints, aprovações e compensações |
+| Recovery | Idempotente e fail-closed; fronteiras ambíguas tornam-se `unknown` |
+| Mensageria externa | Não habilitada |
+| Pesquisa autônoma na web | Não habilitada |
+| Autopromoção e autoevolução | Proibidas por governança |
+| Subagentes irrestritos | Fora do escopo |
+
+O histórico detalhado está em [`CHANGELOG.md`](CHANGELOG.md). O procedimento de operação sem conhecimento interno de Rust está em [`RUNBOOK_OPERACIONAL.md`](RUNBOOK_OPERACIONAL.md), e as evidências da validação pós-release estão em [`ETAPA9_VALIDACAO_POS_RELEASE.md`](ETAPA9_VALIDACAO_POS_RELEASE.md).
+
+## Modelo de segurança
+
+O Shaka trata conteúdo externo, objetivos do modelo e resultados de ferramentas como dados não confiáveis. O modelo não recebe autoridade implícita para alterar políticas, promover skills, modificar o system prompt ou ignorar aprovações.
+
+A regra operacional é falhar de forma explícita diante de ambiguidade, inconsistência, timeout ou evidência incompleta. No Plan Engine, transições são verificadas por digest, dependências, limites, condições, aprovações, capabilities e estado persistido. Uma fronteira ativa ou ambígua após crash não recebe retry cego: o estado é convertido em `unknown` e exige resolução humana.
+
+A release v0.8.0 não é uma implantação pública pronta por si só. Exposição externa exige, em um ciclo separado, IAM remoto forte, cofre de segredos, HTTPS na borda, armazenamento persistente, backup externo, métricas, alertas, política de dados e revisão de ameaça.
 
 ## Requisitos locais
 
-O projeto usa Rust stable e Cargo. A versão mínima declarada no workspace é Rust 1.85, enquanto a validação e o container de release usam Rust 1.98.0.
+O workspace usa Rust edition 2024 e declara Rust `1.85` como versão mínima. O CI e o workflow de release utilizam Rust/Cargo `1.98.0` para validação reprodutível.
 
-Para compilar e testar:
+Para validar o código-fonte, execute:
 
 ```bash
 cd Shaka
-cargo check --workspace
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings -A missing_docs -A clippy::missing_errors_doc
+export PATH="$HOME/.cargo/bin:$PATH"
+rustc --version
+cargo --version
+cargo fmt --all -- --check
+cargo check --workspace --locked
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --locked -- \
+  -D warnings -A missing_docs -A clippy::missing_errors_doc
 ```
 
-O banco SQLite e o catálogo de skills são criados automaticamente quando a CLI é executada.
+O banco SQLite, o catálogo de skills e outros dados locais devem permanecer fora do controle de versão. Não armazene API keys, tokens IAM, backups ou dados de usuários no repositório.
 
-## Uso da CLI
+## Usar a CLI a partir do código-fonte
 
-A execução padrão usa o modelo local e mantém o agente em modo seguro:
+Os exemplos abaixo usam o binário do crate explicitamente para evitar ambiguidade no workspace:
 
 ```bash
-cargo run -- run "Descreva como o Shaka deve tratar uma tarefa"
+cargo run -p shaka-cli -- --help
+cargo run -p shaka-cli -- --version
+cargo run -p shaka-cli -- config
+cargo run -p shaka-cli -- doctor
 ```
 
-Para usar o endpoint OpenAI-compatível, configure a chave somente no ambiente, nunca no código ou no repositório. Em `production`, a configuração também exige `SHAKA_ENVIRONMENT=production`, endpoint HTTPS e auditoria habilitada:
+A execução padrão usa o provedor local e mantém a tarefa em modo seguro:
+
+```bash
+cargo run -p shaka-cli -- run \
+  "Descreva em uma frase a política deny-by-default do Shaka"
+```
+
+A tentativa de execução real não deve ser usada como atalho operacional. Tarefas começam em `dry-run` e planos `live` permanecem bloqueados na v0.8.0. Efeitos externos, quando futuramente autorizados, exigirão mudança formal de governança e novo ciclo de validação.
+
+Para executar a demonstração do sandbox:
+
+```bash
+cargo run -p shaka-cli -- sandbox-demo
+```
+
+O resultado esperado contém `exit_code: 42` e consumo positivo de fuel. O sandbox rejeita imports do host e não fornece WASI, rede ou filesystem.
+
+## API HTTP local
+
+Inicie o servidor somente em loopback durante a operação local:
+
+```bash
+cargo run -p shaka-cli -- serve \
+  --bind 127.0.0.1:8080 \
+  --workers 2
+```
+
+Consulte o health check:
+
+```bash
+curl --fail --silent http://127.0.0.1:8080/healthz
+```
+
+A resposta esperada apresenta status operacional `ok`, versão `0.8.0` e circuito `closed`. Os endpoints principais são:
+
+| Método | Endpoint | Finalidade |
+|---|---|---|
+| `GET` | `/healthz` | Saúde, versão, fila e circuito |
+| `POST` | `/v1/sessions` | Criar sessão |
+| `GET` | `/v1/sessions/{session_id}` | Consultar sessão |
+| `POST` | `/v1/sessions/{session_id}/tasks` | Enfileirar tarefa |
+| `GET` | `/v1/tasks/{task_id}` | Consultar estado e resultado |
+| `DELETE` | `/v1/tasks/{task_id}` | Solicitar cancelamento |
+
+Toda submissão de tarefa deve possuir `Idempotency-Key`. Um exemplo seguro é:
+
+```bash
+SESSION=$(curl --fail --silent -X POST \
+  http://127.0.0.1:8080/v1/sessions \
+  -H 'content-type: application/json' \
+  -d '{"metadata":{"source":"manual"}}' \
+  | sed -n 's/.*"session_id":"\([^" ]*\)".*/\1/p')
+
+curl --fail --silent -X POST \
+  "http://127.0.0.1:8080/v1/sessions/$SESSION/tasks" \
+  -H 'content-type: application/json' \
+  -H 'Idempotency-Key: manual-task-1' \
+  -d '{"objective":"Descreva a política de execução segura","priority":5}'
+```
+
+Repetir a mesma chave com o mesmo payload deve retornar a tarefa existente. Reutilizar a chave com intenção divergente deve ser rejeitado. Não faça bind em `0.0.0.0` sem autenticação adequada, HTTPS na borda e revisão específica de exposição.
+
+## Configurar um provedor OpenAI-compatível
+
+O adaptador é opcional. A chave deve ser fornecida somente por variável de ambiente ou cofre externo, nunca no código, em prompts, logs, banco ou catálogo:
 
 ```bash
 export SHAKA_MODEL_PROVIDER=openai-compatible
 export SHAKA_MODEL_API_KEY="chave-fornecida-pelo-operador"
-export SHAKA_MODEL="gpt-4o-mini"
-cargo run -- run "Responda ao objetivo usando as ferramentas disponíveis"
+export SHAKA_MODEL_ENDPOINT="https://provedor.example/v1/chat/completions"
+export SHAKA_MODEL="modelo-aprovado"
+cargo run -p shaka-cli -- run "Objetivo controlado para validação"
 ```
 
-O endpoint padrão é `https://api.openai.com/v1/chat/completions`, mas pode ser substituído por `SHAKA_MODEL_ENDPOINT`. O adaptador é genérico e deve ser validado contra o provedor escolhido antes de uso operacional.
+Em ambiente de produção, use endpoint HTTPS, auditoria habilitada, credencial válida e configuração validada. Isso não libera automaticamente efeitos externos nem planos `live`.
 
-Iniciar a API persistente localmente, com bind em loopback por padrão:
+## IAM, memória, auditoria e backup
+
+As operações IAM e de manutenção exigem o papel apropriado, em especial `administrator` para auditoria, backup e restauração. Exemplos:
 
 ```bash
-cargo run -- serve --bind 127.0.0.1:8080 --workers 2
+cargo run -p shaka-cli -- iam tenant-create acme "Acme"
+cargo run -p shaka-cli -- iam user-create alice --tenant acme --role operator
+cargo run -p shaka-cli -- iam token-issue alice --expires-in-seconds 86400
+cargo run -p shaka-cli -- memory recent --limit 10
+cargo run -p shaka-cli -- verify-audit
+cargo run -p shaka-cli -- --role administrator \
+  backup --output backups/shaka.db
 ```
 
-O serviço expõe `GET /healthz`, `POST /v1/sessions`, `GET /v1/sessions/{session_id}`, `POST /v1/sessions/{session_id}/tasks`, `GET /v1/tasks/{task_id}` e `DELETE /v1/tasks/{task_id}`. Toda submissão exige o header `Idempotency-Key`; tarefas iniciam em dry-run e são executadas por workers persistentes. Em loopback, a compatibilidade anônima local continua disponível; para bind não local, configure `SHAKA_API_KEY` ou um token IAM persistente e use `Authorization: Bearer <token>`.
+O token bruto é exibido somente durante a emissão. O banco persiste apenas o hash SHA-256, o `token_id` e referências operacionais redacted.
 
-Exemplo de criação de sessão e tarefa:
+Restaure sempre primeiro em um banco separado:
 
 ```bash
-SESSION=$(curl -fsS -X POST http://127.0.0.1:8080/v1/sessions \
-  -H 'content-type: application/json' \
-  -d '{"metadata":{"source":"cli"}}' | jq -r .session_id)
-curl -fsS -X POST "http://127.0.0.1:8080/v1/sessions/$SESSION/tasks" \
-  -H 'content-type: application/json' \
-  -H 'Idempotency-Key: tarefa-demo-1' \
-  -d '{"objective":"Descreva a política de execução segura","priority":5}'
+cargo run -p shaka-cli -- --role administrator \
+  --database data/restore-test.db \
+  restore --input backups/shaka.db
+cargo run -p shaka-cli -- --role administrator \
+  --database data/restore-test.db \
+  doctor
+cargo run -p shaka-cli -- --role administrator \
+  --database data/restore-test.db \
+  verify-audit
 ```
 
-## Administrar identidade, tenants e quotas
+Consulte o [runbook operacional](RUNBOOK_OPERACIONAL.md) para retenção, recuperação de incidentes, skills e operação do container.
 
-As operações IAM ficam fora da API pública e exigem o papel `administrator`:
+## Skills e governança humana
+
+Criar uma skill registra uma candidata; não gera nem executa código automaticamente:
 
 ```bash
-cargo run -- iam tenant-create acme "Acme"
-cargo run -- iam user-create alice --tenant acme --role operator
-cargo run -- iam token-issue alice --expires-in-seconds 86400
-cargo run -- iam limits-set acme --max-active 32 --max-daily 1000 --max-cost-microunits 10000000 --requests 120 --window-seconds 60
-cargo run -- iam list
+cargo run -p shaka-cli -- skill candidate relatorio \
+  "Gera um relatório estruturado" \
+  --permissions memory-write
+cargo run -p shaka-cli -- skill list
 ```
 
-O token bruto é exibido somente na emissão. Armazene-o em um cofre; o banco persiste apenas seu SHA-256, e a auditoria registra somente `token_id` e prefixo público.
-
-## Consultar a memória episódica
-
-```bash
-cargo run -- memory recent --limit 10
-```
-
-Expurgar episódios antigos do tenant atual:
-
-```bash
-cargo run -- memory purge --days 30
-```
-
-Executar o exemplo do sandbox:
-
-```bash
-cargo run -- sandbox-demo
-```
-
-Verificar a configuração e a prontidão operacional:
-
-```bash
-cargo run -- config
-cargo run -- doctor
-cargo run -- verify-audit
-```
-
-Criar um backup consistente e restaurar:
-
-```bash
-cargo run -- backup --output backups/shaka.db
-cargo run -- restore --input backups/shaka.db
-```
-
-Criar uma skill candidata:
-
-```bash
-cargo run -- skill candidate relatorio "Gera um relatório estruturado" --permissions memory-write
-cargo run -- skill list
-```
-
-Aprovar uma skill exige papel `reviewer` ou `administrator`, hash SHA-256 completo e justificativa. O caminho recomendado é fornecer o arquivo real para que a CLI calcule o hash; a aprovação manual do hash continua disponível para fluxos externos controlados:
-
-```bash
-cargo run -- skill approve relatorio \
-  0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
-  --reason "Aprovada após revisão manual e testes locais"
-
-# ou, preferencialmente, calcular o hash do artefato real
-cargo run -- skill approve relatorio \
-  --artifact artefato.wasm \
-  --reason "Aprovada após revisão manual e testes locais"
-```
-
-Revogar uma skill ativa:
-
-```bash
-cargo run -- skill revoke relatorio
-```
+A promoção exige revisão humana, papel autorizado, hash SHA-256 completo e justificativa. Uma skill revogada não pode ser executada mesmo que permaneça no histórico. Não edite manualmente o catálogo para contornar uma transição.
 
 ## Estrutura do workspace
 
@@ -168,59 +199,52 @@ Shaka/
 ├── Cargo.toml
 ├── Cargo.lock
 ├── crates/
-│   ├── shaka-core/            # tipos, contratos e políticas centrais
+│   ├── shaka-core/            # tipos, contratos, políticas e Plan Engine
 │   ├── shaka-memory/          # SQLite, memória e auditoria persistente
 │   ├── shaka-skills/          # catálogo e governança de skills
 │   ├── shaka-sandbox/         # execução WASM deny-by-default
 │   ├── shaka-orchestrator/    # modelo, ferramentas e runtime
-│   ├── shaka-observability/   # tracing e auditoria
-│   ├── shaka-queue/            # sessões, fila SQLite, leases e resiliência
-│   ├── shaka-api/              # HTTP REST, workers e autenticação local
-│   └── shaka-cli/              # interface de operação local e servidor
+│   ├── shaka-observability/   # tracing, redaction e correlação
+│   ├── shaka-config/          # configuração, identidade e políticas
+│   ├── shaka-queue/           # sessões, fila, leases e resiliência
+│   ├── shaka-api/             # HTTP REST, workers e autenticação
+│   └── shaka-cli/              # interface de operação e servidor
 ├── data/                      # dados locais; não versionar segredos
 ├── docs/                      # material complementar
-└── .github/workflows/         # CI mínimo
+└── .github/workflows/         # CI e release
 ```
-
-## Decisões de segurança
-
-O agente não executa código gerado no processo principal. O sandbox do MVP não habilita WASI, rede, filesystem nem funções importadas do host. Um módulo WASM precisa ser autocontido e exportar `run() -> i32`; imports são rejeitados antes da instanciação.
-
-As skills têm estados explícitos e não podem passar diretamente de candidata para ativa. A promoção exige operador, hash do artefato e justificativa. A CLI não oferece um caminho de autopromoção.
-
-Conteúdo externo, quando uma camada futura de pesquisa web for adicionada, deverá ser tratado como dado não confiável. Ele não poderá alterar o system prompt, permissões ou fluxo de execução.
-
-## Produção candidata e limitações
-
-A release atual adiciona API HTTP persistente, sessões, fila priorizada, leases recuperáveis, retry com backoff, cancelamento cooperativo, idempotência, circuit breaker, configuração tipada, RBAC mínimo, validação JSON Schema, redaction, cadeia de auditoria, backup/restore, integrity check, gravação atômica de skills, Wasmtime atualizado e cargo-audit obrigatório. O documento `V0.5_DESIGN.md` contém os contratos e as condições para promoção ao ambiente real.
-
-O sistema ainda não é uma implantação pública pronta sem infraestrutura adicional. A v0.6.0 adiciona IAM persistente local e isolamento de tenants no processo, mas ainda faltam IAM remoto OIDC/OAuth2, cofre de segredos, backup externo, métricas remotas, mensageria, pesquisa web, subagentes distribuídos, rate limits distribuídos e PostgreSQL/row-level security para escala horizontal.
-
-## Limitações operacionais remanescentes
-
-O parâmetro `--live` exige confirmação explícita e papel administrador, mas nenhuma ferramenta externa de mensageria é registrada nesta release. Tokens IAM e quotas governam a API, mas não substituem um provedor IAM remoto nem um cofre de segredos. Portanto, ele não deve ser interpretado como autorização para enviar mensagens reais. A produção pública continua dependendo de IAM remoto, cofre de segredos, backup externo, alertas, política de dados, mensageria validada, pesquisa web isolada e multi-tenancy forte.
-
-## Princípios de operação
-
-O Shaka deve preferir falhar de forma explícita a executar uma ação ambígua. O operador deve revisar permissões, hashes, logs e custo antes de ativar capacidades novas. A documentação de segurança e o runbook são parte do sistema, não artefatos opcionais.
-
-## Licença
-
-Apache-2.0. Consulte `CHANGELOG.md` para o histórico de mudanças.
 
 ## CI/CD no GitHub
 
-O workflow `CI` executa formatação, compilação, testes, Clippy, auditoria de dependências e o smoke test em cada push e pull request. O workflow `Shaka Release` é acionado por uma tag SemVer, como `v0.2.0`, ou manualmente pela interface do GitHub.
+O workflow [`.github/workflows/ci.yml`](.github/workflows/ci.yml) executa, em cada push e Pull Request, formatação, compilação, testes, Clippy, secret scan, política de workflows, auditoria de dependências e smoke test de produção.
 
-Ao criar uma tag de release, o workflow valida que a tag corresponde à versão do `Cargo.toml`, compila o binário otimizado, gera tarball, ZIP e `SHA256SUMS`, publica os artefatos em uma GitHub Release e constrói a imagem Docker no GitHub Container Registry. A imagem publicada configura `shaka serve` como comando padrão, expõe a porta 8080 e mantém `doctor` como healthcheck. O proprietário ainda deve fornecer armazenamento persistente para `/app/data`, HTTPS na borda, autenticação adequada e políticas de operação antes de expor o serviço à rede.
+O workflow [`.github/workflows/release.yml`](.github/workflows/release.yml) é acionado por tags SemVer no formato `vX.Y.Z`. Ele valida a correspondência entre tag e `Cargo.toml`, gera o binário otimizado, SBOM CycloneDX, checksums, tarball e ZIP, cria a GitHub Release e publica opcionalmente a imagem no GHCR. A publicação de attestations é condicionada à visibilidade pública do repositório.
 
-Depois que o repositório estiver publicado, o fluxo recomendado é:
+As actions de checkout usam a série compatível com Node.js 24. A action `actions/checkout@v5` requer runner Actions `v2.327.1` ou superior; os workflows deste projeto usam `ubuntu-latest`.[1] [2]
+
+Para contribuir na linha v0.8.1:
 
 ```bash
-git checkout main
+git switch main
 git pull --ff-only origin main
-git tag -a v0.2.0 -m "Shaka 0.2.0"
-git push origin v0.2.0
+git switch roadmap/v0.8.1
+# implementar uma alteração pequena e verificável
+git diff --check
 ```
 
-A tag dispara o workflow de release. Para executar apenas a validação, use o workflow `CI`. Para um deploy futuro em infraestrutura externa, o próximo passo será adicionar um ambiente GitHub protegido, secrets de produção e um job de implantação com aprovação manual; não é seguro embutir credenciais ou um destino de produção diretamente no repositório.
+Commits devem ser GPG assinados. A criação de tags, releases e merges deve ocorrer somente após revisão dos gates e confirmação apropriada.
+
+## Produção candidata e limitações
+
+A v0.8.0 deve ser entendida como uma base operacional local governada, não como autorização para implantação pública irrestrita. Permanecem fora do escopo IAM remoto, cofre de segredos integrado, backup remoto automatizado, métricas exportáveis, mensageria, pesquisa web, escala horizontal com PostgreSQL/row-level security e subagentes distribuídos.
+
+O Shaka deve preservar as seguintes propriedades: autoridade de tenant e papel derivada no host; tarefas iniciando em `dry-run`; planos `live` bloqueados nesta release; auditoria sem payloads ou segredos; recuperação idempotente; inconsistências convertidas em `unknown`; e decisão humana para aprovação, compensação ou cancelamento de fronteiras ambíguas.
+
+## Licença
+
+Apache-2.0. Consulte [`CHANGELOG.md`](CHANGELOG.md) para o histórico completo.
+
+## Referências
+
+[1]: https://github.com/actions/checkout "actions/checkout — documentação oficial"
+[2]: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/ "GitHub — depreciação do Node.js 20 nos runners"

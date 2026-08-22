@@ -92,34 +92,53 @@ pub enum PlanVerificationStatus {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanViolationCode {
+    /// O plano ou a etapa não atende à estrutura declarada.
     StructureInvalid,
+    /// O digest canônico não corresponde ao plano recebido.
     DigestInvalid,
+    /// O estado atual do plano impede a transição verificada.
     PlanStateInvalid,
+    /// Um limite bounded do verificador foi excedido.
     LimitExceeded,
+    /// Uma referência obrigatória não existe no plano ou no contexto.
     MissingReference,
+    /// Uma dependência declarada ainda não foi comprovada como concluída.
     DependencyNotSatisfied,
+    /// Um fato exigido por uma condição não foi fornecido pelo host.
     ConditionContextMissing,
+    /// Uma condição declarada não foi satisfeita pelo contexto observado.
     ConditionUnsatisfied,
+    /// Uma aprovação humana exigida ainda não foi comprovada.
     ApprovalRequired,
+    /// A aprovação apresentada não atende aos vínculos de segurança do plano.
     ApprovalInvalid,
 }
 
 /// Violação redacted produzida pelo verificador.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PlanViolation {
+    /// Código estável e redacted da classe de violação.
     pub code: PlanViolationCode,
+    /// Etapa relacionada à violação, quando aplicável.
     pub step_id: Option<PlanStepId>,
+    /// Índice da condição relacionada, quando aplicável.
     pub condition_index: Option<usize>,
+    /// Detalhe bounded produzido sem payload livre.
     pub detail: String,
 }
 
 /// Relatório bounded e serializável da verificação.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PlanVerificationReport {
+    /// Identificador do plano verificado.
     pub plan_id: PlanId,
+    /// Digest canônico observado no plano.
     pub plan_digest: String,
+    /// Fase determinística usada na verificação.
     pub phase: PlanVerificationPhase,
+    /// Resultado agregado da verificação.
     pub status: PlanVerificationStatus,
+    /// Violações bounded encontradas durante a verificação.
     pub violations: Vec<PlanViolation>,
 }
 
@@ -140,9 +159,13 @@ impl PlanVerificationReport {
 /// Verificador determinístico com limites para impedir planos patológicos.
 #[derive(Debug, Clone, Copy)]
 pub struct PlanVerifier {
+    /// Número máximo de etapas aceitas em um plano.
     pub max_steps: usize,
+    /// Número máximo de dependências aceitas por etapa.
     pub max_dependencies_per_step: usize,
+    /// Número máximo de condições aceitas por etapa.
     pub max_conditions_per_step: usize,
+    /// Número máximo de violações retidas no relatório.
     pub max_violations: usize,
 }
 
