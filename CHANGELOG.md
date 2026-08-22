@@ -14,7 +14,17 @@ Todas as mudanças relevantes do Shaka serão registradas neste arquivo. O forma
 - IAM remoto, ABAC, cofre de segredos, multi-tenancy forte e métricas exportáveis.
 - Backup remoto automatizado, migrações formais, RPO/RTO e testes de recuperação em infraestrutura-alvo.
 
+## [0.8.1] - 2026-08-22
+
+### Manutenção
+
+- README alinhado à release v0.8.0, à CLI atual e aos limites operacionais de `dry_run`, loopback e planos `live` bloqueados.
+- `actions/checkout` atualizado para v5 nos workflows de CI, release e fuzzing, removendo o warning evitável de runtime Node.js 20.
+- Contratos públicos do `PlanVerifier` documentados, incluindo códigos de violação, relatórios bounded e limites de proteção contra planos patológicos.
+- Validação pós-release repetida com formato, compilação, testes, Clippy, secret scan, política de workflows, auditoria de dependências e smoke test de produção.
+
 ## [0.8.0] - 2026-08-22
+
 
 ### v0.8.0 — Etapa 6: exposição HTTP/CLI e inspeção operacional de planos
 

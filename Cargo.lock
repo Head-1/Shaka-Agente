@@ -2392,7 +2392,7 @@ dependencies = [
 
 [[package]]
 name = "shaka-api"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -2417,7 +2417,7 @@ dependencies = [
 
 [[package]]
 name = "shaka-cli"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2443,7 +2443,7 @@ dependencies = [
 
 [[package]]
 name = "shaka-config"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "serde",
  "shaka-core",
@@ -2453,7 +2453,7 @@ dependencies = [
 
 [[package]]
 name = "shaka-core"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "chrono",
  "hex",
@@ -2468,7 +2468,7 @@ dependencies = [
 
 [[package]]
 name = "shaka-memory"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "chrono",
  "parking_lot",
@@ -2482,7 +2482,7 @@ dependencies = [
 
 [[package]]
 name = "shaka-observability"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "hex",
  "regex",
@@ -2498,7 +2498,7 @@ dependencies = [
 
 [[package]]
 name = "shaka-orchestrator"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2521,7 +2521,7 @@ dependencies = [
 
 [[package]]
 name = "shaka-queue"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "chrono",
  "hex",
@@ -2537,7 +2537,7 @@ dependencies = [
 
 [[package]]
 name = "shaka-sandbox"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "serde",
  "shaka-core",
@@ -2548,7 +2548,7 @@ dependencies = [
 
 [[package]]
 name = "shaka-skills"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "chrono",
  "ed25519-dalek",
