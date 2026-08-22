@@ -1,3 +1,8 @@
+//! Persistência, inspeção e recovery do Plan Engine em SQLite.
+//!
+//! As transições são append-only e encadeadas por SHA-256; inconsistências ou
+//! fronteiras ambíguas não são convertidas em sucesso automaticamente.
+
 use super::{FinishOutcome, QueueError, QueueStore, TaskRecord, TaskStatus};
 use chrono::{DateTime, Utc};
 use rusqlite::{OptionalExtension, Transaction, params};
@@ -16,15 +21,20 @@ use uuid::Uuid;
 /// Snapshot persistente de um plano pertencente a um tenant.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PersistedPlan {
+    /// Snapshot do plano e da revisão persistida.
     pub plan: PlanSpec,
+    /// Instante da última atualização em UTC.
     pub updated_at: DateTime<Utc>,
 }
 
 /// Referência imutável usada para vincular uma task a uma revisão de plano.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PlanTaskReference {
+    /// Identificador do plano imutável.
     pub plan_id: PlanId,
+    /// Revisão do plano vinculada à tarefa.
     pub revision: u32,
+    /// Digest SHA-256 canônico da revisão.
     pub digest: String,
 }
 
@@ -53,9 +63,13 @@ impl PlanTaskReference {
 /// Fatos fornecidos pelo host durante o claim de uma etapa planejada.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PlanClaimContext {
+    /// Indica se o circuit breaker permite o claim.
     pub circuit_closed: bool,
+    /// Capabilities concedidas pelo host para a etapa.
     pub granted_capabilities: Vec<Capability>,
+    /// Orçamento restante observado no host.
     pub remaining_budget: Option<ExecutionBudget>,
+    /// Digest do estado persistido usado na validação.
     pub state_digest: Option<String>,
 }
 
@@ -63,12 +77,19 @@ pub struct PlanClaimContext {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanCheckpointPhase {
+    /// Verificação estrutural e de admissão.
     Preflight,
+    /// Registro de decisão humana.
     Approval,
+    /// Resolução de uma fronteira ambígua.
     Resolution,
+    /// Fronteira imediatamente anterior à etapa.
     BeforeStep,
+    /// Fronteira imediatamente posterior à etapa.
     AfterStep,
+    /// Execução de compensação declarada.
     Compensation,
+    /// Reconciliação após falha ou reinício.
     Recovery,
 }
 
@@ -105,9 +126,13 @@ impl PlanCheckpointPhase {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanCheckpointStatus {
+    /// Checkpoint criado, mas ainda sem conclusão.
     Pending,
+    /// Checkpoint concluído.
     Succeeded,
+    /// Checkpoint terminou com falha conhecida.
     Failed,
+    /// Resultado não determinável; exige tratamento fail-closed.
     Unknown,
 }
 
@@ -138,7 +163,9 @@ impl PlanCheckpointStatus {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanTransitionEntity {
+    /// A transição altera o estado do plano.
     Plan,
+    /// A transição altera o estado de uma etapa.
     Step,
 }
 
@@ -155,24 +182,38 @@ impl PlanTransitionEntity {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", tag = "entity")]
 pub enum PlanTransitionState {
+    /// Estado anterior ou posterior do plano.
     Plan(PlanState),
+    /// Estado anterior ou posterior de uma etapa.
     Step(PlanStepState),
 }
 
 /// Transição append-only com encadeamento SHA-256.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PlanStoreTransition {
+    /// Identificador da transição.
     pub transition_id: Uuid,
+    /// Plano ao qual a transição pertence.
     pub plan_id: PlanId,
+    /// Revisão do plano.
     pub revision: u32,
+    /// Sequência monotônica dentro da revisão.
     pub sequence: u64,
+    /// Entidade cujo estado foi alterado.
     pub entity: PlanTransitionEntity,
+    /// Etapa afetada, quando a entidade é `Step`.
     pub entity_id: Option<PlanStepId>,
+    /// Estado anterior validado.
     pub from_state: PlanTransitionState,
+    /// Estado posterior validado.
     pub to_state: PlanTransitionState,
+    /// Chave que torna a transição idempotente.
     pub idempotency_key: String,
+    /// Hash da transição anterior na cadeia.
     pub previous_hash: Option<String>,
+    /// Hash SHA-256 do material canônico do evento.
     pub event_hash: String,
+    /// Instante de criação em UTC.
     pub created_at: DateTime<Utc>,
 }
 
@@ -267,13 +308,21 @@ struct TransitionHashMaterial<'a> {
 /// Checkpoint de fronteira persistido antes ou depois de uma etapa.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PlanCheckpoint {
+    /// Plano ao qual o checkpoint pertence.
     pub plan_id: PlanId,
+    /// Revisão do plano.
     pub revision: u32,
+    /// Sequência monotônica do checkpoint.
     pub sequence: u64,
+    /// Etapa associada, quando aplicável.
     pub step_id: Option<PlanStepId>,
+    /// Fronteira operacional registrada.
     pub phase: PlanCheckpointPhase,
+    /// Resultado persistido da fronteira.
     pub status: PlanCheckpointStatus,
+    /// Digest do estado observado no checkpoint.
     pub state_digest: Option<String>,
+    /// Instante de criação em UTC.
     pub created_at: DateTime<Utc>,
 }
 
@@ -281,8 +330,11 @@ pub struct PlanCheckpoint {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanResumeStatus {
+    /// O reducer foi reconstruído sem inconsistência.
     Stable,
+    /// A recuperação preservou a incerteza como `unknown`.
     RecoveredUnknown,
+    /// A cadeia não pode ser reconciliada com segurança.
     Inconsistent,
 }
 
@@ -290,7 +342,9 @@ pub enum PlanResumeStatus {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanInspectionStatus {
+    /// A inspeção somente leitura confirmou a cadeia.
     Stable,
+    /// A inspeção encontrou divergência ou sequência inválida.
     Inconsistent,
 }
 
@@ -298,30 +352,45 @@ pub enum PlanInspectionStatus {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanInspectionIssue {
+    /// Hash ou encadeamento de transições inválido.
     TransitionChainInvalid,
+    /// Estado reduzido diverge do snapshot persistido.
     ReducerDiverged,
+    /// Sequência de checkpoints inválida.
     CheckpointSequenceInvalid,
 }
 
 /// Relatório bounded de inspeção sem efeitos colaterais.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PlanInspectionReport {
+    /// Plano inspecionado.
     pub plan: PlanSpec,
+    /// Estado reduzido por etapa.
     pub step_states: BTreeMap<PlanStepId, PlanStepState>,
+    /// Resultado da inspeção.
     pub status: PlanInspectionStatus,
+    /// Problema estável, quando a inspeção foi inconsistente.
     pub issue: Option<PlanInspectionIssue>,
+    /// Número de checkpoints verificados.
     pub checkpoints_checked: u64,
+    /// Número de transições verificadas.
     pub transitions_checked: u64,
 }
 
 /// Relatório bounded da retomada de um plano.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PlanResumeReport {
+    /// Plano reconstruído.
     pub plan: PlanSpec,
+    /// Estado reduzido por etapa após a tentativa de recovery.
     pub step_states: BTreeMap<PlanStepId, PlanStepState>,
+    /// Resultado da reconstrução.
     pub status: PlanResumeStatus,
+    /// Número de checkpoints verificados.
     pub checkpoints_checked: u64,
+    /// Número de transições verificadas.
     pub transitions_checked: u64,
+    /// Motivo sanitizado da inconsistência, quando houver.
     pub inconsistency: Option<String>,
 }
 
@@ -335,25 +404,35 @@ type PlanReducerRows = (
 /// Resultado idempotente de uma decisão humana sobre o plano.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum PlanApprovalOutcome {
+    /// A decisão foi persistida e aceita pelo contrato.
     Approved,
+    /// A decisão humana rejeitou o escopo solicitado.
     Rejected,
+    /// A mesma chave já havia produzido uma decisão.
     Existing,
 }
 
 /// Decisão humana explícita para um plano em estado ambíguo.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum PlanResolutionDecision {
+    /// Retoma o fluxo após evidência e revisão humana.
     Resume,
+    /// Inicia a compensação declarada pelo plano.
     Compensate,
+    /// Cancela o plano e impede novas etapas.
     Cancel,
 }
 
 /// Resultado idempotente da resolução humana.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum PlanResolutionOutcome {
+    /// O plano foi retomado.
     Resumed,
+    /// A compensação declarada foi iniciada.
     Compensating,
+    /// O plano foi cancelado.
     Cancelled,
+    /// A mesma chave já havia produzido uma resolução.
     Existing,
 }
 

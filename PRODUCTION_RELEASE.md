@@ -1,6 +1,8 @@
-# Shaka — Release de produção candidata
+# Shaka — Release de produção candidata (histórico)
 
-## Status
+> **Documento histórico:** este registro descreve a avaliação da v0.6.0 e não é a fonte normativa para operar a v0.8.2. Para a documentação atual, consulte [`README.md`](README.md), [`RUNBOOK_OPERACIONAL.md`](RUNBOOK_OPERACIONAL.md), [`docs/API_PUBLICA.md`](docs/API_PUBLICA.md) e [`CHANGELOG.md`](CHANGELOG.md).
+
+## Status histórico da v0.6.0
 
 Esta release eleva o Shaka para a **v0.6.0, produção candidata para operação controlada e multiusuário local**. Além da configuração tipada, RBAC mínimo, validação JSON Schema real, redaction de credenciais, auditoria encadeada, backup/restore, verificação de integridade, catálogo de skills com escrita atômica, hash calculado de artefato e pipeline de dependências com `cargo audit` obrigatório, o código possui API REST persistente, sessões SQLite, fila priorizada, retry, cancelamento, idempotência e circuit breaker.
 

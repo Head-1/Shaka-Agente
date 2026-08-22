@@ -1,4 +1,4 @@
-//! Persistência e coordenação da fila de tarefas da API v0.5.0.
+//! Persistência e coordenação da fila de tarefas da API v0.8.2.
 //!
 //! O crate mantém as operações de fila em SQLite com transições explícitas,
 //! idempotência por tenant e leases recuperáveis após reinicialização.
@@ -23,32 +23,54 @@ pub use plan_store::{
     PlanStoreTransition, PlanTaskReference, PlanTransitionEntity, PlanTransitionState,
 };
 
+/// Erros da fila, do IAM host-side e da persistência SQLite.
+///
+/// Erros de tenant, autorização e idempotência devem ser tratados como
+/// decisões de bloqueio; o consumidor não deve repetir a operação cegamente.
 #[derive(Debug, Error)]
 pub enum QueueError {
+    /// Falha de leitura ou escrita no SQLite.
     #[error("erro SQLite: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    /// Falha ao serializar ou desserializar um registro persistido.
     #[error("erro de serialização: {0}")]
     Serialization(#[from] serde_json::Error),
+    /// Violação de contrato compartilhado do `shaka-core`.
     #[error("erro de núcleo: {0}")]
     Core(#[from] shaka_core::CoreError),
+    /// Identificador que não atende ao formato esperado.
     #[error("identificador inválido: {0}")]
     InvalidIdentifier(String),
+    /// Entrada que não atende ao contrato da fila.
     #[error("entrada inválida: {0}")]
     InvalidInput(String),
+    /// Registro ausente no tenant consultado.
     #[error("registro não encontrado: {0}")]
     NotFound(String),
+    /// Chave de idempotência reutilizada com payload diferente.
     #[error("chave de idempotência já usada com outro payload")]
     IdempotencyConflict,
+    /// Credencial ausente ou inválida.
     #[error("não autorizado")]
     Unauthorized,
+    /// Principal autenticado sem o papel ou escopo necessário.
     #[error("operação proibida")]
     Forbidden,
+    /// Limite persistente do tenant excedido.
     #[error("quota excedida: {0}")]
     QuotaExceeded(String),
+    /// Limite temporal de requisições excedido.
     #[error("rate limit excedido; tente novamente em {retry_after_seconds}s")]
-    RateLimited { retry_after_seconds: u64 },
+    RateLimited {
+        /// Segundos sugeridos até uma nova tentativa.
+        retry_after_seconds: u64,
+    },
 }
 
+/// Estado persistido de uma tarefa da fila.
+///
+/// `Queued`, `Running` e `CancelRequested` são estados não terminais;
+/// `Succeeded`, `Failed` e `Cancelled` são terminais.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
@@ -87,40 +109,66 @@ impl TaskStatus {
         }
     }
 
+    /// Indica se o estado não admite novas transições de execução.
     #[must_use]
     pub const fn is_terminal(self) -> bool {
         matches!(self, Self::Succeeded | Self::Failed | Self::Cancelled)
     }
 }
 
+/// Sessão persistida e vinculada a um principal e tenant.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionRecord {
+    /// Identificador público da sessão.
     pub session_id: Uuid,
+    /// Principal host-side ao qual a sessão pertence.
     pub principal: Principal,
+    /// Instante de criação em UTC.
     pub created_at: DateTime<Utc>,
+    /// Último acesso observado em UTC.
     pub last_seen_at: DateTime<Utc>,
+    /// Metadados operacionais bounded da sessão.
     pub metadata: Value,
 }
 
+/// Registro persistido da tarefa e de sua lease.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskRecord {
+    /// Identificador da tarefa.
     pub task_id: TaskId,
+    /// Sessão que originou a tarefa.
     pub session_id: Uuid,
+    /// Tenant dono do registro; nunca deve ser substituído pelo cliente.
     pub tenant_id: TenantId,
+    /// Chave de idempotência no escopo do tenant.
     pub idempotency_key: String,
+    /// Impressão digital usada para detectar reutilização divergente.
     pub request_fingerprint: String,
+    /// Envelope validado pelo host para o runtime.
     pub envelope: TaskEnvelope,
+    /// Estado atual da tarefa.
     pub status: TaskStatus,
+    /// Prioridade da seleção determinística.
     pub priority: i32,
+    /// Tentativas já executadas.
     pub attempts: u32,
+    /// Limite superior de tentativas.
     pub max_attempts: u32,
+    /// Próximo instante elegível para execução.
     pub next_attempt_at: DateTime<Utc>,
+    /// Solicitação de cancelamento cooperativo.
     pub cancel_requested: bool,
+    /// Fim da lease atribuída ao worker.
     pub lease_until: Option<DateTime<Utc>>,
+    /// Resultado serializado quando disponível.
     pub result: Option<Value>,
+    /// Último erro sanitizado observado.
     pub last_error: Option<String>,
+    /// Instante de criação em UTC.
     pub created_at: DateTime<Utc>,
+    /// Instante da última atualização em UTC.
     pub updated_at: DateTime<Utc>,
+    /// Instante de conclusão, quando terminal.
     pub completed_at: Option<DateTime<Utc>>,
     /// Plano imutável associado à task, quando o modo planejado está ativo.
     pub plan_id: Option<PlanId>,
@@ -132,14 +180,19 @@ pub struct TaskRecord {
     pub plan_step_id: Option<PlanStepId>,
 }
 
+/// Resultado de uma submissão idempotente.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SubmitOutcome {
+    /// Uma nova tarefa foi persistida.
     Created,
+    /// A tarefa existente foi devolvida para a mesma intenção.
     Existing,
 }
 
+/// Resultado da finalização de uma tarefa ou etapa planejada.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum FinishOutcome {
+    /// A tarefa terminou com sucesso.
     Succeeded,
     /// A etapa planejada terminou e a task será reencaminhada para a próxima etapa.
     PlanStepSucceeded {
@@ -165,54 +218,81 @@ pub enum AuthSource {
 /// Principal autenticado, sem expor o segredo bearer.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AuthenticatedPrincipal {
+    /// Identidade e papel resolvidos pelo host.
     pub principal: Principal,
+    /// Identificador não secreto do token usado.
     pub token_id: String,
+    /// Prefixo operacional não suficiente para autenticar novamente.
     pub token_prefix: String,
+    /// Origem da autenticação resolvida.
     pub source: AuthSource,
 }
 
 /// Resultado da emissão de um token. O campo `token` deve ser exibido uma única vez.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TokenIssue {
+    /// Identificador persistente do token.
     pub token_id: String,
+    /// Token bruto; deve ser exibido e armazenado uma única vez.
     pub token: String,
+    /// Prefixo operacional para identificação sem segredo.
     pub token_prefix: String,
+    /// Principal ao qual o token foi vinculado.
     pub principal: Principal,
+    /// Expiração opcional em UTC.
     pub expires_at: Option<DateTime<Utc>>,
 }
 
 /// Limites persistentes de um tenant.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TenantLimits {
+    /// Tenant ao qual os limites pertencem.
     pub tenant_id: TenantId,
+    /// Máximo de tarefas ativas simultâneas.
     pub max_active_tasks: u32,
+    /// Máximo de tarefas aceitas por dia.
     pub max_daily_tasks: u32,
+    /// Orçamento diário em microunidades.
     pub max_daily_cost_microunits: u64,
+    /// Número máximo de requisições na janela.
     pub requests_per_window: u32,
+    /// Duração da janela de rate limit em segundos.
     pub window_seconds: u32,
 }
 
 /// Registro administrativo resumido de um tenant.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TenantRecord {
+    /// Identificador do tenant.
     pub tenant_id: TenantId,
+    /// Nome de apresentação sem autoridade implícita.
     pub display_name: String,
+    /// Indica se o tenant pode operar.
     pub active: bool,
+    /// Instante de criação em UTC.
     pub created_at: DateTime<Utc>,
+    /// Limites persistentes aplicados pelo host.
     pub limits: TenantLimits,
 }
 
 /// Registro administrativo resumido de um usuário.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UserRecord {
+    /// Identificador do operador.
     pub operator_id: OperatorId,
+    /// Tenant do operador.
     pub tenant_id: TenantId,
+    /// Papel resolvido pelo IAM host-side.
     pub role: Role,
+    /// Indica se o operador pode autenticar e agir.
     pub active: bool,
+    /// Instante de criação em UTC.
     pub created_at: DateTime<Utc>,
+    /// Instante da última alteração em UTC.
     pub updated_at: DateTime<Utc>,
 }
 
+/// Estado persistido do circuit breaker do runtime.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CircuitState {
@@ -243,18 +323,27 @@ impl CircuitState {
     }
 }
 
+/// Fotografia operacional do circuit breaker.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CircuitSnapshot {
+    /// Nome estável do circuito.
     pub name: String,
+    /// Estado atual do circuito.
     pub state: CircuitState,
+    /// Falhas observadas desde a última abertura ou reset.
     pub failure_count: u32,
+    /// Instante em que o circuito abriu, quando aplicável.
     pub opened_at: Option<DateTime<Utc>>,
+    /// Próxima sonda permitida, quando o circuito está aberto.
     pub next_probe_at: Option<DateTime<Utc>>,
 }
 
+/// Parâmetros bounded do circuit breaker.
 #[derive(Debug, Clone, Copy)]
 pub struct CircuitConfig {
+    /// Número de falhas consecutivas para abrir o circuito.
     pub failure_threshold: u32,
+    /// Tempo mínimo de abertura antes de uma sonda.
     pub open_for: Duration,
 }
 
@@ -267,12 +356,18 @@ impl Default for CircuitConfig {
     }
 }
 
+/// Store SQLite host-side para sessões, tarefas, IAM e Plan Engine.
+///
+/// O store aplica isolamento por tenant, idempotência, quotas, leases e
+/// transições persistentes. Consumidores devem usar seus métodos públicos em
+/// vez de editar a conexão ou tabelas diretamente.
 #[derive(Debug)]
 pub struct QueueStore {
     connection: Mutex<Connection>,
 }
 
 impl QueueStore {
+    /// Abre ou cria um banco SQLite e executa migrações idempotentes.
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, QueueError> {
         let connection = Connection::open(path)?;
         let store = Self {
@@ -282,6 +377,7 @@ impl QueueStore {
         Ok(store)
     }
 
+    /// Cria um store efêmero para testes e validações locais.
     pub fn in_memory() -> Result<Self, QueueError> {
         let connection = Connection::open_in_memory()?;
         let store = Self {
