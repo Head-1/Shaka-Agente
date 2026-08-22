@@ -4,6 +4,18 @@ Todas as mudanças relevantes do Shaka serão registradas neste arquivo. O forma
 
 ## [Unreleased]
 
+### v0.8.0 — Etapa 4: integração QueueStore/worker do Plan Engine
+
+- Tasks governadas agora carregam referência imutável ao plano: `plan_id`, revisão, digest e etapa locada.
+- Migração idempotente do `api_tasks` para colunas opcionais de plano, com schema `plan_store` v2 e índice de claim planejado.
+- Admissão preflight fail-closed com isolamento por tenant, vínculo à task declarada e fingerprint de idempotência incluindo plano e digest.
+- Tasks planejadas live são bloqueadas até existir executor tipado; a Etapa 4 mantém o caminho seguro em `dry_run`.
+- Claim transacional e bounded com seleção determinística, dependências, condições, aprovação, capabilities, circuit breaker e checkpoint `before_step`.
+- Finalização transacional com pós-condições, progresso multi-etapa, retry bounded por etapa e estado terminal do plano.
+- Lease planejada expirada não sofre retry cego: plano e etapa são marcados como `unknown` com checkpoint de recuperação.
+- Worker expõe ao verificador somente facts host-side e o runtime fornece cópia das capabilities concedidas.
+- Testes de admissão, claim, conclusão, recuperação e compatibilidade direta; workspace, Clippy e smoke aprovados.
+
 ### v0.8.0 — Etapa 3: persistência SQLite do Plan Engine
 
 - Migração SQLite idempotente e versionada para planos, etapas, checkpoints, aprovações, transições e compensações.

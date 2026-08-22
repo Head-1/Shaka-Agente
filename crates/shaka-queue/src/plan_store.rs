@@ -1,20 +1,61 @@
-use super::{QueueError, QueueStore};
+use super::{FinishOutcome, QueueError, QueueStore, TaskRecord, TaskStatus};
 use chrono::{DateTime, Utc};
 use rusqlite::{OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
-use shaka_core::{PlanApproval, PlanId, PlanSpec, PlanState, PlanStepId, PlanStepState, TenantId};
-use std::collections::BTreeMap;
+use shaka_core::{
+    Capability, ExecutionBudget, PlanApproval, PlanId, PlanMode, PlanSpec, PlanState, PlanStep,
+    PlanStepId, PlanStepState, PlanTaskState, PlanVerificationContext, PlanVerificationPhase,
+    PlanVerifier, Principal, TaskEnvelope, TenantId,
+};
+use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
-
-#[cfg(test)]
-use shaka_core::PlanStep;
 
 /// Snapshot persistente de um plano pertencente a um tenant.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PersistedPlan {
     pub plan: PlanSpec,
     pub updated_at: DateTime<Utc>,
+}
+
+/// Referência imutável usada para vincular uma task a uma revisão de plano.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlanTaskReference {
+    pub plan_id: PlanId,
+    pub revision: u32,
+    pub digest: String,
+}
+
+impl PlanTaskReference {
+    /// Cria uma referência bounded e valida o formato do digest.
+    pub fn new(
+        plan_id: PlanId,
+        revision: u32,
+        digest: impl Into<String>,
+    ) -> Result<Self, QueueError> {
+        if revision == 0 {
+            return Err(QueueError::InvalidInput(
+                "revisão do plano deve ser maior que zero".to_owned(),
+            ));
+        }
+        let digest = digest.into();
+        validate_sha256(&digest, "plan_digest")?;
+        Ok(Self {
+            plan_id,
+            revision,
+            digest,
+        })
+    }
+}
+
+/// Fatos fornecidos pelo host durante o claim de uma etapa planejada.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlanClaimContext {
+    pub circuit_closed: bool,
+    pub granted_capabilities: Vec<Capability>,
+    pub remaining_budget: Option<ExecutionBudget>,
+    pub state_digest: Option<String>,
 }
 
 /// Fase de um checkpoint persistido.
@@ -900,6 +941,789 @@ impl QueueStore {
     }
 }
 
+pub(crate) fn verify_plan_admission_tx(
+    transaction: &Transaction<'_>,
+    principal: &Principal,
+    envelope: &TaskEnvelope,
+    reference: &PlanTaskReference,
+) -> Result<PlanSpec, QueueError> {
+    let plan = load_plan_tx(transaction, &principal.tenant_id, reference)?;
+    if plan.task_id != envelope.task_id || plan.operator_id != principal.operator_id {
+        return Err(QueueError::Forbidden);
+    }
+    if plan.mode != PlanMode::DryRun {
+        return Err(QueueError::InvalidInput(
+            "execução live planejada ainda não possui executor tipado".to_owned(),
+        ));
+    }
+    if !matches!(
+        plan.state,
+        PlanState::Draft
+            | PlanState::Proposed
+            | PlanState::Validated
+            | PlanState::AwaitingApproval
+            | PlanState::Approved
+    ) {
+        return Err(QueueError::InvalidInput(
+            "plano não está em estado admitível".to_owned(),
+        ));
+    }
+    let mut context = PlanVerificationContext::new(PlanVerificationPhase::Preflight);
+    context.approvals = load_approvals_tx(transaction, &plan)?;
+    let report = PlanVerifier::default().verify(&plan, &context);
+    if !report.is_executable() {
+        return Err(QueueError::InvalidInput(
+            "plano não passou pela verificação preflight".to_owned(),
+        ));
+    }
+    Ok(plan)
+}
+
+pub(crate) fn record_plan_admission_tx(
+    transaction: &Transaction<'_>,
+    principal: &Principal,
+    envelope: &TaskEnvelope,
+    reference: &PlanTaskReference,
+) -> Result<(), QueueError> {
+    let plan = verify_plan_admission_tx(transaction, principal, envelope, reference)?;
+    let mut state = plan.state;
+    let now = Utc::now();
+    if state == PlanState::Draft {
+        append_plan_transition_tx(
+            transaction,
+            principal,
+            &plan,
+            PlanState::Draft,
+            PlanState::Proposed,
+            "admission:proposed",
+            now,
+        )?;
+        state = PlanState::Proposed;
+    }
+    if state == PlanState::Proposed {
+        append_plan_transition_tx(
+            transaction,
+            principal,
+            &plan,
+            PlanState::Proposed,
+            PlanState::Validated,
+            "admission:validated",
+            now,
+        )?;
+        state = PlanState::Validated;
+    }
+    if state == PlanState::Validated || state == PlanState::AwaitingApproval {
+        append_plan_transition_tx(
+            transaction,
+            principal,
+            &plan,
+            state,
+            PlanState::Approved,
+            "admission:approved",
+            now,
+        )?;
+    }
+    insert_checkpoint_tx(
+        transaction,
+        &plan.plan_id,
+        plan.revision,
+        None,
+        PlanCheckpointPhase::Preflight,
+        PlanCheckpointStatus::Succeeded,
+        Some(&plan.digest),
+        now,
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+pub(crate) fn prepare_planned_claim_tx(
+    transaction: &Transaction<'_>,
+    task: &TaskRecord,
+    reference: &PlanTaskReference,
+    claim_context: &PlanClaimContext,
+    now: DateTime<Utc>,
+) -> Result<Option<PlanStepId>, QueueError> {
+    let plan = load_plan_tx(transaction, &task.tenant_id, reference)?;
+    if plan.task_id != task.task_id || plan.mode != PlanMode::DryRun {
+        return Err(QueueError::Forbidden);
+    }
+    if task.plan_step_id.is_some() {
+        return Err(QueueError::InvalidInput(
+            "task planejada já possui etapa locada".to_owned(),
+        ));
+    }
+    let states = load_step_states_tx(transaction, &plan)?;
+    let succeeded_steps: BTreeSet<PlanStepId> = states
+        .iter()
+        .filter(|(_, state)| **state == PlanStepState::Succeeded)
+        .map(|(step_id, _)| step_id.clone())
+        .collect();
+    let approvals = load_approvals_tx(transaction, &plan)?;
+    let mut candidates: Vec<&PlanStep> = plan
+        .steps
+        .iter()
+        .filter(|step| {
+            matches!(
+                states.get(&step.step_id),
+                Some(PlanStepState::Ready | PlanStepState::Pending)
+            )
+        })
+        .collect();
+    candidates.sort_by(|left, right| left.step_id.cmp(&right.step_id));
+    let remaining_budget = claim_context
+        .remaining_budget
+        .clone()
+        .unwrap_or_else(|| task.envelope.budget.clone());
+    let selected = candidates.into_iter().find(|step| {
+        if !step
+            .depends_on
+            .iter()
+            .all(|dependency| succeeded_steps.contains(dependency))
+        {
+            return false;
+        }
+        let mut context = PlanVerificationContext::new(PlanVerificationPhase::StepReady)
+            .for_step(step.step_id.clone());
+        context.task_state = Some(PlanTaskState::Running);
+        context.succeeded_steps.clone_from(&succeeded_steps);
+        context
+            .granted_capabilities
+            .clone_from(&claim_context.granted_capabilities);
+        context.circuit_closed = claim_context.circuit_closed;
+        context.remaining_budget = remaining_budget.clone();
+        context.state_digest.clone_from(&claim_context.state_digest);
+        context.approvals.clone_from(&approvals);
+        context.now = now;
+        PlanVerifier::default()
+            .verify(&plan, &context)
+            .is_executable()
+    });
+    let Some(selected) = selected else {
+        return Ok(None);
+    };
+    if plan.state == PlanState::Approved {
+        append_plan_transition_tx(
+            transaction,
+            &Principal {
+                operator_id: plan.operator_id.clone(),
+                tenant_id: plan.tenant_id.clone(),
+                role: shaka_core::Role::Administrator,
+            },
+            &plan,
+            PlanState::Approved,
+            PlanState::Running,
+            &format!("claim:plan:{}", selected.step_id.0),
+            now,
+        )?;
+    } else if plan.state != PlanState::Running {
+        return Ok(None);
+    }
+    let current_step_state = states
+        .get(&selected.step_id)
+        .copied()
+        .ok_or_else(|| QueueError::NotFound(format!("step {}", selected.step_id.0)))?;
+    if current_step_state == PlanStepState::Pending {
+        append_step_transition_tx(
+            transaction,
+            &plan,
+            &selected.step_id,
+            PlanStepState::Pending,
+            PlanStepState::Ready,
+            &format!("claim:ready:{}", selected.step_id.0),
+            now,
+        )?;
+    }
+    append_step_transition_tx(
+        transaction,
+        &plan,
+        &selected.step_id,
+        PlanStepState::Ready,
+        PlanStepState::Running,
+        &format!("claim:running:{}", selected.step_id.0),
+        now,
+    )?;
+    transaction.execute(
+        "UPDATE plan_steps SET attempts = attempts + 1
+         WHERE plan_id = ?1 AND revision = ?2 AND step_id = ?3",
+        params![
+            plan.plan_id.0.to_string(),
+            plan.revision,
+            selected.step_id.0
+        ],
+    )?;
+    insert_checkpoint_tx(
+        transaction,
+        &plan.plan_id,
+        plan.revision,
+        Some(&selected.step_id),
+        PlanCheckpointPhase::BeforeStep,
+        PlanCheckpointStatus::Pending,
+        claim_context.state_digest.as_deref(),
+        now,
+    )?;
+    Ok(Some(selected.step_id.clone()))
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub(crate) fn finish_planned_step_tx(
+    transaction: &Transaction<'_>,
+    task: &TaskRecord,
+    result: Option<Value>,
+    error: Option<&str>,
+    retryable: bool,
+    now: DateTime<Utc>,
+    base_delay: chrono::Duration,
+    max_delay: chrono::Duration,
+    claim_context: &PlanClaimContext,
+) -> Result<FinishOutcome, QueueError> {
+    let reference = task_reference(task)?;
+    let plan = load_plan_tx(transaction, &task.tenant_id, &reference)?;
+    let step_id = task
+        .plan_step_id
+        .as_ref()
+        .ok_or_else(|| QueueError::InvalidInput("task planejada sem etapa locada".to_owned()))?;
+    let (step_state, attempts, max_attempts) = transaction.query_row(
+        "SELECT state, attempts, max_attempts FROM plan_steps
+         WHERE plan_id = ?1 AND revision = ?2 AND step_id = ?3",
+        params![plan.plan_id.0.to_string(), plan.revision, step_id.0],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, u32>(1)?,
+                row.get::<_, u32>(2)?,
+            ))
+        },
+    )?;
+    let step_state = parse_step_state(&step_state)?;
+    if !matches!(
+        step_state,
+        PlanStepState::Running | PlanStepState::CancelRequested
+    ) {
+        return Err(QueueError::InvalidInput(
+            "etapa planejada não está em execução".to_owned(),
+        ));
+    }
+    let (task_status, cancel_requested): (String, i64) = transaction.query_row(
+        "SELECT status, cancel_requested FROM api_tasks WHERE task_id = ?1 AND tenant_id = ?2",
+        params![task.task_id.0.to_string(), task.tenant_id.0],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if cancel_requested != 0 || task_status == TaskStatus::CancelRequested.as_str() {
+        mark_plan_unknown_tx(
+            transaction,
+            &task.tenant_id,
+            &plan,
+            Some(step_id),
+            claim_context.state_digest.as_deref(),
+            now,
+        )?;
+        transaction.execute(
+            "UPDATE api_tasks SET status = 'cancelled', cancel_requested = 1,
+             lease_until = NULL, plan_step_id = NULL, updated_at = ?1, completed_at = ?1
+             WHERE task_id = ?2 AND tenant_id = ?3",
+            params![
+                now.to_rfc3339(),
+                task.task_id.0.to_string(),
+                task.tenant_id.0
+            ],
+        )?;
+        return Ok(FinishOutcome::Cancelled);
+    }
+    let mut success = error.is_none();
+    let mut safe_error = error.map(|value| value.chars().take(4_096).collect::<String>());
+    if success {
+        let states = load_step_states_tx(transaction, &plan)?;
+        let mut context =
+            PlanVerificationContext::new(PlanVerificationPhase::PostStep).for_step(step_id.clone());
+        context.task_state = Some(PlanTaskState::Succeeded);
+        context.succeeded_steps = states
+            .iter()
+            .filter(|(id, state)| **state == PlanStepState::Succeeded || *id == step_id)
+            .map(|(id, _)| id.clone())
+            .collect();
+        context
+            .granted_capabilities
+            .clone_from(&claim_context.granted_capabilities);
+        context.circuit_closed = claim_context.circuit_closed;
+        context.remaining_budget = claim_context
+            .remaining_budget
+            .clone()
+            .unwrap_or_else(|| task.envelope.budget.clone());
+        context.state_digest.clone_from(&claim_context.state_digest);
+        context.approvals = load_approvals_tx(transaction, &plan)?;
+        context.now = now;
+        let report = PlanVerifier::default().verify(&plan, &context);
+        if !report.is_executable() {
+            success = false;
+            safe_error = Some("pós-condição planejada não satisfeita".to_owned());
+        }
+    }
+    if success {
+        append_step_transition_tx(
+            transaction,
+            &plan,
+            step_id,
+            PlanStepState::Running,
+            PlanStepState::Succeeded,
+            &format!("finish:succeeded:{}:{}", step_id.0, attempts),
+            now,
+        )?;
+        insert_checkpoint_tx(
+            transaction,
+            &plan.plan_id,
+            plan.revision,
+            Some(step_id),
+            PlanCheckpointPhase::AfterStep,
+            PlanCheckpointStatus::Succeeded,
+            claim_context.state_digest.as_deref(),
+            now,
+        )?;
+        let remaining = transaction.query_row(
+            "SELECT COUNT(*) FROM plan_steps
+             WHERE plan_id = ?1 AND revision = ?2 AND state != 'succeeded'",
+            params![plan.plan_id.0.to_string(), plan.revision],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if remaining == 0 {
+            append_plan_transition_tx(
+                transaction,
+                &Principal {
+                    operator_id: plan.operator_id.clone(),
+                    tenant_id: plan.tenant_id.clone(),
+                    role: shaka_core::Role::Administrator,
+                },
+                &plan,
+                PlanState::Running,
+                PlanState::Succeeded,
+                "finish:plan:succeeded",
+                now,
+            )?;
+            let result_json = result
+                .map(|value| serde_json::to_string(&value))
+                .transpose()?;
+            transaction.execute(
+                "UPDATE api_tasks SET status = 'succeeded', lease_until = NULL,
+                 plan_step_id = NULL, result_json = ?1, last_error = NULL,
+                 updated_at = ?2, completed_at = ?2 WHERE task_id = ?3 AND tenant_id = ?4",
+                params![
+                    result_json,
+                    now.to_rfc3339(),
+                    task.task_id.0.to_string(),
+                    task.tenant_id.0
+                ],
+            )?;
+            return Ok(FinishOutcome::Succeeded);
+        }
+        let next_attempt_at = now;
+        transaction.execute(
+            "UPDATE api_tasks SET status = 'queued', lease_until = NULL,
+             plan_step_id = NULL, result_json = NULL, last_error = NULL,
+             next_attempt_at = ?1, updated_at = ?1 WHERE task_id = ?2 AND tenant_id = ?3",
+            params![
+                next_attempt_at.to_rfc3339(),
+                task.task_id.0.to_string(),
+                task.tenant_id.0
+            ],
+        )?;
+        return Ok(FinishOutcome::PlanStepSucceeded { next_attempt_at });
+    }
+    append_step_transition_tx(
+        transaction,
+        &plan,
+        step_id,
+        PlanStepState::Running,
+        PlanStepState::Failed,
+        &format!("finish:failed:{}:{}", step_id.0, attempts),
+        now,
+    )?;
+    insert_checkpoint_tx(
+        transaction,
+        &plan.plan_id,
+        plan.revision,
+        Some(step_id),
+        PlanCheckpointPhase::AfterStep,
+        PlanCheckpointStatus::Failed,
+        claim_context.state_digest.as_deref(),
+        now,
+    )?;
+    if retryable && attempts < max_attempts {
+        append_step_transition_tx(
+            transaction,
+            &plan,
+            step_id,
+            PlanStepState::Failed,
+            PlanStepState::Ready,
+            &format!("retry:ready:{}:{}", step_id.0, attempts),
+            now,
+        )?;
+        let exponent = attempts.saturating_sub(1).min(10);
+        let multiplier = 1_i64 << exponent;
+        let delay_ms = base_delay
+            .num_milliseconds()
+            .saturating_mul(multiplier)
+            .min(max_delay.num_milliseconds())
+            .max(0);
+        let next_attempt_at = now + chrono::Duration::milliseconds(delay_ms);
+        transaction.execute(
+            "UPDATE api_tasks SET status = 'queued', lease_until = NULL,
+             plan_step_id = NULL, result_json = NULL, last_error = ?1,
+             next_attempt_at = ?2, updated_at = ?3 WHERE task_id = ?4 AND tenant_id = ?5",
+            params![
+                safe_error,
+                next_attempt_at.to_rfc3339(),
+                now.to_rfc3339(),
+                task.task_id.0.to_string(),
+                task.tenant_id.0
+            ],
+        )?;
+        return Ok(FinishOutcome::Requeued { next_attempt_at });
+    }
+    if plan.state == PlanState::Running {
+        append_plan_transition_tx(
+            transaction,
+            &Principal {
+                operator_id: plan.operator_id.clone(),
+                tenant_id: plan.tenant_id.clone(),
+                role: shaka_core::Role::Administrator,
+            },
+            &plan,
+            PlanState::Running,
+            PlanState::Failed,
+            "finish:plan:failed",
+            now,
+        )?;
+    }
+    transaction.execute(
+        "UPDATE api_tasks SET status = 'failed', lease_until = NULL,
+         plan_step_id = NULL, result_json = NULL, last_error = ?1,
+         updated_at = ?2, completed_at = ?2 WHERE task_id = ?3 AND tenant_id = ?4",
+        params![
+            safe_error,
+            now.to_rfc3339(),
+            task.task_id.0.to_string(),
+            task.tenant_id.0
+        ],
+    )?;
+    Ok(FinishOutcome::Failed)
+}
+
+pub(crate) fn recover_expired_plan_lease_tx(
+    transaction: &Transaction<'_>,
+    task: &TaskRecord,
+    now: DateTime<Utc>,
+) -> Result<(), QueueError> {
+    let reference = task_reference(task)?;
+    let plan = load_plan_tx(transaction, &task.tenant_id, &reference)?;
+    mark_plan_unknown_tx(
+        transaction,
+        &task.tenant_id,
+        &plan,
+        task.plan_step_id.as_ref(),
+        None,
+        now,
+    )?;
+    let status = if task.cancel_requested {
+        TaskStatus::Cancelled.as_str()
+    } else {
+        TaskStatus::Failed.as_str()
+    };
+    transaction.execute(
+        "UPDATE api_tasks SET status = ?1, lease_until = NULL, plan_step_id = NULL,
+         updated_at = ?2, completed_at = ?2, last_error = ?3
+         WHERE task_id = ?4 AND tenant_id = ?5",
+        params![
+            status,
+            now.to_rfc3339(),
+            "lease planejada expirada; estado requer resolução",
+            task.task_id.0.to_string(),
+            task.tenant_id.0
+        ],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn mark_plan_unknown_tx(
+    transaction: &Transaction<'_>,
+    tenant_id: &TenantId,
+    plan: &PlanSpec,
+    step_id: Option<&PlanStepId>,
+    state_digest: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<(), QueueError> {
+    let current_plan_state = transaction.query_row(
+        "SELECT state FROM plans WHERE plan_id = ?1 AND revision = ?2 AND tenant_id = ?3",
+        params![plan.plan_id.0.to_string(), plan.revision, tenant_id.0],
+        |row| row.get::<_, String>(0),
+    )?;
+    let current_plan_state = parse_plan_state(&current_plan_state)?;
+    if current_plan_state != PlanState::Unknown {
+        if current_plan_state
+            .validate_transition(PlanState::Unknown)
+            .is_ok()
+        {
+            append_plan_transition_tx(
+                transaction,
+                &Principal {
+                    operator_id: plan.operator_id.clone(),
+                    tenant_id: plan.tenant_id.clone(),
+                    role: shaka_core::Role::Administrator,
+                },
+                plan,
+                current_plan_state,
+                PlanState::Unknown,
+                "recovery:plan:unknown",
+                now,
+            )?;
+        } else {
+            transaction.execute(
+                "UPDATE plans SET state = 'unknown', updated_at = ?1
+                 WHERE plan_id = ?2 AND revision = ?3 AND tenant_id = ?4",
+                params![
+                    now.to_rfc3339(),
+                    plan.plan_id.0.to_string(),
+                    plan.revision,
+                    tenant_id.0
+                ],
+            )?;
+        }
+    }
+    if let Some(step_id) = step_id {
+        let current_step_state = transaction
+            .query_row(
+                "SELECT state FROM plan_steps
+                 WHERE plan_id = ?1 AND revision = ?2 AND step_id = ?3",
+                params![plan.plan_id.0.to_string(), plan.revision, step_id.0],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|value| parse_step_state(&value))
+            .transpose()?;
+        if let Some(current_step_state) = current_step_state {
+            if current_step_state != PlanStepState::Unknown {
+                if current_step_state
+                    .validate_transition(PlanStepState::Unknown)
+                    .is_ok()
+                {
+                    append_step_transition_tx(
+                        transaction,
+                        plan,
+                        step_id,
+                        current_step_state,
+                        PlanStepState::Unknown,
+                        "recovery:step:unknown",
+                        now,
+                    )?;
+                } else {
+                    transaction.execute(
+                        "UPDATE plan_steps SET state = 'unknown'
+                         WHERE plan_id = ?1 AND revision = ?2 AND step_id = ?3",
+                        params![plan.plan_id.0.to_string(), plan.revision, step_id.0],
+                    )?;
+                }
+            }
+        }
+    }
+    insert_checkpoint_tx(
+        transaction,
+        &plan.plan_id,
+        plan.revision,
+        step_id,
+        PlanCheckpointPhase::Recovery,
+        PlanCheckpointStatus::Unknown,
+        state_digest,
+        now,
+    )?;
+    Ok(())
+}
+
+fn load_plan_tx(
+    transaction: &Transaction<'_>,
+    tenant_id: &TenantId,
+    reference: &PlanTaskReference,
+) -> Result<PlanSpec, QueueError> {
+    let row = transaction
+        .query_row(
+            "SELECT plan_json, state, digest FROM plans
+             WHERE plan_id = ?1 AND revision = ?2 AND tenant_id = ?3",
+            params![
+                reference.plan_id.0.to_string(),
+                reference.revision,
+                tenant_id.0
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| QueueError::NotFound(format!("plan {}", reference.plan_id.0)))?;
+    if row.2 != reference.digest {
+        return Err(QueueError::InvalidInput(
+            "digest da task não corresponde ao plano persistido".to_owned(),
+        ));
+    }
+    let mut plan: PlanSpec = serde_json::from_str(&row.0)?;
+    plan.state = parse_plan_state(&row.1)?;
+    if plan.plan_id != reference.plan_id
+        || plan.revision != reference.revision
+        || plan.tenant_id != *tenant_id
+        || plan.digest != reference.digest
+    {
+        return Err(QueueError::InvalidInput(
+            "referência da task não corresponde ao snapshot do plano".to_owned(),
+        ));
+    }
+    plan.validate_structure()?;
+    plan.verify_digest()?;
+    Ok(plan)
+}
+
+fn load_approvals_tx(
+    transaction: &Transaction<'_>,
+    plan: &PlanSpec,
+) -> Result<Vec<PlanApproval>, QueueError> {
+    let mut statement = transaction.prepare(
+        "SELECT approval_json FROM plan_approvals
+         WHERE plan_id = ?1 AND revision = ?2 AND tenant_id = ?3 AND revoked = 0
+         ORDER BY created_at ASC",
+    )?;
+    let rows = statement.query_map(
+        params![plan.plan_id.0.to_string(), plan.revision, plan.tenant_id.0],
+        |row| row.get::<_, String>(0),
+    )?;
+    rows.map(|row| {
+        let json = row?;
+        serde_json::from_str(&json).map_err(QueueError::from)
+    })
+    .collect()
+}
+
+fn load_step_states_tx(
+    transaction: &Transaction<'_>,
+    plan: &PlanSpec,
+) -> Result<BTreeMap<PlanStepId, PlanStepState>, QueueError> {
+    let mut statement = transaction.prepare(
+        "SELECT step_id, state FROM plan_steps
+         WHERE plan_id = ?1 AND revision = ?2 ORDER BY step_id ASC",
+    )?;
+    let rows = statement.query_map(params![plan.plan_id.0.to_string(), plan.revision], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    rows.map(|row| {
+        let (step_id, state) = row?;
+        Ok((PlanStepId::new(step_id)?, parse_step_state(&state)?))
+    })
+    .collect::<Result<BTreeMap<_, _>, QueueError>>()
+}
+
+fn append_plan_transition_tx(
+    transaction: &Transaction<'_>,
+    tenant_id: &Principal,
+    plan: &PlanSpec,
+    from: PlanState,
+    to: PlanState,
+    idempotency_key: &str,
+    now: DateTime<Utc>,
+) -> Result<(), QueueError> {
+    let last = last_transition_tx(transaction, &plan.plan_id, plan.revision)?;
+    let sequence = last.as_ref().map_or(1, |row| row.0 + 1);
+    let previous_hash = last.map(|row| row.1);
+    let transition = PlanStoreTransition::new(
+        plan.plan_id.clone(),
+        plan.revision,
+        sequence,
+        PlanTransitionEntity::Plan,
+        None,
+        PlanTransitionState::Plan(from),
+        PlanTransitionState::Plan(to),
+        idempotency_key,
+        previous_hash,
+        now,
+    )?;
+    apply_transition_tx(transaction, &tenant_id.tenant_id, &transition)?;
+    insert_transition_tx(transaction, &transition)
+}
+
+fn append_step_transition_tx(
+    transaction: &Transaction<'_>,
+    plan: &PlanSpec,
+    step_id: &PlanStepId,
+    from: PlanStepState,
+    to: PlanStepState,
+    idempotency_key: &str,
+    now: DateTime<Utc>,
+) -> Result<(), QueueError> {
+    let last = last_transition_tx(transaction, &plan.plan_id, plan.revision)?;
+    let sequence = last.as_ref().map_or(1, |row| row.0 + 1);
+    let previous_hash = last.map(|row| row.1);
+    let transition = PlanStoreTransition::new(
+        plan.plan_id.clone(),
+        plan.revision,
+        sequence,
+        PlanTransitionEntity::Step,
+        Some(step_id.clone()),
+        PlanTransitionState::Step(from),
+        PlanTransitionState::Step(to),
+        idempotency_key,
+        previous_hash,
+        now,
+    )?;
+    apply_transition_tx(transaction, &plan.tenant_id, &transition)?;
+    insert_transition_tx(transaction, &transition)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_checkpoint_tx(
+    transaction: &Transaction<'_>,
+    plan_id: &PlanId,
+    revision: u32,
+    step_id: Option<&PlanStepId>,
+    phase: PlanCheckpointPhase,
+    status: PlanCheckpointStatus,
+    state_digest: Option<&str>,
+    created_at: DateTime<Utc>,
+) -> Result<(), QueueError> {
+    if let Some(digest) = state_digest {
+        validate_sha256(digest, "state_digest")?;
+    }
+    let sequence = next_checkpoint_sequence_tx(transaction, plan_id, revision)?;
+    transaction.execute(
+        "INSERT INTO plan_checkpoints
+         (plan_id, revision, sequence, step_id, phase, status, state_digest, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            plan_id.0.to_string(),
+            revision,
+            sequence,
+            step_id.map(|id| id.0.clone()),
+            phase.as_str(),
+            status.as_str(),
+            state_digest,
+            created_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn task_reference(task: &TaskRecord) -> Result<PlanTaskReference, QueueError> {
+    match (
+        &task.plan_id,
+        task.plan_revision,
+        task.plan_digest.as_deref(),
+    ) {
+        (Some(plan_id), Some(revision), Some(digest)) => {
+            PlanTaskReference::new(plan_id.clone(), revision, digest)
+        }
+        _ => Err(QueueError::InvalidInput(
+            "task planejada sem referência completa".to_owned(),
+        )),
+    }
+}
+
 fn apply_transition_tx(
     transaction: &Transaction<'_>,
     tenant_id: &TenantId,
@@ -1275,6 +2099,25 @@ mod tests {
         .unwrap()
     }
 
+    fn dependency_plan() -> PlanSpec {
+        let mut plan = test_plan();
+        plan.steps.push(PlanStep {
+            step_id: PlanStepId::new("write-preview").unwrap(),
+            depends_on: vec![PlanStepId::new("read").unwrap()],
+            action: PlanAction::ReadOnly {
+                operation: "preview".to_owned(),
+            },
+            preconditions: Vec::new(),
+            postconditions: Vec::new(),
+            risk: PlanRisk::ReadOnly,
+            approval: PlanApprovalRequirement::None,
+            max_attempts: 1,
+            compensation_step_id: None,
+        });
+        plan.digest = plan.calculate_digest().unwrap();
+        plan
+    }
+
     #[test]
     fn save_load_is_idempotent_and_tenant_isolated() {
         let store = QueueStore::in_memory().unwrap();
@@ -1450,6 +2293,253 @@ mod tests {
             store.record_plan_transition(&plan.tenant_id, &transition),
             Err(QueueError::InvalidInput(_))
         ));
+    }
+
+    #[test]
+    fn planned_admission_claim_and_completion_are_atomic() {
+        let store = QueueStore::in_memory().unwrap();
+        let plan = test_plan();
+        let principal = Principal {
+            operator_id: plan.operator_id.clone(),
+            tenant_id: plan.tenant_id.clone(),
+            role: Role::Administrator,
+        };
+        store.bootstrap_principal(&principal).unwrap();
+        let session = store
+            .create_session(principal.clone(), Value::Null)
+            .unwrap();
+        store.save_plan(&plan).unwrap();
+        let mut envelope = TaskEnvelope::new(
+            principal.tenant_id.clone(),
+            principal.operator_id.clone(),
+            "executar etapa planejada",
+        )
+        .unwrap();
+        envelope.task_id = plan.task_id.clone();
+        let reference =
+            PlanTaskReference::new(plan.plan_id.clone(), plan.revision, plan.digest.clone())
+                .unwrap();
+        let (_, admitted) = store
+            .submit_task_governed_with_plan(
+                session.session_id,
+                &principal,
+                "planned-1",
+                "planned-fingerprint",
+                &envelope,
+                10,
+                1,
+                Some(&reference),
+            )
+            .unwrap();
+        assert_eq!(admitted.plan_id, Some(plan.plan_id.clone()));
+        assert_eq!(admitted.plan_step_id, None);
+        let claimed = store
+            .claim_next_with_plan_context(
+                Utc::now(),
+                Duration::seconds(30),
+                &PlanClaimContext {
+                    circuit_closed: true,
+                    ..PlanClaimContext::default()
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.plan_step_id, Some(PlanStepId::new("read").unwrap()));
+        let outcome = store
+            .finish_task_with_plan_context(
+                &claimed.task_id,
+                &principal.tenant_id,
+                Some(Value::Null),
+                None,
+                false,
+                Utc::now(),
+                Duration::milliseconds(1),
+                Duration::seconds(1),
+                &PlanClaimContext {
+                    circuit_closed: true,
+                    ..PlanClaimContext::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(outcome, FinishOutcome::Succeeded);
+        assert_eq!(
+            store
+                .get_task(&claimed.task_id, &principal.tenant_id)
+                .unwrap()
+                .status,
+            TaskStatus::Succeeded
+        );
+        assert_eq!(
+            store
+                .load_plan(&plan.plan_id, &plan.tenant_id)
+                .unwrap()
+                .plan
+                .state,
+            PlanState::Succeeded
+        );
+    }
+
+    #[test]
+    fn planned_claim_respects_dependencies_and_advances_deterministically() {
+        let store = QueueStore::in_memory().unwrap();
+        let plan = dependency_plan();
+        let principal = Principal {
+            operator_id: plan.operator_id.clone(),
+            tenant_id: plan.tenant_id.clone(),
+            role: Role::Administrator,
+        };
+        store.bootstrap_principal(&principal).unwrap();
+        let session = store
+            .create_session(principal.clone(), Value::Null)
+            .unwrap();
+        store.save_plan(&plan).unwrap();
+        let mut envelope = TaskEnvelope::new(
+            principal.tenant_id.clone(),
+            principal.operator_id.clone(),
+            "executar DAG planejado",
+        )
+        .unwrap();
+        envelope.task_id = plan.task_id.clone();
+        let reference =
+            PlanTaskReference::new(plan.plan_id.clone(), plan.revision, plan.digest.clone())
+                .unwrap();
+        store
+            .submit_task_governed_with_plan(
+                session.session_id,
+                &principal,
+                "planned-dag",
+                "planned-dag-fingerprint",
+                &envelope,
+                1,
+                1,
+                Some(&reference),
+            )
+            .unwrap();
+        let first = store
+            .claim_next_with_plan_context(
+                Utc::now(),
+                Duration::seconds(30),
+                &PlanClaimContext {
+                    circuit_closed: true,
+                    ..PlanClaimContext::default()
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.plan_step_id, Some(PlanStepId::new("read").unwrap()));
+        assert_eq!(
+            store
+                .finish_task_with_plan_context(
+                    &first.task_id,
+                    &principal.tenant_id,
+                    Some(Value::Null),
+                    None,
+                    false,
+                    Utc::now(),
+                    Duration::milliseconds(1),
+                    Duration::seconds(1),
+                    &PlanClaimContext {
+                        circuit_closed: true,
+                        ..PlanClaimContext::default()
+                    },
+                )
+                .unwrap(),
+            FinishOutcome::PlanStepSucceeded {
+                next_attempt_at: store
+                    .get_task(&first.task_id, &principal.tenant_id)
+                    .unwrap()
+                    .next_attempt_at,
+            }
+        );
+        let second = store
+            .claim_next_with_plan_context(
+                Utc::now(),
+                Duration::seconds(30),
+                &PlanClaimContext {
+                    circuit_closed: true,
+                    ..PlanClaimContext::default()
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            second.plan_step_id,
+            Some(PlanStepId::new("write-preview").unwrap())
+        );
+    }
+
+    #[test]
+    fn expired_planned_lease_becomes_unknown_without_retry() {
+        let store = QueueStore::in_memory().unwrap();
+        let plan = test_plan();
+        let principal = Principal {
+            operator_id: plan.operator_id.clone(),
+            tenant_id: plan.tenant_id.clone(),
+            role: Role::Administrator,
+        };
+        store.bootstrap_principal(&principal).unwrap();
+        let session = store
+            .create_session(principal.clone(), Value::Null)
+            .unwrap();
+        store.save_plan(&plan).unwrap();
+        let mut envelope = TaskEnvelope::new(
+            principal.tenant_id.clone(),
+            principal.operator_id.clone(),
+            "recuperar etapa planejada",
+        )
+        .unwrap();
+        envelope.task_id = plan.task_id.clone();
+        let reference =
+            PlanTaskReference::new(plan.plan_id.clone(), plan.revision, plan.digest.clone())
+                .unwrap();
+        store
+            .submit_task_governed_with_plan(
+                session.session_id,
+                &principal,
+                "planned-recovery",
+                "planned-recovery-fingerprint",
+                &envelope,
+                1,
+                1,
+                Some(&reference),
+            )
+            .unwrap();
+        let claimed = store
+            .claim_next_with_plan_context(
+                Utc::now(),
+                Duration::seconds(1),
+                &PlanClaimContext {
+                    circuit_closed: true,
+                    ..PlanClaimContext::default()
+                },
+            )
+            .unwrap()
+            .unwrap();
+        let recovered = store
+            .recover_expired_leases(Utc::now() + Duration::seconds(2))
+            .unwrap();
+        assert_eq!(recovered, 1);
+        assert_eq!(
+            store
+                .load_plan(&plan.plan_id, &plan.tenant_id)
+                .unwrap()
+                .plan
+                .state,
+            PlanState::Unknown
+        );
+        assert_eq!(
+            store
+                .get_task(&claimed.task_id, &principal.tenant_id)
+                .unwrap()
+                .status,
+            TaskStatus::Failed
+        );
+        assert!(
+            store
+                .claim_next(Utc::now(), Duration::seconds(1))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

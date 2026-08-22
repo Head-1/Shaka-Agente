@@ -17,12 +17,15 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use shaka_core::{Action, ExecutionBudget, Principal, TaskEnvelope, TaskId, TenantId};
+use shaka_core::{
+    Action, ExecutionBudget, PlanId, PlanStepId, Principal, TaskEnvelope, TaskId, TenantId,
+};
 use shaka_observability::{AuditLogger, CorrelationContext, Telemetry};
 use shaka_orchestrator::{AgentRuntime, CancellationToken, OrchestratorError};
 use shaka_queue::{
     AuthSource, AuthenticatedPrincipal, CircuitBreaker, CircuitConfig, CircuitSnapshot,
-    FinishOutcome, QueueError, QueueStore, SessionRecord, SubmitOutcome, TaskRecord, TaskStatus,
+    FinishOutcome, PlanClaimContext, PlanTaskReference, QueueError, QueueStore, SessionRecord,
+    SubmitOutcome, TaskRecord, TaskStatus,
 };
 use std::{
     collections::{BTreeMap, HashMap},
@@ -374,7 +377,7 @@ impl From<SessionRecord> for SessionResponse {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct SubmitTaskRequest {
     pub objective: String,
     #[serde(default)]
@@ -382,6 +385,14 @@ pub struct SubmitTaskRequest {
     pub max_attempts: Option<u32>,
     pub dry_run: Option<bool>,
     pub budget: Option<ExecutionBudget>,
+    /// ID da task definida pelo plano; obrigatório quando a referência planejada é usada.
+    pub task_id: Option<TaskId>,
+    /// Plano imutável que autoriza a task, quando o modo planejado está ativo.
+    pub plan_id: Option<PlanId>,
+    /// Revisão do plano imutável.
+    pub plan_revision: Option<u32>,
+    /// Digest SHA-256 da revisão do plano.
+    pub plan_digest: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -400,6 +411,10 @@ pub struct TaskResponse {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
+    pub plan_id: Option<PlanId>,
+    pub plan_revision: Option<u32>,
+    pub plan_digest: Option<String>,
+    pub plan_step_id: Option<PlanStepId>,
 }
 
 impl From<TaskRecord> for TaskResponse {
@@ -419,6 +434,10 @@ impl From<TaskRecord> for TaskResponse {
             created_at: task.created_at,
             updated_at: task.updated_at,
             completed_at: task.completed_at,
+            plan_id: task.plan_id,
+            plan_revision: task.plan_revision,
+            plan_digest: task.plan_digest,
+            plan_step_id: task.plan_step_id,
         }
     }
 }
@@ -488,6 +507,7 @@ async fn get_session(
     Ok(Json(session.into()))
 }
 
+#[allow(clippy::too_many_lines)]
 async fn submit_task(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -522,6 +542,37 @@ async fn submit_task(
             "execução live exige configuração explícita e principal administrador".to_owned(),
         ));
     }
+    let plan_fields_present = request.plan_id.is_some()
+        || request.plan_revision.is_some()
+        || request.plan_digest.is_some()
+        || request.task_id.is_some();
+    let plan_reference = if plan_fields_present {
+        let plan_id = request.plan_id.clone().ok_or_else(|| {
+            ApiError::BadRequest("plan_id é obrigatório no modo planejado".to_owned())
+        })?;
+        let revision = request.plan_revision.ok_or_else(|| {
+            ApiError::BadRequest("plan_revision é obrigatório no modo planejado".to_owned())
+        })?;
+        let digest = request.plan_digest.clone().ok_or_else(|| {
+            ApiError::BadRequest("plan_digest é obrigatório no modo planejado".to_owned())
+        })?;
+        if request.task_id.is_none() {
+            return Err(ApiError::BadRequest(
+                "task_id é obrigatório no modo planejado".to_owned(),
+            ));
+        }
+        if !dry_run {
+            return Err(ApiError::BadRequest(
+                "tasks planejadas exigem dry-run na v0.8.0".to_owned(),
+            ));
+        }
+        Some(
+            PlanTaskReference::new(plan_id, revision, digest)
+                .map_err(|error| ApiError::BadRequest(error.to_string()))?,
+        )
+    } else {
+        None
+    };
     let mut envelope = TaskEnvelope::new(
         auth.principal.tenant_id.clone(),
         auth.principal.operator_id.clone(),
@@ -529,6 +580,14 @@ async fn submit_task(
     )
     .map_err(|error| ApiError::BadRequest(error.to_string()))?;
     envelope.dry_run = dry_run;
+    if let Some(task_id) = request.task_id.clone() {
+        if plan_reference.is_none() {
+            return Err(ApiError::BadRequest(
+                "task_id somente pode ser usado no modo planejado".to_owned(),
+            ));
+        }
+        envelope.task_id = task_id;
+    }
     if let Some(budget) = request.budget.clone() {
         envelope.budget = budget;
     }
@@ -540,7 +599,7 @@ async fn submit_task(
         Some(session_id),
         Some(&envelope.task_id),
     );
-    let submission = state.queue.submit_task_governed(
+    let submission = state.queue.submit_task_governed_with_plan(
         session_id,
         &auth.principal,
         idempotency_key,
@@ -548,6 +607,7 @@ async fn submit_task(
         &envelope,
         request.priority,
         max_attempts,
+        plan_reference.as_ref(),
     );
     let (outcome, task) = match submission {
         Ok((outcome, task)) => {
@@ -697,7 +757,16 @@ async fn worker_loop(worker_id: usize, state: ApiState) {
         }
         let claim_span = correlation_span(&state, "queue.claim", None, None);
         claim_span.record("worker_id", worker_id);
-        match state.queue.claim_next(now, state.config.lease_for) {
+        let plan_context = PlanClaimContext {
+            circuit_closed: true,
+            granted_capabilities: state.runtime.granted_capabilities(),
+            remaining_budget: None,
+            state_digest: None,
+        };
+        match state
+            .queue
+            .claim_next_with_plan_context(now, state.config.lease_for, &plan_context)
+        {
             Ok(Some(task)) => {
                 claim_span.record("outcome", "claimed");
                 claim_span.record("lease_state", "held");
@@ -723,6 +792,19 @@ async fn execute_task(worker_id: usize, state: ApiState, task: TaskRecord) {
     task_span.record("worker_id", worker_id);
     task_span.record("attempt", task.attempts);
     task_span.record("lease_state", "held");
+    if let Some(plan_id) = &task.plan_id {
+        task_span.record("plan_mode", "planned");
+        task_span.record("plan_revision", task.plan_revision.unwrap_or_default());
+        task_span.record(
+            "plan_step",
+            task.plan_step_id
+                .as_ref()
+                .map_or("none", |id| id.0.as_str()),
+        );
+        task_span.record("plan_reference", plan_id.0.to_string());
+    } else {
+        task_span.record("plan_mode", "direct");
+    }
     let token = CancellationToken::new();
     state.register_cancellation(&task_id, token.clone());
     let execution = state
@@ -805,7 +887,8 @@ fn finish_success(
     now: DateTime<Utc>,
 ) {
     let finish_span = correlation_span(state, "queue.finish", None, Some(task_id));
-    match state.queue.finish_task(
+    let plan_context = worker_plan_context(state);
+    match state.queue.finish_task_with_plan_context(
         task_id,
         &task.tenant_id,
         result_json,
@@ -814,6 +897,7 @@ fn finish_success(
         now,
         state.config.retry_base_delay,
         state.config.retry_max_delay,
+        &plan_context,
     ) {
         Ok(outcome) => {
             finish_span.record("outcome", finish_outcome_name(&outcome));
@@ -843,7 +927,8 @@ fn finish_failure(
 ) {
     let safe_error = shaka_core::redact_sensitive(&error.to_string());
     let finish_span = correlation_span(state, "queue.finish", None, Some(task_id));
-    match state.queue.finish_task(
+    let plan_context = worker_plan_context(state);
+    match state.queue.finish_task_with_plan_context(
         task_id,
         &task.tenant_id,
         None,
@@ -852,6 +937,7 @@ fn finish_failure(
         now,
         state.config.retry_base_delay,
         state.config.retry_max_delay,
+        &plan_context,
     ) {
         Ok(outcome) => {
             finish_span.record("outcome", finish_outcome_name(&outcome));
@@ -880,9 +966,19 @@ fn finish_failure(
     }
 }
 
+fn worker_plan_context(state: &ApiState) -> PlanClaimContext {
+    PlanClaimContext {
+        circuit_closed: state.breaker.snapshot().state == shaka_queue::CircuitState::Closed,
+        granted_capabilities: state.runtime.granted_capabilities(),
+        remaining_budget: None,
+        state_digest: None,
+    }
+}
+
 fn audit_task_finish(state: &ApiState, task: &TaskRecord, outcome: &FinishOutcome) {
     let outcome_name = match outcome {
         FinishOutcome::Succeeded => "succeeded",
+        FinishOutcome::PlanStepSucceeded { .. } => "plan_step_succeeded",
         FinishOutcome::Requeued { .. } => "retry_scheduled",
         FinishOutcome::Failed => "failed",
         FinishOutcome::Cancelled => "cancelled",
@@ -915,6 +1011,7 @@ fn submit_outcome_name(outcome: &SubmitOutcome) -> &'static str {
 fn finish_outcome_name(outcome: &FinishOutcome) -> &'static str {
     match outcome {
         FinishOutcome::Succeeded => "succeeded",
+        FinishOutcome::PlanStepSucceeded { .. } => "plan_step_succeeded",
         FinishOutcome::Requeued { .. } => "retry_scheduled",
         FinishOutcome::Failed => "failed",
         FinishOutcome::Cancelled => "cancelled",
@@ -1096,6 +1193,10 @@ fn fingerprint(request: &SubmitTaskRequest, idempotency_key: &str) -> Result<Str
         "max_attempts": request.max_attempts.unwrap_or(3),
         "dry_run": request.dry_run.unwrap_or(true),
         "budget": request.budget,
+        "task_id": request.task_id,
+        "plan_id": request.plan_id,
+        "plan_revision": request.plan_revision,
+        "plan_digest": request.plan_digest,
     }))
     .map_err(|_| ApiError::BadRequest("payload não serializável".to_owned()))?;
     let mut hasher = Sha256::new();
@@ -1466,6 +1567,7 @@ mod tests {
             max_attempts: None,
             dry_run: None,
             budget: None,
+            ..Default::default()
         };
         let mut second = first.clone();
         second.objective = "two".to_owned();

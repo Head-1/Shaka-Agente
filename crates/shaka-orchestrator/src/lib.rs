@@ -401,6 +401,12 @@ impl AgentRuntime {
         }
     }
 
+    /// Retorna uma cópia bounded das capabilities host-side disponíveis ao runtime.
+    #[must_use]
+    pub fn granted_capabilities(&self) -> Vec<shaka_core::Capability> {
+        self.tools.capabilities.0.clone()
+    }
+
     fn record_failure(
         &self,
         envelope: &TaskEnvelope,
