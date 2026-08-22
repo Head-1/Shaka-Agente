@@ -47,7 +47,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Cache Cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -90,6 +90,22 @@ jobs:
 
       - name: Workflow policy
         run: python3 ./scripts/workflow_policy_check.py
+
+      - name: Version preflight tests
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
+
+      - name: Version preflight
+        shell: bash
+        run: |
+          release_tag="${{ inputs.release_tag }}"
+          if [[ -z "$release_tag" && "$GITHUB_REF_TYPE" == "tag" ]]; then
+            release_tag="$GITHUB_REF_NAME"
+          fi
+          if [[ -n "$release_tag" ]]; then
+            python3 ./scripts/version_preflight.py --tag "$release_tag"
+          else
+            python3 ./scripts/version_preflight.py --allow-no-tag --allow-unreleased
+          fi
 
       - name: Install cargo-audit
         uses: taiki-e/install-action@v2
@@ -138,7 +154,7 @@ jobs:
           sbom-path: dist/shaka.cdx.json
 
       - name: Upload workflow artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: shaka-${{ steps.version.outputs.version }}-release-assets
           path: dist/*

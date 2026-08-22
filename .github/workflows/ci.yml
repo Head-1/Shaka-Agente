@@ -40,6 +40,12 @@ jobs:
       - name: Workflow policy
         run: python3 ./scripts/workflow_policy_check.py
 
+      - name: Version preflight tests
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
+
+      - name: Version preflight
+        run: python3 ./scripts/version_preflight.py --allow-no-tag --allow-unreleased
+
       - name: Dependency audit
         run: cargo install cargo-audit --version 0.22.2 --locked && cargo audit
 
