@@ -1,176 +1,269 @@
-# Runbook Operacional do Shaka
+# Runbook Operacional do Shaka v0.8.0
 
-## 1. Escopo
+## 1. Escopo e modelo de segurança
 
-Este runbook descreve a operação da release candidata para produção controlada. Ele foi escrito para permitir que uma pessoa que não participou da implementação consiga iniciar o agente, verificar o estado, executar uma tarefa em modo seguro, investigar falhas, operar backups e revogar uma skill.
+Este runbook descreve a operação controlada do **Shaka v0.8.0**, release publicada com binário Linux, SBOM CycloneDX, checksums e imagem privada no GHCR. Ele foi escrito para que um operador consiga instalar, verificar, executar, diagnosticar e recuperar o agente sem precisar conhecer a implementação interna em Rust.
 
-A release é um processo de linha de comando, não um serviço 24/7. Ela não recebe webhooks, não mantém workers permanentes e não envia mensagens externas. Antes de exposição remota, substituir a identidade local por IAM forte.
+A operação padrão é local e segura. A API vincula-se a `127.0.0.1`, o provedor padrão é local, tarefas começam em `dry-run` e nenhuma ação externa deve ser liberada por padrão. Os planos `live` permanecem bloqueados na v0.8.0. Mensageria externa, pesquisa autônoma na web, autopromoção de skills e controle irrestrito de subagentes não fazem parte desta release.
 
-## 2. Pré-condições
+> **Princípio operacional:** diante de ambiguidade, falha ou inconsistência, o Shaka deve bloquear a transição, preservar evidências e exigir decisão humana.
 
-A máquina deve possuir Rust stable, Cargo e acesso ao filesystem do projeto. O operador precisa conhecer o tenant e usar uma identidade própria na variável `SHAKA_OPERATOR`. Chaves de modelo devem existir somente no ambiente ou em um cofre externo; nunca devem ser adicionadas a arquivos versionados.
+A release não deve ser exposta diretamente à internet. Uma implantação pública exigirá, em ciclo posterior, IAM remoto forte, cofre de segredos, HTTPS na borda, armazenamento persistente, backup externo, métricas e revisão de segurança específica.
 
-Verificar o ambiente:
+## 2. Artefatos e pré-condições
+
+Os artefatos oficiais estão na [GitHub Release v0.8.0](https://github.com/Head-1/Shaka-Agente/releases/tag/v0.8.0). Os downloads recomendados são `shaka-linux-x86_64`, `shaka-v0.8.0-linux-x86_64.tar.gz`, `shaka-v0.8.0-linux-x86_64.zip`, `shaka.cdx.json` e `SHA256SUMS`.
+
+Antes de instalar, valide os hashes publicados. O manifesto referencia os arquivos dentro de `dist/`:
 
 ```bash
-cd Shaka
+mkdir -p dist
+cp shaka-linux-x86_64 shaka.cdx.json dist/
+sha256sum -c SHA256SUMS
+```
+
+O arquivo `SHA256SUMS` deve responder `OK` para o binário e para o SBOM. Os pacotes compactados devem passar nos testes de integridade:
+
+```bash
+tar -tzf shaka-v0.8.0-linux-x86_64.tar.gz >/dev/null
+unzip -t shaka-v0.8.0-linux-x86_64.zip
+```
+
+Dê permissão de execução somente ao binário baixado e mantenha os arquivos de dados separados do código:
+
+```bash
+chmod 0555 ./shaka-linux-x86_64
+./shaka-linux-x86_64 --version
+```
+
+A saída esperada para a release é `shaka 0.8.0`. Se a execução for feita a partir do código-fonte, use Rust/Cargo 1.98.0 ou toolchain compatível com edition 2024:
+
+```bash
+export PATH="$HOME/.cargo/bin:$PATH"
 rustc --version
 cargo --version
-cargo test --workspace
+cargo test --workspace --locked
 ```
 
-## 3. Inicialização segura
+Não armazene chaves de modelo, tokens IAM, bancos de dados de usuários ou backups em arquivos versionados. O arquivo SQLite e o catálogo de skills podem conter dados sensíveis.
 
-A primeira execução deve usar o modelo local e dry-run. O papel padrão é `operator`, que não pode executar efeitos externos, aprovar/revogar skills, restaurar banco ou operar dados de outro tenant:
+## 3. Configuração local segura
+
+Defina um diretório de dados restrito ao operador. Os parâmetros abaixo também podem ser passados diretamente à CLI; variáveis de ambiente são preferíveis para configuração repetível.
 
 ```bash
-cargo run -- run "Faça um diagnóstico resumido do objetivo X"
+export SHAKA_DATABASE="$PWD/data/shaka.db"
+export SHAKA_SKILLS_FILE="$PWD/data/skills.json"
+export SHAKA_TRUST_FILE="$PWD/data/trusted_keys.json"
+export SHAKA_TENANT="demo"
+export SHAKA_OPERATOR="operator"
+export SHAKA_ROLE="operator"
+export SHAKA_ENVIRONMENT="development"
 ```
 
-Uma execução correta produz JSON com `task_id`, `answer`, `tool_results` e `success`. Também grava um episódio em `data/shaka.db`.
-
-Se o diretório `data` não existir, a CLI o cria. Os arquivos `data/shaka.db` e `data/skills.json` são dados operacionais e devem ser tratados como sensíveis quando contiverem conteúdo de usuários.
-
-## 4. Diagnóstico de configuração e prontidão
-
-Executar antes de uma mudança ou release:
+Verifique a configuração sem fornecer chave de modelo:
 
 ```bash
-cargo run -- config
-cargo run -- doctor
-cargo run -- verify-audit
+./shaka-linux-x86_64 config
+./shaka-linux-x86_64 doctor
 ```
 
-`doctor` verifica configuração, integridade SQLite, existência do catálogo e cadeia de auditoria. Uma resposta com `status=failed` bloqueia a promoção. Em `production`, a configuração exige provedor externo, API key, endpoint HTTPS e auditoria habilitada. Modo live exige administrador e `SHAKA_CONFIRM_LIVE=true`.
+Uma resposta operacionalmente pronta deve apresentar `config_valid: true`, `database_integrity: true` e `status: "ready"`. O campo `api_key_configured` deve permanecer `false` quando o provedor local estiver sendo usado.
 
-## 5. Backup e restore
-
-Criar backup online:
+Para usar um provedor OpenAI-compatível em ambiente controlado, injete a chave somente pelo ambiente ou por um cofre externo. Nunca registre a chave em shell history, logs, prompts, banco, catálogo ou auditoria:
 
 ```bash
-cargo run -- backup --output backups/shaka-$(date -u +%Y%m%dT%H%M%SZ).db
+export SHAKA_MODEL_PROVIDER=openai-compatible
+export SHAKA_MODEL_API_KEY="chave-fornecida-pelo-operador"
+export SHAKA_MODEL_ENDPOINT="https://provedor.example/v1/chat/completions"
+export SHAKA_MODEL="modelo-aprovado"
 ```
 
-Restaurar exige administrador e valida a integridade após a operação:
+Em produção, a configuração exige provedor externo HTTPS, chave válida, auditoria habilitada e validação explícita. Isso não libera automaticamente efeitos externos.
+
+## 4. Execução de uma tarefa em dry-run
+
+A execução padrão usa o provedor local e não solicita efeitos externos:
 
 ```bash
-cargo run -- restore --input backups/shaka-arquivo.db
+./shaka-linux-x86_64 run "Descreva em uma frase a política deny-by-default do Shaka"
 ```
 
-O backup deve ser transferido para armazenamento externo criptografado e a restauração deve ser testada periodicamente em banco separado.
+Uma execução bem-sucedida retorna JSON com `task_id`, `answer`, `tool_results` e `success: true`. O episódio é persistido no SQLite do tenant atual.
 
-## 6. Verificação do sandbox
+O operador não deve usar `--live`. O teste de segurança da release confirmou que uma tentativa de `run --live` por um operador comum é bloqueada por autorização. Qualquer proposta futura de execução real exige mudança de governança, aprovação explícita, revisão de permissões e novo ciclo de release.
 
-Executar:
+## 5. Health check e servidor HTTP local
+
+Inicie o servidor somente em loopback:
 
 ```bash
-cargo run -- sandbox-demo
+./shaka-linux-x86_64 serve --bind 127.0.0.1:8080 --workers 2
 ```
 
-O resultado esperado é um JSON com `exit_code` igual a `42` e um valor positivo de `fuel_consumed`.
-
-Os testes adversariais básicos podem ser repetidos com:
+O health check pode ser consultado com:
 
 ```bash
-cargo test -p shaka-sandbox
+curl --fail --silent http://127.0.0.1:8080/healthz
 ```
 
-O comportamento esperado é: módulo puro executa; módulo que importa função do host é rejeitado; capability de rede é negada por padrão.
+A resposta esperada contém `status: "ok"`, `version: "0.8.0"` e circuito `closed`. Os endpoints principais são:
 
-## 7. Diagnóstico de falha de execução
+| Endpoint | Finalidade |
+|---|---|
+| `GET /healthz` | Saúde, versão, fila e circuito |
+| `POST /v1/sessions` | Criar sessão local |
+| `GET /v1/sessions/{session_id}` | Consultar sessão |
+| `POST /v1/sessions/{session_id}/tasks` | Enfileirar tarefa |
+| `GET /v1/tasks/{task_id}` | Consultar estado e resultado |
+| `DELETE /v1/tasks/{task_id}` | Solicitar cancelamento |
 
-Quando uma tarefa falhar, primeiro capture o `task_id` e repita em modo local:
+Toda submissão de tarefa exige um `Idempotency-Key`. Exemplo seguro:
 
 ```bash
-RUST_LOG=shaka=debug cargo run -- run "mesmo objetivo"
+SESSION=$(curl --fail --silent -X POST http://127.0.0.1:8080/v1/sessions \
+  -H 'content-type: application/json' \
+  -d '{"metadata":{"source":"manual"}}' \
+  | sed -n 's/.*"session_id":"\([^"]*\)".*/\1/p')
+
+curl --fail --silent -X POST "http://127.0.0.1:8080/v1/sessions/$SESSION/tasks" \
+  -H 'content-type: application/json' \
+  -H 'Idempotency-Key: manual-task-1' \
+  -d '{"objective":"Descreva a política de execução segura","priority":5}'
 ```
 
-Depois consulte o episódio:
+O mesmo `Idempotency-Key` e o mesmo payload devem retornar a tarefa já existente, sem criar uma segunda execução. Não faça bind em `0.0.0.0` em ambiente real sem autenticação, HTTPS na borda e revisão de exposição.
+
+A imagem GHCR usa `shaka serve` como comando padrão, expõe a porta 8080 e possui `doctor` como healthcheck. Um host com Docker pode executar a imagem privada depois de autenticar no GHCR:
 
 ```bash
-cargo run -- memory recent --limit 20
+docker pull ghcr.io/head-1/shaka-agente:v0.8.0
+docker run --rm \
+  -p 127.0.0.1:8080:8080 \
+  -v "$PWD/data:/app/data" \
+  ghcr.io/head-1/shaka-agente:v0.8.0
 ```
 
-Classifique a falha antes de tentar novamente:
+A validação pós-release deste ambiente confirmou a publicação da imagem no GHCR, mas não executou Docker localmente porque Docker/Podman não estão instalados no sandbox de validação.
 
-| Sintoma | Causa provável | Ação |
-|---|---|---|
-| `DeadlineExceeded` | Modelo ou ferramenta demorou além do orçamento | Reduzir escopo, revisar timeout e verificar endpoint. |
-| `tool_not_found` | O modelo propôs ferramenta não registrada | Não adicionar automaticamente; revisar contrato e catálogo. |
-| `schema` | Argumentos não são um objeto válido | Corrigir schema/adapter; nunca executar o JSON diretamente. |
-| `capability denied` | Ferramenta exige permissão não concedida | Revisar se a permissão é necessária; manter deny-by-default. |
-| `dry_run` | Ação tem efeito externo | Confirmar intenção e implementar aprovação antes de habilitar. |
-| `HostImportsDenied` | WASM solicita função do host | Inspecionar o artefato; não liberar import sem ADR e threat model. |
-| `fuel` ou timeout do sandbox | Código excedeu limite | Reproduzir com fixture; não aumentar o limite indiscriminadamente. |
-| erro HTTP do modelo | Endpoint, credencial, rate limit ou schema do provedor | Validar variáveis, endpoint e contrato do provedor sem registrar a chave. |
+## 6. Diagnóstico e auditoria
 
-## 8. Revogação de skill
-
-Se uma skill ativa apresentar comportamento inesperado, revogue-a imediatamente:
+Antes de qualquer alteração operacional, execute:
 
 ```bash
-cargo run -- skill revoke NOME_DA_SKILL
+./shaka-linux-x86_64 doctor
+./shaka-linux-x86_64 verify-audit
 ```
 
-A revogação deve ser registrada em uma ocorrência operacional com horário, operador, versão, hash do artefato, motivo e evidências. Não substitua o arquivo manualmente sem preservar o catálogo e a trilha de auditoria.
-
-Após a revogação, confirme que ela não aparece na lista de ativas:
+`verify-audit` exige papel `administrator`. Uma cadeia inválida bloqueia a promoção e deve ser tratada como incidente. Para consultar episódios recentes:
 
 ```bash
-cargo run -- skill list
+./shaka-linux-x86_64 memory recent --limit 20
 ```
 
-Se a revogação falhar porque a skill não está no estado `Active`, preserve a saída e trate como divergência de estado. Não force a alteração diretamente no JSON sem backup.
+Classifique a falha antes de repetir uma tarefa:
 
-## 9. Criação e aprovação de skill
+| Sintoma | Conduta |
+|---|---|
+| `DeadlineExceeded` | Reduzir escopo, revisar timeout e validar o provedor. |
+| `tool_not_found` | Não adicionar a ferramenta automaticamente; revisar contrato e catálogo. |
+| `schema` | Corrigir schema ou adapter; nunca executar JSON diretamente. |
+| `capability denied` | Manter o bloqueio até demonstrar necessidade e autorização. |
+| `unknown` | Exigir resolução humana; não presumir sucesso nem repetir cegamente. |
+| `HostImportsDenied` | Preservar o artefato e revisar sandbox, threat model e imports. |
+| erro HTTP do modelo | Verificar endpoint, credencial, limite e contrato sem registrar segredo. |
+| inconsistência de reducer | Parar novas transições, preservar evidências e abrir incidente. |
 
-A criação de skill no MVP registra uma candidata; ela não gera nem executa código automaticamente. O fluxo operacional atual é:
+## 7. Backup, restauração e integridade
+
+Backup e restauração exigem papel `administrator`. Faça backup antes de mudanças relevantes:
 
 ```bash
-cargo run -- skill candidate NOME "Descrição" --permissions memory-write
-cargo run -- skill list
+./shaka-linux-x86_64 --role administrator \
+  backup --output "backups/shaka-$(date -u +%Y%m%dT%H%M%SZ).db"
 ```
 
-Antes da aprovação, o revisor deve revisar a interface, permissões, código/artefato produzido fora do catálogo e resultado dos testes. O caminho recomendado calcula o SHA-256 do arquivo real:
+Restaure primeiro em uma cópia de trabalho, nunca diretamente sobre o único banco operacional:
 
 ```bash
-cargo run -- skill approve NOME --artifact artefato.wasm --reason "Justificativa completa"
+./shaka-linux-x86_64 --role administrator \
+  --database data/restore-test.db \
+  restore --input backups/shaka-arquivo.db
+
+./shaka-linux-x86_64 --role administrator \
+  --database data/restore-test.db \
+  doctor
+
+./shaka-linux-x86_64 --role administrator \
+  --database data/restore-test.db \
+  verify-audit
 ```
 
-Também é possível informar um hash completo calculado em fluxo externo:
+O backup deve ser transferido para armazenamento externo criptografado. Defina RPO/RTO, retenção, criptografia, rotação e teste periódico de restauração antes de uma implantação pública.
+
+## 8. Skills e aprovações humanas
+
+A criação de skill registra uma candidata; não gera nem executa código automaticamente:
 
 ```bash
-cargo run -- skill approve NOME HASH --reason "Justificativa completa"
+./shaka-linux-x86_64 skill candidate relatorio \
+  "Gera um relatório estruturado" --permissions memory-write
+./shaka-linux-x86_64 skill list
 ```
 
-A ausência de hash, hash inválido ou justificativa vazia deve bloquear a transição.
+A aprovação exige papel `reviewer` ou `administrator`, hash SHA-256 completo, justificativa e revisão independente do artefato:
 
-## 10. Rotação de credenciais
+```bash
+./shaka-linux-x86_64 --role reviewer skill approve relatorio \
+  --artifact artefato.wasm \
+  --reason "Aprovada após revisão manual e testes locais"
+```
 
-No MVP, credenciais de modelo são lidas de `SHAKA_MODEL_API_KEY`. Para rotacionar uma chave, remova o valor antigo do ambiente, injete o novo valor por um mecanismo seguro e execute uma chamada de teste sem registrar o segredo:
+Para revogar uma skill ativa:
+
+```bash
+./shaka-linux-x86_64 --role reviewer skill revoke relatorio
+./shaka-linux-x86_64 skill list
+```
+
+Não edite manualmente o catálogo para contornar uma transição. Registre horário, operador, versão, hash, motivo e evidências.
+
+## 9. Rotação de credenciais e retenção
+
+Para rotacionar uma credencial, remova o valor antigo do ambiente, injete o novo por mecanismo seguro e execute um teste sem registrar a chave:
 
 ```bash
 unset SHAKA_MODEL_API_KEY
 export SHAKA_MODEL_API_KEY="nova-chave"
-RUST_LOG=shaka=info cargo run -- run "teste de conectividade"
+./shaka-linux-x86_64 run "teste de conectividade controlado"
 ```
 
-Não coloque credenciais em `.env` versionado, argumentos visíveis do shell, logs, episódios, prompts ou campos de auditoria.
-
-## 11. Retenção e expurgo
-
-A memória episódica não deve crescer indefinidamente. O operador deve aplicar a política do tenant:
+A memória episódica deve seguir a política do tenant:
 
 ```bash
-cargo run -- memory purge --days 30
+./shaka-linux-x86_64 memory purge --days 30
 ```
 
-Antes do expurgo em ambiente real, confirme a política de retenção, o backup e eventuais obrigações de preservação. O comando do MVP não substitui um processo formal de direito ao esquecimento ou restauração.
+Antes do expurgo, confirme backup, retenção e eventuais obrigações de preservação. O expurgo do MVP não substitui processo formal de privacidade ou restauração.
 
-## 12. Recuperação de dados
+## 10. Sandbox WASM
 
-O comando de backup/restauração já existe, mas não substitui armazenamento externo criptografado. Preserve o arquivo original, valide a cadeia de auditoria e execute o restore primeiro em cópia de trabalho. Antes de uma implantação pública, definir RPO/RTO, retenção de backups, criptografia, rotação e teste periódico de restauração.
+Execute o exemplo seguro:
 
-## 13. Escalonamento de incidente
+```bash
+./shaka-linux-x86_64 sandbox-demo
+```
 
-Classifique como incidente crítico qualquer execução de código fora do sandbox, autopromoção de skill, exposição de segredo, vazamento entre tenants, envio externo não autorizado ou alteração de logs. A primeira ação é conter: revogar skill, interromper novas execuções, preservar evidências e rotacionar credenciais afetadas. O MVP não fornece contenção remota automática; esse processo deve ser operado pelo responsável técnico.
+O resultado esperado contém `exit_code: 42` e `fuel_consumed` positivo. O comportamento de segurança esperado é: módulo puro executa; módulo que importa função do host é rejeitado; rede, filesystem, WASI e imports do host permanecem negados por padrão.
+
+## 11. Resposta a incidentes
+
+Trate como incidente crítico qualquer execução fora do sandbox, autopromoção de skill, exposição de segredo, vazamento entre tenants, envio externo não autorizado ou alteração de logs. A primeira resposta é conter: interromper novas execuções, revogar a skill afetada, preservar evidências, fazer backup e rotacionar credenciais potencialmente expostas.
+
+O MVP não fornece contenção remota automática. O responsável técnico deve preservar o `task_id`, versão, hash do artefato, logs, tenant, operador, horário e sequência de comandos. Não apague o banco original nem force transições diretamente no SQLite.
+
+## 12. Validação pós-release registrada
+
+A validação da release v0.8.0 em 22 de agosto de 2026 confirmou versão, configuração, `doctor`, execução local em dry-run, sandbox, backup, restauração, auditoria, health check HTTP, criação de sessão, execução de tarefa e replay idempotente. A tentativa de `live` por operador comum foi bloqueada conforme esperado.
+
+O relatório detalhado está em `ETAPA9_VALIDACAO_POS_RELEASE.md`. As evidências desta etapa são locais e não alteram a tag `v0.8.0`.
