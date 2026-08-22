@@ -14,6 +14,14 @@ Todas as mudanças relevantes do Shaka serão registradas neste arquivo. O forma
 - IAM remoto, ABAC, cofre de segredos, multi-tenancy forte e métricas exportáveis.
 - Backup remoto automatizado, migrações formais, RPO/RTO e testes de recuperação em infraestrutura-alvo.
 
+## [0.8.2] - 2026-08-22
+
+### Segurança e release
+
+- Adicionado preflight fail-closed para validar tag SemVer, versão do workspace, metadata do Cargo, `Cargo.lock` e entrada correspondente no changelog antes de qualquer build ou upload de release.
+- Adicionados testes automatizados para versões válidas, tags divergentes, metadata divergente, lockfile divergente, changelog ausente e validação sem tag em contexto não-release.
+- Atualizadas `actions/cache` e `actions/upload-artifact` para versões compatíveis com Node.js 24, mantendo os gates, permissões e triggers existentes.
+
 ## [0.8.1] - 2026-08-22
 
 ### Manutenção
