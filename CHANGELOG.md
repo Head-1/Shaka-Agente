@@ -4,6 +4,17 @@ Todas as mudanças relevantes do Shaka serão registradas neste arquivo. O forma
 
 ## [Unreleased]
 
+### v0.8.0 — Etapa 1: contratos do Plan Engine governado
+
+- `PlanId`, `PlanStepId`, `PlanSpec` e `PlanStep` adicionados ao `shaka-core`.
+- Modos `dry_run`/`live`, riscos `read_only`/`mutation`/`external_effect`/`irreversible` e níveis de aprovação humana tipados.
+- Estados de plano e etapa com transições fail-closed, incluindo `unknown` para resultados ambíguos após crash ou timeout.
+- Condições allowlisted e ações tipadas, sem expressões arbitrárias ou autoridade implícita do modelo.
+- Digest SHA-256 canônico do plano e aprovação vinculada a tenant, revisão, etapa, digest, papel, expiração e revogação.
+- Separação de funções: o operador proponente não pode aprovar o próprio plano.
+- Verificação estrutural de IDs, dependências, ciclos, risco, aprovação, retries e referências de compensação.
+- Testes unitários para dry-run padrão, digest verificável, ciclo/dependência inválida, transições e aprovação segura.
+
 ### v0.7.0 — Etapa A: observabilidade governada
 
 - Fachada `Telemetry` com schema interno `shaka.observability` v0.7 e perfil `shaka.genai.v0.7`.
