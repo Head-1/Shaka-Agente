@@ -1525,20 +1525,31 @@ impl QueueStore {
                AND state IN ('running', 'cancel_requested', 'compensating')",
             params![plan_id.0.to_string(), revision],
         )?;
-        let checkpoint_sequence = next_checkpoint_sequence_tx(&transaction, plan_id, revision)?;
-        transaction.execute(
-            "INSERT INTO plan_checkpoints
-             (plan_id, revision, sequence, step_id, phase, status, state_digest, created_at)
-             SELECT ?1, ?2, ?3, NULL, 'recovery', 'unknown', digest, ?4
-             FROM plans WHERE plan_id = ?1 AND revision = ?2 AND tenant_id = ?5",
-            params![
-                plan_id.0.to_string(),
-                revision,
-                checkpoint_sequence,
-                Utc::now().to_rfc3339(),
-                tenant_id.0
-            ],
-        )?;
+        let recovery_checkpoint_exists = transaction.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM plan_checkpoints
+                 WHERE plan_id = ?1 AND revision = ?2
+                   AND phase = 'recovery' AND status = 'unknown'
+             )",
+            params![plan_id.0.to_string(), revision],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+        if !recovery_checkpoint_exists {
+            let checkpoint_sequence = next_checkpoint_sequence_tx(&transaction, plan_id, revision)?;
+            transaction.execute(
+                "INSERT INTO plan_checkpoints
+                 (plan_id, revision, sequence, step_id, phase, status, state_digest, created_at)
+                 SELECT ?1, ?2, ?3, NULL, 'recovery', 'unknown', digest, ?4
+                 FROM plans WHERE plan_id = ?1 AND revision = ?2 AND tenant_id = ?5",
+                params![
+                    plan_id.0.to_string(),
+                    revision,
+                    checkpoint_sequence,
+                    Utc::now().to_rfc3339(),
+                    tenant_id.0
+                ],
+            )?;
+        }
         transaction.commit()?;
         drop(connection);
         let persisted = self.load_plan(plan_id, tenant_id)?;
@@ -3602,6 +3613,214 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(resumed.plan_step_id, Some(PlanStepId::new("read").unwrap()));
+    }
+
+    #[test]
+    fn reducer_inconsistency_is_quarantined_once_after_restart() {
+        let store = QueueStore::in_memory().unwrap();
+        let plan = test_plan();
+        store.save_plan(&plan).unwrap();
+        let proposed = PlanStoreTransition::new(
+            plan.plan_id.clone(),
+            plan.revision,
+            1,
+            PlanTransitionEntity::Plan,
+            None,
+            PlanTransitionState::Plan(PlanState::Draft),
+            PlanTransitionState::Plan(PlanState::Proposed),
+            "propose-before-corruption",
+            None,
+            Utc::now(),
+        )
+        .unwrap();
+        store
+            .record_plan_transition(&plan.tenant_id, &proposed)
+            .unwrap();
+        store
+            .connection
+            .lock()
+            .execute(
+                "UPDATE plans SET state = 'running' WHERE plan_id = ?1 AND revision = ?2 AND tenant_id = ?3",
+                params![plan.plan_id.0.to_string(), plan.revision, plan.tenant_id.0],
+            )
+            .unwrap();
+
+        let first = store.resume_plan(&plan.tenant_id, &plan.plan_id).unwrap();
+        assert_eq!(first.status, PlanResumeStatus::Inconsistent);
+        assert_eq!(first.plan.state, PlanState::Unknown);
+        let checkpoints_after_first = store
+            .list_plan_checkpoints(&plan.tenant_id, &plan.plan_id)
+            .unwrap();
+        assert_eq!(checkpoints_after_first.len(), 1);
+        assert_eq!(
+            checkpoints_after_first[0].phase,
+            PlanCheckpointPhase::Recovery
+        );
+        assert_eq!(
+            checkpoints_after_first[0].status,
+            PlanCheckpointStatus::Unknown
+        );
+
+        let second = store.resume_plan(&plan.tenant_id, &plan.plan_id).unwrap();
+        assert_eq!(second.status, PlanResumeStatus::Inconsistent);
+        assert_eq!(second.plan.state, PlanState::Unknown);
+        assert_eq!(
+            store
+                .list_plan_checkpoints(&plan.tenant_id, &plan.plan_id)
+                .unwrap(),
+            checkpoints_after_first
+        );
+    }
+
+    #[test]
+    fn expired_planned_lease_recovery_is_idempotent_after_restart() {
+        let store = QueueStore::in_memory().unwrap();
+        let plan = test_plan();
+        let principal = admit_plan(&store, &plan);
+        let claim_at = Utc::now();
+        let claimed = store
+            .claim_next_with_plan_context(
+                claim_at,
+                Duration::seconds(1),
+                &PlanClaimContext {
+                    circuit_closed: true,
+                    ..PlanClaimContext::default()
+                },
+            )
+            .unwrap()
+            .unwrap();
+        let before = store
+            .list_plan_checkpoints(&plan.tenant_id, &plan.plan_id)
+            .unwrap();
+        assert_eq!(
+            before.last().map(|checkpoint| checkpoint.phase),
+            Some(PlanCheckpointPhase::BeforeStep)
+        );
+        assert_eq!(
+            before.last().map(|checkpoint| checkpoint.status),
+            Some(PlanCheckpointStatus::Pending)
+        );
+
+        let recovery_at = claim_at + Duration::seconds(2);
+        assert_eq!(store.recover_expired_leases(recovery_at).unwrap(), 1);
+        let after = store
+            .list_plan_checkpoints(&plan.tenant_id, &plan.plan_id)
+            .unwrap();
+        assert_eq!(after.len(), before.len() + 1);
+        assert_eq!(
+            after.last().map(|checkpoint| checkpoint.phase),
+            Some(PlanCheckpointPhase::Recovery)
+        );
+        assert_eq!(
+            after.last().map(|checkpoint| checkpoint.status),
+            Some(PlanCheckpointStatus::Unknown)
+        );
+        assert_eq!(
+            store
+                .get_task(&claimed.task_id, &principal.tenant_id)
+                .unwrap()
+                .status,
+            TaskStatus::Failed
+        );
+
+        assert_eq!(
+            store
+                .recover_expired_leases(recovery_at + Duration::seconds(1))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .list_plan_checkpoints(&plan.tenant_id, &plan.plan_id)
+                .unwrap(),
+            after
+        );
+        let report = store.resume_plan(&plan.tenant_id, &plan.plan_id).unwrap();
+        assert_eq!(report.status, PlanResumeStatus::Stable);
+        assert_eq!(report.plan.state, PlanState::Unknown);
+        assert_eq!(report.checkpoints_checked, after.len() as u64);
+    }
+
+    #[test]
+    fn planned_finish_replay_after_commit_is_terminal_and_idempotent() {
+        let store = QueueStore::in_memory().unwrap();
+        let plan = test_plan();
+        let principal = admit_plan(&store, &plan);
+        let claimed = store
+            .claim_next_with_plan_context(
+                Utc::now(),
+                Duration::seconds(30),
+                &PlanClaimContext {
+                    circuit_closed: true,
+                    ..PlanClaimContext::default()
+                },
+            )
+            .unwrap()
+            .unwrap();
+        let finished_at = Utc::now();
+        assert_eq!(
+            store
+                .finish_task_with_plan_context(
+                    &claimed.task_id,
+                    &principal.tenant_id,
+                    Some(Value::String("committed".to_owned())),
+                    None,
+                    false,
+                    finished_at,
+                    Duration::milliseconds(1),
+                    Duration::seconds(1),
+                    &PlanClaimContext {
+                        circuit_closed: true,
+                        ..PlanClaimContext::default()
+                    },
+                )
+                .unwrap(),
+            FinishOutcome::Succeeded
+        );
+        let checkpoints_after_commit = store
+            .list_plan_checkpoints(&plan.tenant_id, &plan.plan_id)
+            .unwrap();
+
+        assert_eq!(
+            store
+                .finish_task_with_plan_context(
+                    &claimed.task_id,
+                    &principal.tenant_id,
+                    Some(Value::String("replayed".to_owned())),
+                    None,
+                    false,
+                    finished_at + Duration::seconds(1),
+                    Duration::milliseconds(1),
+                    Duration::seconds(1),
+                    &PlanClaimContext {
+                        circuit_closed: true,
+                        ..PlanClaimContext::default()
+                    },
+                )
+                .unwrap(),
+            FinishOutcome::Succeeded
+        );
+        assert_eq!(
+            store
+                .list_plan_checkpoints(&plan.tenant_id, &plan.plan_id)
+                .unwrap(),
+            checkpoints_after_commit
+        );
+        assert_eq!(
+            store
+                .load_plan(&plan.plan_id, &plan.tenant_id)
+                .unwrap()
+                .plan
+                .state,
+            PlanState::Succeeded
+        );
+        assert_eq!(
+            store
+                .resume_plan(&plan.tenant_id, &plan.plan_id)
+                .unwrap()
+                .status,
+            PlanResumeStatus::Stable
+        );
     }
 
     #[test]

@@ -1381,6 +1381,14 @@ impl QueueStore {
         let mut connection = self.connection.lock();
         let transaction = connection.transaction()?;
         let task = load_task(&transaction, &task_id.0.to_string(), tenant_id)?;
+        if task.status.is_terminal() {
+            transaction.commit()?;
+            return Ok(match task.status {
+                TaskStatus::Succeeded => FinishOutcome::Succeeded,
+                TaskStatus::Cancelled => FinishOutcome::Cancelled,
+                _ => FinishOutcome::Failed,
+            });
+        }
         if task.plan_id.is_some() {
             let outcome = plan_store::finish_planned_step_tx(
                 &transaction,
@@ -1395,14 +1403,6 @@ impl QueueStore {
             )?;
             transaction.commit()?;
             return Ok(outcome);
-        }
-        if task.status.is_terminal() {
-            transaction.commit()?;
-            return Ok(match task.status {
-                TaskStatus::Succeeded => FinishOutcome::Succeeded,
-                TaskStatus::Cancelled => FinishOutcome::Cancelled,
-                _ => FinishOutcome::Failed,
-            });
         }
         if task.cancel_requested || task.status == TaskStatus::CancelRequested {
             transaction.execute(

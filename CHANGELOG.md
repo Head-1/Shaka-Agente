@@ -14,6 +14,14 @@ Todas as mudanças relevantes do Shaka serão registradas neste arquivo. O forma
 - Auditoria de todas as operações administrativas de plano sem persistir payloads, segredos ou conteúdo livre; respostas HTTP permanecem bounded e tenant-isolated.
 - Testes HTTP do ciclo de plano, aprovação/idempotência, submissão planejada, cancelamento e checkpoints; testes de parsing da CLI; workspace, Clippy e smoke de produção aprovados.
 
+### v0.8.0 — Etapa 7: crash/recovery e fronteiras ambíguas
+
+- Recovery de lease planejada permanece fail-closed: a fronteira ativa vira `unknown`, a task não recebe retry cego e a retomada exige resolução humana.
+- Recovery repetido após reinicialização é idempotente, sem duplicar checkpoints ou reprocessar uma task já encerrada.
+- Snapshot divergente da cadeia do reducer entra em quarentena `unknown`, com checkpoint de recovery único e sem efeitos cumulativos em reinicializações seguintes.
+- Replay do worker após commit terminal retorna o mesmo outcome persistido e não duplica transições, checkpoints ou efeitos de plano.
+- Três novos testes de crash/recovery e replay; 23 testes do `shaka-queue` aprovados.
+
 ### v0.8.0 — Etapa 5: aprovações, compensações e resolução de unknown
 
 - `approve_plan` com autorização RBAC, separação de funções, escopo por plano/etapa, digest/revisão vinculados e idempotência.
