@@ -1,7 +1,7 @@
 //! Interface operacional do Shaka.
 
 use anyhow::{Context, Result, bail};
-use chrono::Duration;
+use chrono::{Duration, Utc};
 use clap::{Args, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
@@ -9,17 +9,19 @@ use serde_json::{Value, json};
 use shaka_api::{ApiConfig, ApiState, serve as serve_api};
 use shaka_config::{AppConfig, ModelProvider};
 use shaka_core::{
-    Action, AuditEvent, Capability, CapabilitySet, Principal, Role, SkillManifest, SkillStatus,
-    TaskEnvelope,
+    Action, AuditEvent, Capability, CapabilitySet, PlanApproval, PlanApprovalDecision, PlanId,
+    PlanState, PlanStepId, Principal, Role, SkillManifest, SkillStatus, TaskEnvelope,
 };
 use shaka_memory::MemoryStore;
 use shaka_observability::{AuditLogger, init_tracing};
 use shaka_orchestrator::{
     AgentRuntime, EchoTool, LocalModel, OpenAiCompatibleModel, ToolRegistry, WasmSkillTool,
 };
-use shaka_queue::{QueueStore, TenantLimits};
+use shaka_queue::{PlanInspectionStatus, PlanResolutionDecision, QueueStore, TenantLimits};
 use shaka_sandbox::{SandboxPolicy, WasmExecutor};
 use shaka_skills::{SkillRegistry, TrustStore, load_signing_key, public_key_hex, save_signing_key};
+use uuid::Uuid;
+
 use std::{
     collections::BTreeMap,
     net::SocketAddr,
@@ -99,6 +101,47 @@ enum Command {
     Iam {
         #[command(subcommand)]
         command: IamCommand,
+    },
+    Plan {
+        #[command(subcommand)]
+        command: PlanCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum PlanCommand {
+    Validate {
+        plan_id: String,
+    },
+    Show {
+        plan_id: String,
+    },
+    Approve {
+        plan_id: String,
+        #[arg(long)]
+        step: Option<String>,
+        #[arg(long, value_parser = parse_approval_decision)]
+        decision: PlanApprovalDecision,
+        #[arg(long, default_value_t = 3600)]
+        expires_in_seconds: i64,
+        #[arg(long)]
+        idempotency_key: Option<String>,
+    },
+    Resume {
+        plan_id: String,
+        #[arg(long)]
+        evidence_digest: String,
+        #[arg(long)]
+        idempotency_key: Option<String>,
+    },
+    Cancel {
+        plan_id: String,
+    },
+    Verify {
+        plan_id: String,
+    },
+    Checkpoints {
+        plan_id: String,
     },
 }
 
@@ -244,6 +287,7 @@ async fn main() -> Result<()> {
         Command::VerifyAudit => verify_audit_command(&cli),
         Command::Config => config_command(&cli),
         Command::Iam { command } => iam_command(&cli, command),
+        Command::Plan { command } => plan_command(&cli, command),
     }
 }
 
@@ -580,6 +624,234 @@ fn skill_command(cli: &Cli, command: &SkillCommand) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
+fn plan_command(cli: &Cli, command: &PlanCommand) -> Result<()> {
+    let config = build_config(cli, false, false)?;
+    let store = QueueStore::open(&config.database)?;
+    store.bootstrap_principal(&config.principal)?;
+    match command {
+        PlanCommand::Validate { plan_id } => {
+            authorize(&config, &Action::RunReadOnly)?;
+            let plan_id = parse_plan_id(plan_id)?;
+            let report = store.validate_plan(&config.tenant_id, &plan_id)?;
+            let outcome = if report.is_executable() {
+                "valid"
+            } else {
+                "blocked"
+            };
+            append_control_audit(
+                &open_memory(&config.database)?,
+                &config.principal,
+                "plan.validate",
+                outcome,
+                BTreeMap::from([(String::from("plan_id"), plan_id.0.to_string())]),
+            )?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        PlanCommand::Show { plan_id } => {
+            authorize(&config, &Action::RunReadOnly)?;
+            let plan_id = parse_plan_id(plan_id)?;
+            let inspection = store.inspect_plan(&config.tenant_id, &plan_id)?;
+            append_control_audit(
+                &open_memory(&config.database)?,
+                &config.principal,
+                "plan.show",
+                "success",
+                BTreeMap::from([(String::from("plan_id"), plan_id.0.to_string())]),
+            )?;
+            println!("{}", serde_json::to_string_pretty(&inspection)?);
+        }
+        PlanCommand::Approve {
+            plan_id,
+            step,
+            decision,
+            expires_in_seconds,
+            idempotency_key,
+        } => {
+            authorize(&config, &Action::ApprovePlan)?;
+            if !(1..=604_800).contains(expires_in_seconds) {
+                bail!("expires_in_seconds deve estar entre 1 e 604800");
+            }
+            let plan_id = parse_plan_id(plan_id)?;
+            let persisted = store.load_plan(&plan_id, &config.tenant_id)?;
+            let step_id = step
+                .as_ref()
+                .map(|value| PlanStepId::new(value.clone()))
+                .transpose()?;
+            let required = match &step_id {
+                Some(step_id) => persisted
+                    .plan
+                    .steps
+                    .iter()
+                    .find(|candidate| &candidate.step_id == step_id)
+                    .map(|candidate| candidate.approval.max(candidate.risk.minimum_approval()))
+                    .context("etapa de aprovação não encontrada")?,
+                None => persisted.plan.required_approval(),
+            };
+            let key = idempotency_key.clone().unwrap_or_else(|| {
+                format!(
+                    "cli:plan:approve:{}:{}:{:?}",
+                    plan_id.0,
+                    step.as_deref().unwrap_or("plan"),
+                    decision
+                )
+            });
+            let approval = PlanApproval {
+                approval_id: QueueStore::approval_id_for_idempotency(
+                    &plan_id,
+                    persisted.plan.revision,
+                    &key,
+                ),
+                plan_id: plan_id.clone(),
+                plan_digest: persisted.plan.digest.clone(),
+                revision: persisted.plan.revision,
+                tenant_id: config.tenant_id.clone(),
+                approver: config.principal.operator_id.clone(),
+                approver_role: config.principal.role.clone(),
+                step_id,
+                required,
+                decision: decision.clone(),
+                expires_at: Utc::now() + Duration::seconds(*expires_in_seconds),
+                revoked: false,
+            };
+            let outcome = store.approve_plan(&config.principal, &approval, &key)?;
+            let inspection = store.inspect_plan(&config.tenant_id, &plan_id)?;
+            append_control_audit(
+                &open_memory(&config.database)?,
+                &config.principal,
+                "plan.approve",
+                "success",
+                BTreeMap::from([
+                    (String::from("plan_id"), plan_id.0.to_string()),
+                    (String::from("decision"), format!("{decision:?}")),
+                ]),
+            )?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "outcome": outcome,
+                    "plan": inspection,
+                }))?
+            );
+        }
+        PlanCommand::Resume {
+            plan_id,
+            evidence_digest,
+            idempotency_key,
+        } => {
+            authorize(&config, &Action::ResolvePlanUnknown)?;
+            let plan_id = parse_plan_id(plan_id)?;
+            let key = idempotency_key
+                .clone()
+                .unwrap_or_else(|| format!("cli:plan:resume:{}:{}", plan_id.0, evidence_digest));
+            let outcome = store.resolve_plan_unknown(
+                &config.principal,
+                &plan_id,
+                PlanResolutionDecision::Resume,
+                &key,
+                Some(evidence_digest),
+            )?;
+            let inspection = store.inspect_plan(&config.tenant_id, &plan_id)?;
+            append_control_audit(
+                &open_memory(&config.database)?,
+                &config.principal,
+                "plan.resume",
+                "success",
+                BTreeMap::from([(String::from("plan_id"), plan_id.0.to_string())]),
+            )?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "outcome": outcome,
+                    "plan": inspection,
+                }))?
+            );
+        }
+        PlanCommand::Cancel { plan_id } => {
+            authorize(&config, &Action::RunReadOnly)?;
+            let plan_id = parse_plan_id(plan_id)?;
+            let persisted = store.load_plan(&plan_id, &config.tenant_id)?;
+            let task = if persisted.plan.state == PlanState::Unknown {
+                authorize(&config, &Action::ResolvePlanUnknown)?;
+                store.resolve_plan_unknown(
+                    &config.principal,
+                    &plan_id,
+                    PlanResolutionDecision::Cancel,
+                    &format!("cli:plan:cancel:{}", plan_id.0),
+                    None,
+                )?;
+                store.get_task(&persisted.plan.task_id, &config.tenant_id)?
+            } else {
+                store.request_cancel(&persisted.plan.task_id, &config.tenant_id)?
+            };
+            let inspection = store.inspect_plan(&config.tenant_id, &plan_id)?;
+            append_control_audit(
+                &open_memory(&config.database)?,
+                &config.principal,
+                "plan.cancel",
+                "success",
+                BTreeMap::from([(String::from("plan_id"), plan_id.0.to_string())]),
+            )?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "task": task,
+                    "plan": inspection,
+                }))?
+            );
+        }
+        PlanCommand::Verify { plan_id } => {
+            authorize(&config, &Action::RunReadOnly)?;
+            let plan_id = parse_plan_id(plan_id)?;
+            let inspection = store.inspect_plan(&config.tenant_id, &plan_id)?;
+            let outcome = if matches!(inspection.status, PlanInspectionStatus::Stable) {
+                "valid"
+            } else {
+                "invalid"
+            };
+            append_control_audit(
+                &open_memory(&config.database)?,
+                &config.principal,
+                "plan.verify",
+                outcome,
+                BTreeMap::from([(String::from("plan_id"), plan_id.0.to_string())]),
+            )?;
+            println!("{}", serde_json::to_string_pretty(&inspection)?);
+            if outcome == "invalid" {
+                bail!("integridade do plano inválida");
+            }
+        }
+        PlanCommand::Checkpoints { plan_id } => {
+            authorize(&config, &Action::RunReadOnly)?;
+            let plan_id = parse_plan_id(plan_id)?;
+            let checkpoints = store.list_plan_checkpoints(&config.tenant_id, &plan_id)?;
+            append_control_audit(
+                &open_memory(&config.database)?,
+                &config.principal,
+                "plan.checkpoints",
+                "success",
+                BTreeMap::from([(String::from("plan_id"), plan_id.0.to_string())]),
+            )?;
+            println!("{}", serde_json::to_string_pretty(&checkpoints)?);
+        }
+    }
+    Ok(())
+}
+
+fn parse_plan_id(value: &str) -> Result<PlanId> {
+    Ok(PlanId(
+        Uuid::parse_str(value).with_context(|| format!("plan_id inválido: {value}"))?,
+    ))
+}
+
+fn parse_approval_decision(value: &str) -> Result<PlanApprovalDecision, String> {
+    match value {
+        "approve" => Ok(PlanApprovalDecision::Approved),
+        "reject" => Ok(PlanApprovalDecision::Rejected),
+        _ => Err("decision deve ser approve ou reject".to_owned()),
+    }
+}
+
 fn iam_command(cli: &Cli, command: &IamCommand) -> Result<()> {
     let config = build_config(cli, false, false)?;
     authorize(&config, &Action::ManageIam)?;
@@ -812,5 +1084,68 @@ fn parse_capability(value: &str) -> Option<Capability> {
         "external-messaging" => Some(Capability::ExternalMessaging),
         "memory-write" => Some(Capability::MemoryWrite),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plan_approve_command_parses_bounded_decision() {
+        let cli = Cli::try_parse_from([
+            "shaka",
+            "plan",
+            "approve",
+            "00000000-0000-0000-0000-000000000001",
+            "--decision",
+            "approve",
+            "--expires-in-seconds",
+            "60",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Plan {
+                command: PlanCommand::Approve {
+                    decision: PlanApprovalDecision::Approved,
+                    ..
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn plan_resume_requires_evidence_argument_and_valid_id() {
+        let cli = Cli::try_parse_from([
+            "shaka",
+            "plan",
+            "resume",
+            "00000000-0000-0000-0000-000000000001",
+            "--evidence-digest",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Plan {
+                command: PlanCommand::Resume { .. }
+            }
+        ));
+        assert!(parse_plan_id("not-a-uuid").is_err());
+    }
+
+    #[test]
+    fn plan_decision_parser_is_closed() {
+        assert_eq!(
+            parse_approval_decision("approve").unwrap(),
+            PlanApprovalDecision::Approved
+        );
+        assert_eq!(
+            parse_approval_decision("reject").unwrap(),
+            PlanApprovalDecision::Rejected
+        );
+        assert!(parse_approval_decision("execute").is_err());
     }
 }

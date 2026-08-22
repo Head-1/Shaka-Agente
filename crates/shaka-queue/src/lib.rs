@@ -9,10 +9,19 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use shaka_core::{OperatorId, Principal, Role, TaskEnvelope, TaskId, TenantId};
+use shaka_core::{OperatorId, PlanId, PlanStepId, Principal, Role, TaskEnvelope, TaskId, TenantId};
 use std::sync::Arc;
 use thiserror::Error;
 use uuid::Uuid;
+
+pub mod plan_store;
+
+pub use plan_store::{
+    PersistedPlan, PlanApprovalOutcome, PlanCheckpoint, PlanCheckpointPhase, PlanCheckpointStatus,
+    PlanClaimContext, PlanInspectionIssue, PlanInspectionReport, PlanInspectionStatus,
+    PlanResolutionDecision, PlanResolutionOutcome, PlanResumeReport, PlanResumeStatus,
+    PlanStoreTransition, PlanTaskReference, PlanTransitionEntity, PlanTransitionState,
+};
 
 #[derive(Debug, Error)]
 pub enum QueueError {
@@ -113,6 +122,14 @@ pub struct TaskRecord {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
+    /// Plano imutável associado à task, quando o modo planejado está ativo.
+    pub plan_id: Option<PlanId>,
+    /// Revisão do plano associado à task.
+    pub plan_revision: Option<u32>,
+    /// Digest SHA-256 da revisão do plano associado à task.
+    pub plan_digest: Option<String>,
+    /// Etapa atualmente locada pelo worker, quando a task é planejada.
+    pub plan_step_id: Option<PlanStepId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -124,7 +141,15 @@ pub enum SubmitOutcome {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum FinishOutcome {
     Succeeded,
-    Requeued { next_attempt_at: DateTime<Utc> },
+    /// A etapa planejada terminou e a task será reencaminhada para a próxima etapa.
+    PlanStepSucceeded {
+        next_attempt_at: DateTime<Utc>,
+    },
+    /// A compensação declarada terminou; a operação original não é reportada como sucesso.
+    Compensated,
+    Requeued {
+        next_attempt_at: DateTime<Utc>,
+    },
     Failed,
     Cancelled,
 }
@@ -266,6 +291,7 @@ impl QueueStore {
         Ok(store)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn migrate(&self) -> Result<(), QueueError> {
         self.connection.lock().execute_batch(
             "PRAGMA foreign_keys = ON;
@@ -304,6 +330,10 @@ impl QueueStore {
                  created_at TEXT NOT NULL,
                  updated_at TEXT NOT NULL,
                  completed_at TEXT,
+                 plan_id TEXT,
+                 plan_revision INTEGER,
+                 plan_digest TEXT,
+                 plan_step_id TEXT,
                  UNIQUE (tenant_id, idempotency_key)
              );
              CREATE INDEX IF NOT EXISTS idx_api_tasks_ready
@@ -361,7 +391,173 @@ impl QueueStore {
                  PRIMARY KEY(scope_key, window_start)
              );
              CREATE INDEX IF NOT EXISTS idx_api_rate_windows_start
-                 ON api_rate_windows (window_start);",
+                 ON api_rate_windows (window_start);
+
+             CREATE TABLE IF NOT EXISTS shaka_schema_versions (
+                 component TEXT PRIMARY KEY,
+                 version INTEGER NOT NULL
+             );
+             INSERT OR IGNORE INTO shaka_schema_versions (component, version)
+                 VALUES ('plan_store', 3);
+
+             CREATE TABLE IF NOT EXISTS plans (
+                 plan_id TEXT NOT NULL,
+                 tenant_id TEXT NOT NULL,
+                 task_id TEXT NOT NULL,
+                 revision INTEGER NOT NULL,
+                 plan_json TEXT NOT NULL,
+                 state TEXT NOT NULL,
+                 mode TEXT NOT NULL,
+                 risk TEXT NOT NULL,
+                 digest TEXT NOT NULL,
+                 created_at TEXT NOT NULL,
+                 updated_at TEXT NOT NULL,
+                 PRIMARY KEY (plan_id, revision)
+             );
+             CREATE INDEX IF NOT EXISTS idx_plans_tenant_updated
+                 ON plans (tenant_id, updated_at DESC);
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_plans_tenant_digest
+                 ON plans (tenant_id, plan_id, revision, digest);
+
+             CREATE TABLE IF NOT EXISTS plan_steps (
+                 plan_id TEXT NOT NULL,
+                 revision INTEGER NOT NULL,
+                 step_id TEXT NOT NULL,
+                 depends_json TEXT NOT NULL,
+                 action_json TEXT NOT NULL,
+                 preconditions_json TEXT NOT NULL,
+                 postconditions_json TEXT NOT NULL,
+                 state TEXT NOT NULL,
+                 attempts INTEGER NOT NULL DEFAULT 0,
+                 max_attempts INTEGER NOT NULL,
+                 compensation_step_id TEXT,
+                 PRIMARY KEY (plan_id, revision, step_id),
+                 FOREIGN KEY (plan_id, revision) REFERENCES plans(plan_id, revision)
+             );
+
+             CREATE TABLE IF NOT EXISTS plan_checkpoints (
+                 plan_id TEXT NOT NULL,
+                 revision INTEGER NOT NULL,
+                 sequence INTEGER NOT NULL,
+                 step_id TEXT,
+                 phase TEXT NOT NULL,
+                 status TEXT NOT NULL,
+                 state_digest TEXT,
+                 created_at TEXT NOT NULL,
+                 PRIMARY KEY (plan_id, revision, sequence),
+                 FOREIGN KEY (plan_id, revision) REFERENCES plans(plan_id, revision)
+             );
+
+             CREATE TABLE IF NOT EXISTS plan_approvals (
+                 approval_id TEXT PRIMARY KEY,
+                 plan_id TEXT NOT NULL,
+                 revision INTEGER NOT NULL,
+                 tenant_id TEXT NOT NULL,
+                 step_id TEXT,
+                 approval_json TEXT NOT NULL,
+                 revoked INTEGER NOT NULL DEFAULT 0,
+                 expires_at TEXT NOT NULL,
+                 created_at TEXT NOT NULL,
+                 idempotency_key TEXT,
+                 FOREIGN KEY (plan_id, revision) REFERENCES plans(plan_id, revision)
+             );
+             CREATE INDEX IF NOT EXISTS idx_plan_approvals_scope
+                 ON plan_approvals (plan_id, revision, step_id, revoked, expires_at);
+
+             CREATE TABLE IF NOT EXISTS plan_transitions (
+                 transition_id TEXT PRIMARY KEY,
+                 plan_id TEXT NOT NULL,
+                 revision INTEGER NOT NULL,
+                 sequence INTEGER NOT NULL,
+                 entity TEXT NOT NULL,
+                 entity_id TEXT,
+                 transition_json TEXT NOT NULL,
+                 idempotency_key TEXT NOT NULL,
+                 previous_hash TEXT,
+                 event_hash TEXT NOT NULL,
+                 created_at TEXT NOT NULL,
+                 UNIQUE (plan_id, revision, idempotency_key),
+                 UNIQUE (plan_id, revision, sequence),
+                 FOREIGN KEY (plan_id, revision) REFERENCES plans(plan_id, revision)
+             );
+             CREATE INDEX IF NOT EXISTS idx_plan_transitions_scope
+                 ON plan_transitions (plan_id, revision, sequence);
+
+             CREATE TABLE IF NOT EXISTS plan_compensations (
+                 plan_id TEXT NOT NULL,
+                 revision INTEGER NOT NULL,
+                 step_id TEXT NOT NULL,
+                 compensation_step_id TEXT NOT NULL,
+                 PRIMARY KEY (plan_id, revision, step_id),
+                 FOREIGN KEY (plan_id, revision) REFERENCES plans(plan_id, revision)
+             );",
+        )?;
+        self.ensure_api_task_plan_columns()?;
+        self.ensure_plan_approval_columns()?;
+        let schema_version = self.connection.lock().query_row(
+            "SELECT version FROM shaka_schema_versions WHERE component = 'plan_store'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if schema_version > 3 {
+            return Err(QueueError::InvalidInput(
+                "schema plan_store mais novo que o suportado".to_owned(),
+            ));
+        }
+        if schema_version < 3 {
+            self.connection.lock().execute(
+                "UPDATE shaka_schema_versions SET version = 3 WHERE component = 'plan_store'",
+                [],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn ensure_plan_approval_columns(&self) -> Result<(), QueueError> {
+        let connection = self.connection.lock();
+        let mut statement = connection.prepare("PRAGMA table_info(plan_approvals)")?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        if !columns.iter().any(|column| column == "idempotency_key") {
+            connection.execute(
+                "ALTER TABLE plan_approvals ADD COLUMN idempotency_key TEXT",
+                [],
+            )?;
+        }
+        connection.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_plan_approvals_idempotency
+             ON plan_approvals (plan_id, revision, idempotency_key)",
+            [],
+        )?;
+        Ok(())
+    }
+
+    fn ensure_api_task_plan_columns(&self) -> Result<(), QueueError> {
+        let connection = self.connection.lock();
+        let mut statement = connection.prepare("PRAGMA table_info(api_tasks)")?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        for (name, definition) in [
+            ("plan_id", "TEXT"),
+            ("plan_revision", "INTEGER"),
+            ("plan_digest", "TEXT"),
+            ("plan_step_id", "TEXT"),
+        ] {
+            if !columns.iter().any(|column| column == name) {
+                connection.execute(
+                    &format!("ALTER TABLE api_tasks ADD COLUMN {name} {definition}"),
+                    [],
+                )?;
+            }
+        }
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_api_tasks_plan_claim
+             ON api_tasks (plan_id, plan_revision, plan_step_id, status)",
+            [],
         )?;
         Ok(())
     }
@@ -826,6 +1022,31 @@ impl QueueStore {
         priority: i32,
         max_attempts: u32,
     ) -> Result<(SubmitOutcome, TaskRecord), QueueError> {
+        self.submit_task_governed_with_plan(
+            session_id,
+            principal,
+            idempotency_key,
+            request_fingerprint,
+            envelope,
+            priority,
+            max_attempts,
+            None,
+        )
+    }
+
+    /// Submete uma task governada e, quando informado, valida sua revisão de plano na admissão.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    pub fn submit_task_governed_with_plan(
+        &self,
+        session_id: Uuid,
+        principal: &Principal,
+        idempotency_key: &str,
+        request_fingerprint: &str,
+        envelope: &TaskEnvelope,
+        priority: i32,
+        max_attempts: u32,
+        plan_reference: Option<&PlanTaskReference>,
+    ) -> Result<(SubmitOutcome, TaskRecord), QueueError> {
         validate_key(idempotency_key, "idempotency_key", 256)?;
         validate_key(request_fingerprint, "request_fingerprint", 128)?;
         if max_attempts == 0 || max_attempts > 10 {
@@ -852,6 +1073,9 @@ impl QueueStore {
             .ok_or_else(|| QueueError::NotFound(format!("session {session_id}")))?;
         if session_operator != principal.operator_id.0 {
             return Err(QueueError::Forbidden);
+        }
+        if let Some(reference) = plan_reference {
+            plan_store::verify_plan_admission_tx(&transaction, principal, envelope, reference)?;
         }
         let limits = load_limits_tx(&transaction, &principal.tenant_id)?;
         let window_start = fixed_window_start(now, limits.window_seconds);
@@ -902,7 +1126,14 @@ impl QueueStore {
             .optional()?
         {
             let existing = load_task(&transaction, &existing_id, &principal.tenant_id)?;
-            if existing.request_fingerprint != request_fingerprint {
+            if existing.request_fingerprint != request_fingerprint
+                || !same_plan_reference(
+                    existing.plan_id.as_ref(),
+                    existing.plan_revision,
+                    existing.plan_digest.as_deref(),
+                    plan_reference,
+                )
+            {
                 return Err(QueueError::IdempotencyConflict);
             }
             transaction.commit()?;
@@ -951,6 +1182,9 @@ impl QueueStore {
                 "max_daily_cost_microunits".to_owned(),
             ));
         }
+        if let Some(reference) = plan_reference {
+            plan_store::record_plan_admission_tx(&transaction, principal, envelope, reference)?;
+        }
         let task_id = envelope.task_id.clone();
         let envelope_json = serde_json::to_string(envelope)?;
         transaction.execute(
@@ -958,9 +1192,9 @@ impl QueueStore {
              (task_id, session_id, tenant_id, idempotency_key, request_fingerprint,
               objective, envelope_json, status, priority, attempts, max_attempts,
               next_attempt_at, cancel_requested, lease_until, result_json, last_error,
-              created_at, updated_at, completed_at)
+              created_at, updated_at, completed_at, plan_id, plan_revision, plan_digest, plan_step_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'queued', ?8, 0, ?9, ?10, 0,
-                     NULL, NULL, NULL, ?10, ?10, NULL)",
+                     NULL, NULL, NULL, ?10, ?10, NULL, ?11, ?12, ?13, NULL)",
             params![
                 task_id.0.to_string(),
                 session_id.to_string(),
@@ -972,6 +1206,9 @@ impl QueueStore {
                 priority,
                 max_attempts,
                 now.to_rfc3339(),
+                plan_reference.map(|reference| reference.plan_id.0.to_string()),
+                plan_reference.map(|reference| reference.revision),
+                plan_reference.map(|reference| reference.digest.clone()),
             ],
         )?;
         let record = load_task(&transaction, &task_id.0.to_string(), &principal.tenant_id)?;
@@ -993,30 +1230,71 @@ impl QueueStore {
         now: DateTime<Utc>,
         lease_for: Duration,
     ) -> Result<Option<TaskRecord>, QueueError> {
+        self.claim_next_with_plan_context(now, lease_for, &PlanClaimContext::default())
+    }
+
+    /// Faz claim de uma task direta ou planejada usando facts host-side do worker.
+    pub fn claim_next_with_plan_context(
+        &self,
+        now: DateTime<Utc>,
+        lease_for: Duration,
+        plan_context: &PlanClaimContext,
+    ) -> Result<Option<TaskRecord>, QueueError> {
+        if lease_for <= Duration::zero() {
+            return Err(QueueError::InvalidInput(
+                "lease_for deve ser maior que zero".to_owned(),
+            ));
+        }
         let mut connection = self.connection.lock();
         let transaction = connection.transaction()?;
-        let candidate = transaction
-            .query_row(
-                "SELECT task_id, tenant_id FROM api_tasks
-                 WHERE status = 'queued' AND cancel_requested = 0 AND next_attempt_at <= ?1
-                 ORDER BY priority DESC, created_at ASC LIMIT 1",
-                params![now.to_rfc3339()],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-            )
-            .optional()?;
-        let Some((task_id, tenant_id)) = candidate else {
-            transaction.commit()?;
-            return Ok(None);
-        };
-        let lease_until = now + lease_for;
-        transaction.execute(
-            "UPDATE api_tasks SET status = 'running', attempts = attempts + 1,
-             lease_until = ?1, updated_at = ?2 WHERE task_id = ?3 AND status = 'queued'",
-            params![lease_until.to_rfc3339(), now.to_rfc3339(), task_id],
+        let mut statement = transaction.prepare(
+            "SELECT task_id, tenant_id FROM api_tasks
+             WHERE status = 'queued' AND cancel_requested = 0 AND next_attempt_at <= ?1
+             ORDER BY priority DESC, created_at ASC LIMIT 64",
         )?;
-        let task = load_task(&transaction, &task_id, &TenantId::new(tenant_id)?)?;
+        let candidates = statement
+            .query_map(params![now.to_rfc3339()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        let lease_until = now + lease_for;
+        for (task_id, tenant_id_raw) in candidates {
+            let tenant_id = TenantId::new(tenant_id_raw)?;
+            let task = load_task(&transaction, &task_id, &tenant_id)?;
+            let selected_step = if task.plan_id.is_some() {
+                let reference = plan_store::task_reference(&task)?;
+                match plan_store::prepare_planned_claim_tx(
+                    &transaction,
+                    &task,
+                    &reference,
+                    plan_context,
+                    now,
+                )? {
+                    Some(step_id) => Some(step_id),
+                    None => continue,
+                }
+            } else {
+                None
+            };
+            transaction.execute(
+                "UPDATE api_tasks SET status = 'running', attempts = attempts + 1,
+                 lease_until = ?1, plan_step_id = ?2, updated_at = ?3
+                 WHERE task_id = ?4 AND tenant_id = ?5 AND status = 'queued'",
+                params![
+                    lease_until.to_rfc3339(),
+                    selected_step.as_ref().map(|step_id| step_id.0.clone()),
+                    now.to_rfc3339(),
+                    task_id,
+                    tenant_id.0,
+                ],
+            )?;
+            let claimed = load_task(&transaction, &task_id, &tenant_id)?;
+            transaction.commit()?;
+            return Ok(Some(claimed));
+        }
         transaction.commit()?;
-        Ok(Some(task))
+        Ok(None)
     }
 
     pub fn request_cancel(
@@ -1031,6 +1309,9 @@ impl QueueStore {
         if task.status.is_terminal() {
             transaction.commit()?;
             return Ok(task);
+        }
+        if task.plan_id.is_some() {
+            plan_store::cancel_planned_task_tx(&transaction, &task, now)?;
         }
         let (status, completed_at): (&str, Option<String>) = match task.status {
             TaskStatus::Queued => (TaskStatus::Cancelled.as_str(), Some(now.to_rfc3339())),
@@ -1070,9 +1351,51 @@ impl QueueStore {
         base_delay: Duration,
         max_delay: Duration,
     ) -> Result<FinishOutcome, QueueError> {
+        self.finish_task_with_plan_context(
+            task_id,
+            tenant_id,
+            result,
+            error,
+            retryable,
+            now,
+            base_delay,
+            max_delay,
+            &PlanClaimContext::default(),
+        )
+    }
+
+    /// Finaliza uma task usando facts host-side para as pós-condições do plano.
+    #[allow(clippy::too_many_arguments)]
+    pub fn finish_task_with_plan_context(
+        &self,
+        task_id: &TaskId,
+        tenant_id: &TenantId,
+        result: Option<Value>,
+        error: Option<&str>,
+        retryable: bool,
+        now: DateTime<Utc>,
+        base_delay: Duration,
+        max_delay: Duration,
+        plan_context: &PlanClaimContext,
+    ) -> Result<FinishOutcome, QueueError> {
         let mut connection = self.connection.lock();
         let transaction = connection.transaction()?;
         let task = load_task(&transaction, &task_id.0.to_string(), tenant_id)?;
+        if task.plan_id.is_some() {
+            let outcome = plan_store::finish_planned_step_tx(
+                &transaction,
+                &task,
+                result,
+                error,
+                retryable,
+                now,
+                base_delay,
+                max_delay,
+                plan_context,
+            )?;
+            transaction.commit()?;
+            return Ok(outcome);
+        }
         if task.status.is_terminal() {
             transaction.commit()?;
             return Ok(match task.status {
@@ -1143,14 +1466,39 @@ impl QueueStore {
     }
 
     pub fn recover_expired_leases(&self, now: DateTime<Utc>) -> Result<u64, QueueError> {
-        let changed = self.connection.lock().execute(
-            "UPDATE api_tasks SET status = CASE WHEN cancel_requested = 1 THEN 'cancelled' ELSE 'queued' END,
-             lease_until = NULL, completed_at = CASE WHEN cancel_requested = 1 THEN ?1 ELSE completed_at END,
-             updated_at = ?1 WHERE status IN ('running', 'cancel_requested')
-             AND lease_until IS NOT NULL AND lease_until < ?1",
-            params![now.to_rfc3339()],
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction()?;
+        let mut statement = transaction.prepare(
+            "SELECT task_id, tenant_id FROM api_tasks
+             WHERE status IN ('running', 'cancel_requested')
+               AND lease_until IS NOT NULL AND lease_until < ?1
+             ORDER BY updated_at ASC LIMIT 128",
         )?;
-        Ok(u64::try_from(changed).unwrap_or(u64::MAX))
+        let candidates = statement
+            .query_map(params![now.to_rfc3339()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        let mut recovered = 0_u64;
+        for (task_id, tenant_id_raw) in candidates {
+            let tenant_id = TenantId::new(tenant_id_raw)?;
+            let task = load_task(&transaction, &task_id, &tenant_id)?;
+            if task.plan_id.is_some() {
+                plan_store::recover_expired_plan_lease_tx(&transaction, &task, now)?;
+            } else {
+                transaction.execute(
+                    "UPDATE api_tasks SET status = CASE WHEN cancel_requested = 1 THEN 'cancelled' ELSE 'queued' END,
+                     lease_until = NULL,
+                     completed_at = CASE WHEN cancel_requested = 1 THEN ?1 ELSE completed_at END,
+                     updated_at = ?1 WHERE task_id = ?2 AND tenant_id = ?3",
+                    params![now.to_rfc3339(), task_id, tenant_id.0],
+                )?;
+            }
+            recovered = recovered.saturating_add(1);
+        }
+        transaction.commit()?;
+        Ok(recovered)
     }
 
     pub fn queued_count(&self) -> Result<u64, QueueError> {
@@ -1288,6 +1636,23 @@ impl CircuitBreaker {
     #[must_use]
     pub fn snapshot(&self) -> CircuitSnapshot {
         self.snapshot.lock().clone()
+    }
+}
+
+fn same_plan_reference(
+    plan_id: Option<&PlanId>,
+    revision: Option<u32>,
+    digest: Option<&str>,
+    reference: Option<&PlanTaskReference>,
+) -> bool {
+    match (plan_id, revision, digest, reference) {
+        (None, None, None, None) => true,
+        (Some(plan_id), Some(revision), Some(digest), Some(reference)) => {
+            plan_id == &reference.plan_id
+                && revision == reference.revision
+                && digest == reference.digest
+        }
+        _ => false,
     }
 }
 
@@ -1445,7 +1810,8 @@ fn load_task(
             "SELECT session_id, idempotency_key, request_fingerprint, envelope_json,
                     status, priority, attempts, max_attempts, next_attempt_at,
                     cancel_requested, lease_until, result_json, last_error,
-                    created_at, updated_at, completed_at
+                    created_at, updated_at, completed_at,
+                    plan_id, plan_revision, plan_digest, plan_step_id
              FROM api_tasks WHERE task_id = ?1 AND tenant_id = ?2",
             params![task_id, tenant_id.0],
             |row| {
@@ -1466,6 +1832,10 @@ fn load_task(
                     row.get::<_, String>(13)?,
                     row.get::<_, String>(14)?,
                     row.get::<_, Option<String>>(15)?,
+                    row.get::<_, Option<String>>(16)?,
+                    row.get::<_, Option<i64>>(17)?,
+                    row.get::<_, Option<String>>(18)?,
+                    row.get::<_, Option<String>>(19)?,
                 ))
             },
         )
@@ -1475,6 +1845,32 @@ fn load_task(
         .map_err(|error| QueueError::InvalidInput(format!("task_id inválido: {error}")))?;
     let session_id = Uuid::parse_str(&row.0)
         .map_err(|error| QueueError::InvalidInput(format!("session_id inválido: {error}")))?;
+    let plan_id = row
+        .16
+        .as_deref()
+        .map(|value| {
+            Uuid::parse_str(value)
+                .map(PlanId)
+                .map_err(|error| QueueError::InvalidInput(format!("plan_id inválido: {error}")))
+        })
+        .transpose()?;
+    let plan_revision = row
+        .17
+        .map(|value| {
+            u32::try_from(value).map_err(|error| {
+                QueueError::InvalidInput(format!("plan_revision inválida: {error}"))
+            })
+        })
+        .transpose()?;
+    let plan_step_id = row.19.as_deref().map(PlanStepId::new).transpose()?;
+    if plan_id.is_some() != plan_revision.is_some()
+        || plan_id.is_some() != row.18.is_some()
+        || plan_step_id.is_some() && plan_id.is_none()
+    {
+        return Err(QueueError::InvalidInput(
+            "referência de plano parcialmente persistida".to_owned(),
+        ));
+    }
     Ok(TaskRecord {
         task_id: TaskId(task_id),
         session_id,
@@ -1494,6 +1890,10 @@ fn load_task(
         created_at: parse_datetime(&row.13)?,
         updated_at: parse_datetime(&row.14)?,
         completed_at: row.15.as_deref().map(parse_datetime).transpose()?,
+        plan_id,
+        plan_revision,
+        plan_digest: row.18,
+        plan_step_id,
     })
 }
 

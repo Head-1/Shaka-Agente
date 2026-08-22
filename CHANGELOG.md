@@ -4,6 +4,70 @@ Todas as mudanças relevantes do Shaka serão registradas neste arquivo. O forma
 
 ## [Unreleased]
 
+### v0.8.0 — Etapa 6: exposição HTTP/CLI e inspeção operacional de planos
+
+- Exposição dos planos por HTTP com criação, detalhe, validação preflight, aprovação, retomada, cancelamento e consulta de checkpoints.
+- Criação de planos restrita ao principal efetivo, tenant derivado da autenticação e modo `dry_run`; planos `live` continuam bloqueados na v0.8.0.
+- Relatório de inspeção somente leitura com status `valid`, `requires_approval` ou `invalid`, verificação de digest, cadeia de transições, estado reduzido, checkpoints e limites bounded.
+- Idempotência determinística de aprovações por `Idempotency-Key`, com conflito fail-closed para intenção divergente e replay estável mesmo quando a expiração é recalculada.
+- Comandos administrativos `shaka plan validate|show|approve|resume|cancel|verify|checkpoints`, com parsing fechado de UUID, decisão, evidência e demais argumentos.
+- Auditoria de todas as operações administrativas de plano sem persistir payloads, segredos ou conteúdo livre; respostas HTTP permanecem bounded e tenant-isolated.
+- Testes HTTP do ciclo de plano, aprovação/idempotência, submissão planejada, cancelamento e checkpoints; testes de parsing da CLI; workspace, Clippy e smoke de produção aprovados.
+
+### v0.8.0 — Etapa 5: aprovações, compensações e resolução de unknown
+
+- `approve_plan` com autorização RBAC, separação de funções, escopo por plano/etapa, digest/revisão vinculados e idempotência.
+- Decisão de rejeição terminal e revalidação de aprovação global em cada claim; expiração/revogação não liberam novas etapas.
+- Migração `plan_store` v3 com `idempotency_key` de aprovação e compatibilidade com bancos da Etapa 3.
+- Resolução humana tipada de `unknown` para `resume`, `compensate` ou `cancel`, com digest de evidência e checkpoints de governança.
+- Cancelamento planejado cooperativo, bloqueado enquanto houver fronteira ativa ou ambígua.
+- Compensações limitadas ao subgrafo estático declarado, com claim filtrado, checkpoint próprio e sem loop ou retry autônomo.
+- Falha de compensação retorna a `unknown`; nova tentativa exige nova resolução humana; plano compensado nunca reporta sucesso da operação original.
+- 20 testes do `shaka-queue`, workspace, Clippy e smoke de produção aprovados.
+
+### v0.8.0 — Etapa 4: integração QueueStore/worker do Plan Engine
+
+- Tasks governadas agora carregam referência imutável ao plano: `plan_id`, revisão, digest e etapa locada.
+- Migração idempotente do `api_tasks` para colunas opcionais de plano, com schema `plan_store` v2 e índice de claim planejado.
+- Admissão preflight fail-closed com isolamento por tenant, vínculo à task declarada e fingerprint de idempotência incluindo plano e digest.
+- Tasks planejadas live são bloqueadas até existir executor tipado; a Etapa 4 mantém o caminho seguro em `dry_run`.
+- Claim transacional e bounded com seleção determinística, dependências, condições, aprovação, capabilities, circuit breaker e checkpoint `before_step`.
+- Finalização transacional com pós-condições, progresso multi-etapa, retry bounded por etapa e estado terminal do plano.
+- Lease planejada expirada não sofre retry cego: plano e etapa são marcados como `unknown` com checkpoint de recuperação.
+- Worker expõe ao verificador somente facts host-side e o runtime fornece cópia das capabilities concedidas.
+- Testes de admissão, claim, conclusão, recuperação e compatibilidade direta; workspace, Clippy e smoke aprovados.
+
+### v0.8.0 — Etapa 3: persistência SQLite do Plan Engine
+
+- Migração SQLite idempotente e versionada para planos, etapas, checkpoints, aprovações, transições e compensações.
+- `plan_store` com persistência append-only por revisão, isolamento por tenant e validação de digest canônico.
+- Transições do reducer com sequência, idempotência e cadeia SHA-256 vinculada por `previous_hash`/`event_hash`.
+- Checkpoints monotônicos de preflight, execução e recuperação com digest de estado validado.
+- Retomada após reinício com reconciliação fail-closed; inconsistências e fronteiras ativas são convertidas em `unknown` sem retry automático.
+- Aprovações persistidas somente após revalidação de tenant, revisão, digest, escopo, expiração, revogação e separação de funções.
+- 6 testes unitários de persistência, integridade, isolamento e recovery; workspace completo e Clippy aprovados.
+
+### v0.8.0 — Etapa 2: verificador determinístico
+
+- `PlanVerifier` público no `shaka-core` com fases `preflight`, `step_ready` e `post_step`.
+- Relatório bounded com estados `valid`, `requires_approval` e `invalid`, códigos de violação estáveis e detalhes sem payload.
+- Verificação fail-closed de digest, estrutura, terminalidade, limites, referências, dependências e condições.
+- Avaliação allowlisted de tarefa, etapas, capabilities, circuito, orçamento, artefatos, idempotência e digest de estado.
+- Aprovação global ou por etapa revalidada com tenant, revisão, digest, papel, expiração e revogação.
+- Limite configurável de violações para evitar relatórios patológicos.
+- Testes de digest adulterado, dependências, condições, aprovação, pós-condições, contexto ausente, alvo inexistente e bounded report.
+
+### v0.8.0 — Etapa 1: contratos do Plan Engine governado
+
+- `PlanId`, `PlanStepId`, `PlanSpec` e `PlanStep` adicionados ao `shaka-core`.
+- Modos `dry_run`/`live`, riscos `read_only`/`mutation`/`external_effect`/`irreversible` e níveis de aprovação humana tipados.
+- Estados de plano e etapa com transições fail-closed, incluindo `unknown` para resultados ambíguos após crash ou timeout.
+- Condições allowlisted e ações tipadas, sem expressões arbitrárias ou autoridade implícita do modelo.
+- Digest SHA-256 canônico do plano e aprovação vinculada a tenant, revisão, etapa, digest, papel, expiração e revogação.
+- Separação de funções: o operador proponente não pode aprovar o próprio plano.
+- Verificação estrutural de IDs, dependências, ciclos, risco, aprovação, retries e referências de compensação.
+- Testes unitários para dry-run padrão, digest verificável, ciclo/dependência inválida, transições e aprovação segura.
+
 ### v0.7.0 — Etapa A: observabilidade governada
 
 - Fachada `Telemetry` com schema interno `shaka.observability` v0.7 e perfil `shaka.genai.v0.7`.

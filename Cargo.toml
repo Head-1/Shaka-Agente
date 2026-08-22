@@ -16,7 +16,7 @@ members = [
 [workspace.package]
 edition = "2024"
 license = "Apache-2.0"
-version = "0.7.0"
+version = "0.8.0"
 authors = ["Shaka Contributors"]
 rust-version = "1.85"
 
@@ -44,6 +44,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 url = { version = "2.5", features = ["serde"] }
 wasmtime = { version = "47.0.3", default-features = false, features = ["runtime", "component-model", "cranelift"] }
 wat = "1.227"
+uuid = { version = "1.11", features = ["serde", "v4"] }
 
 [profile.release]
 lto = "thin"
