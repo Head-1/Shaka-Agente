@@ -4,6 +4,16 @@ Todas as mudanças relevantes do Shaka serão registradas neste arquivo. O forma
 
 ## [Unreleased]
 
+### v0.8.0 — Etapa 6: exposição HTTP/CLI e inspeção operacional de planos
+
+- Exposição dos planos por HTTP com criação, detalhe, validação preflight, aprovação, retomada, cancelamento e consulta de checkpoints.
+- Criação de planos restrita ao principal efetivo, tenant derivado da autenticação e modo `dry_run`; planos `live` continuam bloqueados na v0.8.0.
+- Relatório de inspeção somente leitura com status `valid`, `requires_approval` ou `invalid`, verificação de digest, cadeia de transições, estado reduzido, checkpoints e limites bounded.
+- Idempotência determinística de aprovações por `Idempotency-Key`, com conflito fail-closed para intenção divergente e replay estável mesmo quando a expiração é recalculada.
+- Comandos administrativos `shaka plan validate|show|approve|resume|cancel|verify|checkpoints`, com parsing fechado de UUID, decisão, evidência e demais argumentos.
+- Auditoria de todas as operações administrativas de plano sem persistir payloads, segredos ou conteúdo livre; respostas HTTP permanecem bounded e tenant-isolated.
+- Testes HTTP do ciclo de plano, aprovação/idempotência, submissão planejada, cancelamento e checkpoints; testes de parsing da CLI; workspace, Clippy e smoke de produção aprovados.
+
 ### v0.8.0 — Etapa 5: aprovações, compensações e resolução de unknown
 
 - `approve_plan` com autorização RBAC, separação de funções, escopo por plano/etapa, digest/revisão vinculados e idempotência.

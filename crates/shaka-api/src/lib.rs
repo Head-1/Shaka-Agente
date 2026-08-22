@@ -18,14 +18,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use shaka_core::{
-    Action, ExecutionBudget, PlanId, PlanStepId, Principal, TaskEnvelope, TaskId, TenantId,
+    Action, ExecutionBudget, PlanApproval, PlanApprovalDecision, PlanId, PlanMode, PlanSpec,
+    PlanSpecInput, PlanStepId, PlanStepState, Principal, TaskEnvelope, TaskId, TenantId,
 };
 use shaka_observability::{AuditLogger, CorrelationContext, Telemetry};
 use shaka_orchestrator::{AgentRuntime, CancellationToken, OrchestratorError};
 use shaka_queue::{
     AuthSource, AuthenticatedPrincipal, CircuitBreaker, CircuitConfig, CircuitSnapshot,
-    FinishOutcome, PlanClaimContext, PlanTaskReference, QueueError, QueueStore, SessionRecord,
-    SubmitOutcome, TaskRecord, TaskStatus,
+    FinishOutcome, PlanApprovalOutcome, PlanCheckpoint, PlanClaimContext, PlanInspectionIssue,
+    PlanInspectionReport, PlanInspectionStatus, PlanResolutionDecision, PlanResolutionOutcome,
+    PlanTaskReference, QueueError, QueueStore, SessionRecord, SubmitOutcome, TaskRecord,
+    TaskStatus,
 };
 use std::{
     collections::{BTreeMap, HashMap},
@@ -281,6 +284,13 @@ impl ApiState {
             .route("/v1/sessions/{session_id}", get(get_session))
             .route("/v1/sessions/{session_id}/tasks", post(submit_task))
             .route("/v1/tasks/{task_id}", get(get_task).delete(cancel_task))
+            .route("/v1/plans", post(create_plan))
+            .route("/v1/plans/{plan_id}", get(get_plan))
+            .route("/v1/plans/{plan_id}/validate", post(validate_plan))
+            .route("/v1/plans/{plan_id}/approve", post(approve_plan))
+            .route("/v1/plans/{plan_id}/resume", post(resume_plan))
+            .route("/v1/plans/{plan_id}/cancel", post(cancel_plan))
+            .route("/v1/plans/{plan_id}/checkpoints", get(get_plan_checkpoints))
             .with_state(self.clone())
             .layer(middleware::from_fn_with_state(
                 self.clone(),
@@ -442,6 +452,74 @@ impl From<TaskRecord> for TaskResponse {
     }
 }
 
+#[derive(Debug, Deserialize)]
+pub struct PlanApprovalRequest {
+    pub step_id: Option<PlanStepId>,
+    pub decision: PlanApprovalDecision,
+    pub expires_in_seconds: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PlanResumeRequest {
+    pub evidence_digest: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PlanCreateRequest {
+    #[serde(flatten)]
+    pub input: PlanSpecInput,
+}
+
+#[derive(Debug, Serialize)]
+struct PlanDetailResponse {
+    plan: PlanSpec,
+    step_states: BTreeMap<PlanStepId, PlanStepState>,
+    integrity: PlanInspectionStatus,
+    integrity_issue: Option<PlanInspectionIssue>,
+    checkpoints_checked: u64,
+    transitions_checked: u64,
+    task: Option<TaskResponse>,
+}
+
+#[derive(Debug, Serialize)]
+struct PlanApprovalResponse {
+    outcome: PlanApprovalOutcome,
+    plan: PlanDetailResponse,
+}
+
+#[derive(Debug, Serialize)]
+struct PlanResolutionResponse {
+    outcome: PlanResolutionOutcome,
+    plan: PlanDetailResponse,
+}
+
+#[derive(Debug, Serialize)]
+struct PlanCancelResponse {
+    task: TaskResponse,
+    plan: PlanDetailResponse,
+}
+
+#[derive(Debug, Serialize)]
+struct PlanCheckpointResponse {
+    sequence: u64,
+    step_id: Option<PlanStepId>,
+    phase: shaka_queue::PlanCheckpointPhase,
+    status: shaka_queue::PlanCheckpointStatus,
+    created_at: DateTime<Utc>,
+}
+
+impl From<PlanCheckpoint> for PlanCheckpointResponse {
+    fn from(checkpoint: PlanCheckpoint) -> Self {
+        Self {
+            sequence: checkpoint.sequence,
+            step_id: checkpoint.step_id,
+            phase: checkpoint.phase,
+            status: checkpoint.status,
+            created_at: checkpoint.created_at,
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct HealthResponse {
     status: &'static str,
@@ -462,6 +540,315 @@ async fn healthz(State(state): State<ApiState>) -> Result<Json<HealthResponse>, 
         queued_tasks,
         circuit: state.breaker.snapshot(),
     }))
+}
+
+fn plan_detail(
+    state: &ApiState,
+    inspection: PlanInspectionReport,
+) -> Result<PlanDetailResponse, ApiError> {
+    let task = match state
+        .queue
+        .get_task(&inspection.plan.task_id, &inspection.plan.tenant_id)
+    {
+        Ok(task) => Some(task.into()),
+        Err(QueueError::NotFound(_)) => None,
+        Err(error) => return Err(error.into()),
+    };
+    Ok(PlanDetailResponse {
+        plan: inspection.plan,
+        step_states: inspection.step_states,
+        integrity: inspection.status,
+        integrity_issue: inspection.issue,
+        checkpoints_checked: inspection.checkpoints_checked,
+        transitions_checked: inspection.transitions_checked,
+        task,
+    })
+}
+
+fn idempotency_key(headers: &HeaderMap) -> Result<&str, ApiError> {
+    headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| ApiError::BadRequest("header Idempotency-Key é obrigatório".to_owned()))
+}
+
+async fn create_plan(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<PlanCreateRequest>,
+) -> Result<(StatusCode, Json<PlanSpec>), ApiError> {
+    let span = correlation_span(&state, "plan.create", None, None);
+    let _entered = span.enter();
+    let auth = authorize(&headers, &state)?;
+    let input = request.input;
+    if input.tenant_id != auth.principal.tenant_id
+        || input.operator_id != auth.principal.operator_id
+    {
+        return Err(ApiError::Forbidden);
+    }
+    if input.mode != PlanMode::DryRun {
+        return Err(ApiError::BadRequest(
+            "planos live permanecem bloqueados na v0.8.0".to_owned(),
+        ));
+    }
+    let plan = PlanSpec::new(input).map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    let plan_id = plan.plan_id.clone();
+    let step_count = plan.steps.len();
+    let risk = format!("{:?}", plan.risk);
+    let persisted = state.queue.save_plan(&plan)?;
+    span.record("outcome", "created");
+    span.record("risk_class", risk);
+    span.record("step_count", step_count as u64);
+    span.record("mode", "dry_run");
+    audit_principal(
+        &state,
+        &auth.principal,
+        None,
+        "plan.create",
+        "success",
+        BTreeMap::from([(String::from("plan_id"), plan_id.0.to_string())]),
+    );
+    Ok((StatusCode::CREATED, Json(persisted.plan)))
+}
+
+async fn get_plan(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(plan_id): Path<Uuid>,
+) -> Result<Json<PlanDetailResponse>, ApiError> {
+    let plan_id = PlanId(plan_id);
+    let span = correlation_span(&state, "plan.show", None, None);
+    let _entered = span.enter();
+    let auth = authorize(&headers, &state)?;
+    let inspection = state
+        .queue
+        .inspect_plan(&auth.principal.tenant_id, &plan_id)?;
+    audit_principal(
+        &state,
+        &auth.principal,
+        None,
+        "plan.show",
+        "success",
+        BTreeMap::from([(String::from("plan_id"), plan_id.0.to_string())]),
+    );
+    Ok(Json(plan_detail(&state, inspection)?))
+}
+
+async fn validate_plan(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(plan_id): Path<Uuid>,
+) -> Result<Json<shaka_core::PlanVerificationReport>, ApiError> {
+    let plan_id = PlanId(plan_id);
+    let span = correlation_span(&state, "plan.validate", None, None);
+    let _entered = span.enter();
+    let auth = authorize(&headers, &state)?;
+    let report = state
+        .queue
+        .validate_plan(&auth.principal.tenant_id, &plan_id)?;
+    span.record(
+        "outcome",
+        if report.is_executable() {
+            "valid"
+        } else {
+            "blocked"
+        },
+    );
+    audit_principal(
+        &state,
+        &auth.principal,
+        None,
+        "plan.validate",
+        if report.is_executable() {
+            "success"
+        } else {
+            "blocked"
+        },
+        BTreeMap::from([(String::from("plan_id"), plan_id.0.to_string())]),
+    );
+    Ok(Json(report))
+}
+
+async fn approve_plan(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(plan_id): Path<Uuid>,
+    Json(request): Json<PlanApprovalRequest>,
+) -> Result<Json<PlanApprovalResponse>, ApiError> {
+    let plan_id = PlanId(plan_id);
+    let span = correlation_span(&state, "plan.approve", None, None);
+    let _entered = span.enter();
+    let auth = authorize(&headers, &state)?;
+    let idempotency_key = idempotency_key(&headers)?;
+    let persisted = state.queue.load_plan(&plan_id, &auth.principal.tenant_id)?;
+    let expires_in = request.expires_in_seconds.unwrap_or(3600);
+    if !(1..=604_800).contains(&expires_in) {
+        return Err(ApiError::BadRequest(
+            "expires_in_seconds deve estar entre 1 e 604800".to_owned(),
+        ));
+    }
+    let required = match &request.step_id {
+        Some(step_id) => persisted
+            .plan
+            .steps
+            .iter()
+            .find(|step| &step.step_id == step_id)
+            .map(|step| step.approval.max(step.risk.minimum_approval()))
+            .ok_or(ApiError::NotFound)?,
+        None => persisted.plan.required_approval(),
+    };
+    let approval = PlanApproval {
+        approval_id: QueueStore::approval_id_for_idempotency(
+            &plan_id,
+            persisted.plan.revision,
+            idempotency_key,
+        ),
+        plan_id: plan_id.clone(),
+        plan_digest: persisted.plan.digest.clone(),
+        revision: persisted.plan.revision,
+        tenant_id: auth.principal.tenant_id.clone(),
+        approver: auth.principal.operator_id.clone(),
+        approver_role: auth.principal.role.clone(),
+        step_id: request.step_id,
+        required,
+        decision: request.decision,
+        expires_at: Utc::now() + Duration::seconds(expires_in),
+        revoked: false,
+    };
+    let outcome = state
+        .queue
+        .approve_plan(&auth.principal, &approval, idempotency_key)?;
+    let inspection = state
+        .queue
+        .inspect_plan(&auth.principal.tenant_id, &plan_id)?;
+    span.record("outcome", format!("{outcome:?}"));
+    audit_principal(
+        &state,
+        &auth.principal,
+        None,
+        "plan.approve",
+        "success",
+        BTreeMap::from([
+            (String::from("plan_id"), plan_id.0.to_string()),
+            (String::from("decision"), format!("{:?}", approval.decision)),
+        ]),
+    );
+    Ok(Json(PlanApprovalResponse {
+        outcome,
+        plan: plan_detail(&state, inspection)?,
+    }))
+}
+
+async fn resume_plan(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(plan_id): Path<Uuid>,
+    Json(request): Json<PlanResumeRequest>,
+) -> Result<Json<PlanResolutionResponse>, ApiError> {
+    let plan_id = PlanId(plan_id);
+    let span = correlation_span(&state, "plan.resume", None, None);
+    let _entered = span.enter();
+    let auth = authorize(&headers, &state)?;
+    let key = idempotency_key(&headers)?;
+    let outcome = state.queue.resolve_plan_unknown(
+        &auth.principal,
+        &plan_id,
+        PlanResolutionDecision::Resume,
+        key,
+        Some(&request.evidence_digest),
+    )?;
+    let inspection = state
+        .queue
+        .inspect_plan(&auth.principal.tenant_id, &plan_id)?;
+    span.record("outcome", format!("{outcome:?}"));
+    audit_principal(
+        &state,
+        &auth.principal,
+        None,
+        "plan.resume",
+        "success",
+        BTreeMap::from([(String::from("plan_id"), plan_id.0.to_string())]),
+    );
+    Ok(Json(PlanResolutionResponse {
+        outcome,
+        plan: plan_detail(&state, inspection)?,
+    }))
+}
+
+async fn cancel_plan(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(plan_id): Path<Uuid>,
+) -> Result<Json<PlanCancelResponse>, ApiError> {
+    let plan_id = PlanId(plan_id);
+    let span = correlation_span(&state, "plan.cancel", None, None);
+    let _entered = span.enter();
+    let auth = authorize(&headers, &state)?;
+    let key = idempotency_key(&headers)?;
+    let persisted = state.queue.load_plan(&plan_id, &auth.principal.tenant_id)?;
+    let task = if persisted.plan.state == shaka_core::PlanState::Unknown {
+        state.queue.resolve_plan_unknown(
+            &auth.principal,
+            &plan_id,
+            PlanResolutionDecision::Cancel,
+            key,
+            None,
+        )?;
+        state
+            .queue
+            .get_task(&persisted.plan.task_id, &auth.principal.tenant_id)?
+    } else {
+        state
+            .queue
+            .request_cancel(&persisted.plan.task_id, &auth.principal.tenant_id)?
+    };
+    let inspection = state
+        .queue
+        .inspect_plan(&auth.principal.tenant_id, &plan_id)?;
+    state.cancel_running(&task.task_id);
+    span.record("outcome", "success");
+    audit_principal(
+        &state,
+        &auth.principal,
+        Some(task.task_id.clone()),
+        "plan.cancel",
+        "success",
+        BTreeMap::from([(String::from("plan_id"), plan_id.0.to_string())]),
+    );
+    Ok(Json(PlanCancelResponse {
+        task: task.into(),
+        plan: plan_detail(&state, inspection)?,
+    }))
+}
+
+async fn get_plan_checkpoints(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(plan_id): Path<Uuid>,
+) -> Result<Json<Vec<PlanCheckpointResponse>>, ApiError> {
+    let plan_id = PlanId(plan_id);
+    let span = correlation_span(&state, "plan.checkpoints", None, None);
+    let _entered = span.enter();
+    let auth = authorize(&headers, &state)?;
+    let checkpoints = state
+        .queue
+        .list_plan_checkpoints(&auth.principal.tenant_id, &plan_id)?;
+    span.record("outcome", "success");
+    audit_principal(
+        &state,
+        &auth.principal,
+        None,
+        "plan.checkpoints",
+        "success",
+        BTreeMap::from([(String::from("plan_id"), plan_id.0.to_string())]),
+    );
+    Ok(Json(
+        checkpoints
+            .into_iter()
+            .map(PlanCheckpointResponse::from)
+            .collect(),
+    ))
 }
 
 async fn create_session(
@@ -1269,6 +1656,9 @@ async fn shutdown_signal() {
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use shaka_core::{
+        ExecutionBudget, PlanAction, PlanApprovalRequirement, PlanRisk, PlanSpecInput, PlanStep,
+    };
     use shaka_memory::MemoryStore;
     use shaka_orchestrator::{AgentModel, EchoTool, LocalModel, ToolRegistry};
     use shaka_orchestrator::{ModelRequest, ModelResponse};
@@ -1475,6 +1865,241 @@ mod tests {
                 estimated_cost_microunits: 0,
             })
         }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn plan_routes_enforce_tenant_mode_and_human_approval() {
+        let state = state();
+        let plan_id = PlanId::new();
+        let task_id = TaskId::new();
+        let input = PlanSpecInput {
+            plan_id,
+            task_id,
+            tenant_id: state.principal.tenant_id.clone(),
+            operator_id: state.principal.operator_id.clone(),
+            mode: PlanMode::DryRun,
+            risk: PlanRisk::Mutation,
+            approval: PlanApprovalRequirement::Reviewer,
+            budget: ExecutionBudget::default(),
+            steps: vec![PlanStep {
+                step_id: PlanStepId::new("write-preview").unwrap(),
+                depends_on: Vec::new(),
+                action: PlanAction::Mutation {
+                    operation: "write-preview".to_owned(),
+                },
+                preconditions: Vec::new(),
+                postconditions: Vec::new(),
+                risk: PlanRisk::Mutation,
+                approval: PlanApprovalRequirement::Reviewer,
+                max_attempts: 1,
+                compensation_step_id: None,
+            }],
+        };
+        let body = serde_json::to_vec(&input).unwrap();
+        let response = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/plans")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = axum::body::to_bytes(response.into_body(), 1_048_576)
+            .await
+            .unwrap();
+        let plan: PlanSpec = serde_json::from_slice(&body).unwrap();
+        assert_eq!(plan.plan_id, input.plan_id);
+        assert_eq!(plan.mode, PlanMode::DryRun);
+
+        let response = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/plans/{}/validate", plan.plan_id.0))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1_048_576)
+            .await
+            .unwrap();
+        let validation: shaka_core::PlanVerificationReport = serde_json::from_slice(&body).unwrap();
+        assert!(validation.is_valid());
+
+        let reviewer = shaka_core::OperatorId::new("reviewer-api").unwrap();
+        state
+            .queue
+            .create_user(
+                &reviewer,
+                &state.principal.tenant_id,
+                &shaka_core::Role::Reviewer,
+            )
+            .unwrap();
+        let token = state.queue.issue_token(&reviewer, None).unwrap();
+        let response = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/plans/{}/approve", plan.plan_id.0))
+                    .header("authorization", format!("Bearer {}", token.token))
+                    .header("idempotency-key", "api-approval-1")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(r#"{"decision":"approved"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1_048_576)
+            .await
+            .unwrap();
+        let approval: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(approval["outcome"], "Approved");
+        assert_eq!(approval["plan"]["plan"]["state"], "approved");
+
+        let response = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/plans/{}/approve", plan.plan_id.0))
+                    .header("authorization", format!("Bearer {}", token.token))
+                    .header("idempotency-key", "api-approval-1")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(r#"{"decision":"approved"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1_048_576)
+            .await
+            .unwrap();
+        let replay: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(replay["outcome"], "Existing");
+
+        let session = state
+            .queue
+            .create_session(state.principal.clone(), Value::Null)
+            .unwrap();
+        let mut envelope = TaskEnvelope::new(
+            state.principal.tenant_id.clone(),
+            state.principal.operator_id.clone(),
+            "planned api task",
+        )
+        .unwrap();
+        envelope.task_id = plan.task_id.clone();
+        let reference =
+            PlanTaskReference::new(plan.plan_id.clone(), plan.revision, plan.digest.clone())
+                .unwrap();
+        state
+            .queue
+            .submit_task_governed_with_plan(
+                session.session_id,
+                &state.principal,
+                "api-plan-task-1",
+                "api-plan-task-fingerprint-1",
+                &envelope,
+                1,
+                1,
+                Some(&reference),
+            )
+            .unwrap();
+        let response = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri(format!("/v1/plans/{}", plan.plan_id.0))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/plans/{}/cancel", plan.plan_id.0))
+                    .header("idempotency-key", "api-cancel-1")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1_048_576)
+            .await
+            .unwrap();
+        let cancelled: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(cancelled["plan"]["plan"]["state"], "cancelled");
+
+        let response = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri(format!("/v1/plans/{}/checkpoints", plan.plan_id.0))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1_048_576)
+            .await
+            .unwrap();
+        let checkpoints: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            checkpoints
+                .as_array()
+                .is_some_and(|items| !items.is_empty())
+        );
+
+        let mut forged = input.clone();
+        forged.tenant_id = TenantId::new("other-tenant").unwrap();
+        let response = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/plans")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(serde_json::to_vec(&forged).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        forged.tenant_id = state.principal.tenant_id.clone();
+        forged.mode = PlanMode::Live;
+        let response = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/plans")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(serde_json::to_vec(&forged).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

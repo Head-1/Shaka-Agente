@@ -7,7 +7,8 @@ use sha2::{Digest, Sha256};
 use shaka_core::{
     Capability, ExecutionBudget, PlanApproval, PlanApprovalDecision, PlanId, PlanMode, PlanSpec,
     PlanState, PlanStep, PlanStepId, PlanStepState, PlanTaskState, PlanVerificationContext,
-    PlanVerificationPhase, PlanVerifier, Principal, Role, TaskEnvelope, TenantId,
+    PlanVerificationPhase, PlanVerificationReport, PlanVerifier, Principal, Role, TaskEnvelope,
+    TenantId,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
@@ -285,6 +286,34 @@ pub enum PlanResumeStatus {
     Inconsistent,
 }
 
+/// Resultado bounded de uma inspeção somente leitura do reducer.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanInspectionStatus {
+    Stable,
+    Inconsistent,
+}
+
+/// Classe estável de inconsistência encontrada durante uma inspeção.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanInspectionIssue {
+    TransitionChainInvalid,
+    ReducerDiverged,
+    CheckpointSequenceInvalid,
+}
+
+/// Relatório bounded de inspeção sem efeitos colaterais.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlanInspectionReport {
+    pub plan: PlanSpec,
+    pub step_states: BTreeMap<PlanStepId, PlanStepState>,
+    pub status: PlanInspectionStatus,
+    pub issue: Option<PlanInspectionIssue>,
+    pub checkpoints_checked: u64,
+    pub transitions_checked: u64,
+}
+
 /// Relatório bounded da retomada de um plano.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PlanResumeReport {
@@ -329,6 +358,118 @@ pub enum PlanResolutionOutcome {
 }
 
 impl QueueStore {
+    /// Inspeciona o reducer sem aplicar recovery ou alterar o estado persistido.
+    pub fn inspect_plan(
+        &self,
+        tenant_id: &TenantId,
+        plan_id: &PlanId,
+    ) -> Result<PlanInspectionReport, QueueError> {
+        let persisted = self.load_plan(plan_id, tenant_id)?;
+        let (transitions, checkpoints, db_plan_state, db_step_states) =
+            self.load_reducer_rows(plan_id, persisted.plan.revision, tenant_id)?;
+        let mut computed_plan_state = PlanState::Draft;
+        let mut computed_steps: BTreeMap<PlanStepId, PlanStepState> = persisted
+            .plan
+            .steps
+            .iter()
+            .map(|step| (step.step_id.clone(), PlanStepState::Pending))
+            .collect();
+        let mut previous_hash = None;
+        let mut expected_sequence = 1_u64;
+        let mut status = PlanInspectionStatus::Stable;
+        let mut issue = None;
+        for transition in &transitions {
+            if transition.sequence != expected_sequence
+                || transition.previous_hash != previous_hash
+                || transition.verify_hash().is_err()
+            {
+                status = PlanInspectionStatus::Inconsistent;
+                issue = Some(PlanInspectionIssue::TransitionChainInvalid);
+                break;
+            }
+            if apply_transition_state(&mut computed_plan_state, &mut computed_steps, transition)
+                .is_err()
+            {
+                status = PlanInspectionStatus::Inconsistent;
+                issue = Some(PlanInspectionIssue::ReducerDiverged);
+                break;
+            }
+            previous_hash = Some(transition.event_hash.clone());
+            expected_sequence = expected_sequence.saturating_add(1);
+        }
+        if status == PlanInspectionStatus::Stable
+            && (computed_plan_state != db_plan_state || computed_steps != db_step_states)
+        {
+            status = PlanInspectionStatus::Inconsistent;
+            issue = Some(PlanInspectionIssue::ReducerDiverged);
+        }
+        if status == PlanInspectionStatus::Stable && !check_checkpoint_sequence(&checkpoints) {
+            status = PlanInspectionStatus::Inconsistent;
+            issue = Some(PlanInspectionIssue::CheckpointSequenceInvalid);
+        }
+        let mut plan = persisted.plan;
+        plan.state = db_plan_state;
+        Ok(PlanInspectionReport {
+            plan,
+            step_states: db_step_states,
+            status,
+            issue,
+            checkpoints_checked: checkpoints.len() as u64,
+            transitions_checked: transitions.len() as u64,
+        })
+    }
+
+    /// Executa somente o preflight determinístico, sem alterar o plano.
+    pub fn validate_plan(
+        &self,
+        tenant_id: &TenantId,
+        plan_id: &PlanId,
+    ) -> Result<PlanVerificationReport, QueueError> {
+        let persisted = self.load_plan(plan_id, tenant_id)?;
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction()?;
+        let approvals = load_approvals_tx(&transaction, &persisted.plan)?;
+        transaction.commit()?;
+        let mut context = PlanVerificationContext::new(PlanVerificationPhase::Preflight);
+        context.approvals = approvals;
+        context.now = Utc::now();
+        Ok(PlanVerifier::default().verify(&persisted.plan, &context))
+    }
+
+    /// Lista checkpoints de uma revisão sem executar recovery.
+    pub fn list_plan_checkpoints(
+        &self,
+        tenant_id: &TenantId,
+        plan_id: &PlanId,
+    ) -> Result<Vec<PlanCheckpoint>, QueueError> {
+        let persisted = self.load_plan(plan_id, tenant_id)?;
+        let (_, checkpoints, _, _) =
+            self.load_reducer_rows(plan_id, persisted.plan.revision, tenant_id)?;
+        if !check_checkpoint_sequence(&checkpoints) {
+            return Err(QueueError::InvalidInput(
+                "sequência de checkpoints inválida".to_owned(),
+            ));
+        }
+        Ok(checkpoints)
+    }
+
+    /// Deriva um UUID estável para uma aprovação a partir da chave de idempotência.
+    #[must_use]
+    pub fn approval_id_for_idempotency(
+        plan_id: &PlanId,
+        revision: u32,
+        idempotency_key: &str,
+    ) -> Uuid {
+        let material = format!(
+            "shaka:plan:approval:{}:{revision}:{idempotency_key}",
+            plan_id.0
+        );
+        let digest = Sha256::digest(material.as_bytes());
+        let mut bytes = [0_u8; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        Uuid::from_bytes(bytes)
+    }
+
     /// Persiste uma revisão de plano e suas etapas de forma append-only e idempotente.
     pub fn save_plan(&self, plan: &PlanSpec) -> Result<PersistedPlan, QueueError> {
         plan.validate_structure()?;
@@ -686,7 +827,8 @@ impl QueueStore {
             )
             .optional()?;
         if let Some(existing_json) = existing {
-            if existing_json == approval_json {
+            let existing_approval: PlanApproval = serde_json::from_str(&existing_json)?;
+            if same_approval_intent(&existing_approval, approval) {
                 transaction.commit()?;
                 return Ok(PlanApprovalOutcome::Existing);
             }
@@ -1403,6 +1545,20 @@ impl QueueStore {
         let (_, _, _, states) = self.load_reducer_rows(plan_id, revision, tenant_id)?;
         Ok((persisted.plan, states))
     }
+}
+
+fn same_approval_intent(left: &PlanApproval, right: &PlanApproval) -> bool {
+    left.approval_id == right.approval_id
+        && left.plan_id == right.plan_id
+        && left.plan_digest == right.plan_digest
+        && left.revision == right.revision
+        && left.tenant_id == right.tenant_id
+        && left.approver == right.approver
+        && left.approver_role == right.approver_role
+        && left.step_id == right.step_id
+        && left.required == right.required
+        && left.decision == right.decision
+        && left.revoked == right.revoked
 }
 
 fn validate_approval_shape(

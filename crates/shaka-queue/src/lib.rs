@@ -18,9 +18,9 @@ pub mod plan_store;
 
 pub use plan_store::{
     PersistedPlan, PlanApprovalOutcome, PlanCheckpoint, PlanCheckpointPhase, PlanCheckpointStatus,
-    PlanClaimContext, PlanResolutionDecision, PlanResolutionOutcome, PlanResumeReport,
-    PlanResumeStatus, PlanStoreTransition, PlanTaskReference, PlanTransitionEntity,
-    PlanTransitionState,
+    PlanClaimContext, PlanInspectionIssue, PlanInspectionReport, PlanInspectionStatus,
+    PlanResolutionDecision, PlanResolutionOutcome, PlanResumeReport, PlanResumeStatus,
+    PlanStoreTransition, PlanTaskReference, PlanTransitionEntity, PlanTransitionState,
 };
 
 #[derive(Debug, Error)]

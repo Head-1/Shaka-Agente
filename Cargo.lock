@@ -2437,6 +2437,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "uuid",
  "wat",
 ]
 
