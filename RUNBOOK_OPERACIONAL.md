@@ -1,10 +1,10 @@
-# Runbook Operacional do Shaka v0.8.0
+# Runbook Operacional do Shaka v0.8.2
 
 ## 1. Escopo e modelo de segurança
 
-Este runbook descreve a operação controlada do **Shaka v0.8.0**, release publicada com binário Linux, SBOM CycloneDX, checksums e imagem privada no GHCR. Ele foi escrito para que um operador consiga instalar, verificar, executar, diagnosticar e recuperar o agente sem precisar conhecer a implementação interna em Rust.
+Este runbook descreve a operação controlada do **Shaka v0.8.2**, release publicada com binário Linux, SBOM CycloneDX, checksums e imagem no GHCR. Ele foi escrito para que um operador consiga instalar, verificar, executar, diagnosticar e recuperar o agente sem precisar conhecer a implementação interna em Rust.
 
-A operação padrão é local e segura. A API vincula-se a `127.0.0.1`, o provedor padrão é local, tarefas começam em `dry-run` e nenhuma ação externa deve ser liberada por padrão. Os planos `live` permanecem bloqueados na v0.8.0. Mensageria externa, pesquisa autônoma na web, autopromoção de skills e controle irrestrito de subagentes não fazem parte desta release.
+A operação padrão é local e segura. A API vincula-se a `127.0.0.1`, o provedor padrão é local, tarefas começam em `dry-run` e nenhuma ação externa deve ser liberada por padrão. Os planos `live` permanecem bloqueados na v0.8.2. Mensageria externa, pesquisa autônoma na web, autopromoção de skills e controle irrestrito de subagentes não fazem parte desta release.
 
 > **Princípio operacional:** diante de ambiguidade, falha ou inconsistência, o Shaka deve bloquear a transição, preservar evidências e exigir decisão humana.
 
@@ -12,7 +12,7 @@ A release não deve ser exposta diretamente à internet. Uma implantação públ
 
 ## 2. Artefatos e pré-condições
 
-Os artefatos oficiais estão na [GitHub Release v0.8.0](https://github.com/Head-1/Shaka-Agente/releases/tag/v0.8.0). Os downloads recomendados são `shaka-linux-x86_64`, `shaka-v0.8.0-linux-x86_64.tar.gz`, `shaka-v0.8.0-linux-x86_64.zip`, `shaka.cdx.json` e `SHA256SUMS`.
+Os artefatos oficiais estão na [GitHub Release v0.8.2](https://github.com/Head-1/Shaka-Agente/releases/tag/v0.8.2). Os downloads recomendados são `shaka-linux-x86_64`, `shaka-v0.8.2-linux-x86_64.tar.gz`, `shaka-v0.8.2-linux-x86_64.zip`, `shaka.cdx.json` e `SHA256SUMS`.
 
 Antes de instalar, valide os hashes publicados. O manifesto referencia os arquivos dentro de `dist/`:
 
@@ -25,8 +25,8 @@ sha256sum -c SHA256SUMS
 O arquivo `SHA256SUMS` deve responder `OK` para o binário e para o SBOM. Os pacotes compactados devem passar nos testes de integridade:
 
 ```bash
-tar -tzf shaka-v0.8.0-linux-x86_64.tar.gz >/dev/null
-unzip -t shaka-v0.8.0-linux-x86_64.zip
+tar -tzf shaka-v0.8.2-linux-x86_64.tar.gz >/dev/null
+unzip -t shaka-v0.8.2-linux-x86_64.zip
 ```
 
 Dê permissão de execução somente ao binário baixado e mantenha os arquivos de dados separados do código:
@@ -36,7 +36,7 @@ chmod 0555 ./shaka-linux-x86_64
 ./shaka-linux-x86_64 --version
 ```
 
-A saída esperada para a release é `shaka 0.8.0`. Se a execução for feita a partir do código-fonte, use Rust/Cargo 1.98.0 ou toolchain compatível com edition 2024:
+A saída esperada para a release é `shaka 0.8.2`. Se a execução for feita a partir do código-fonte, use Rust/Cargo 1.98.0 ou toolchain compatível com edition 2024:
 
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
@@ -107,7 +107,7 @@ O health check pode ser consultado com:
 curl --fail --silent http://127.0.0.1:8080/healthz
 ```
 
-A resposta esperada contém `status: "ok"`, `version: "0.8.0"` e circuito `closed`. Os endpoints principais são:
+A resposta esperada contém `status: "ok"`, `version: "0.8.2"` e circuito `closed`. A lista completa dos endpoints, incluindo o Plan Engine, está em [`docs/API_PUBLICA.md`](docs/API_PUBLICA.md). Os endpoints principais são:
 
 | Endpoint | Finalidade |
 |---|---|
@@ -137,14 +137,14 @@ O mesmo `Idempotency-Key` e o mesmo payload devem retornar a tarefa já existent
 A imagem GHCR usa `shaka serve` como comando padrão, expõe a porta 8080 e possui `doctor` como healthcheck. Um host com Docker pode executar a imagem privada depois de autenticar no GHCR:
 
 ```bash
-docker pull ghcr.io/head-1/shaka-agente:v0.8.0
+docker pull ghcr.io/head-1/shaka-agente:v0.8.2
 docker run --rm \
   -p 127.0.0.1:8080:8080 \
   -v "$PWD/data:/app/data" \
-  ghcr.io/head-1/shaka-agente:v0.8.0
+  ghcr.io/head-1/shaka-agente:v0.8.2
 ```
 
-A validação pós-release deste ambiente confirmou a publicação da imagem no GHCR, mas não executou Docker localmente porque Docker/Podman não estão instalados no sandbox de validação.
+A validação da release v0.8.2 confirmou a publicação de `v0.8.2` e `latest` no GHCR, com digest `sha256:7e1c0f36cbe2643f5271c7a4dceb59cff0f105b9959b85eb0acf0f410eea5dd`. Não foi executado Docker localmente no sandbox de validação porque Docker/Podman não estão instalados nesse ambiente.
 
 ## 6. Diagnóstico e auditoria
 
@@ -264,6 +264,6 @@ O MVP não fornece contenção remota automática. O responsável técnico deve 
 
 ## 12. Validação pós-release registrada
 
-A validação da release v0.8.0 em 22 de agosto de 2026 confirmou versão, configuração, `doctor`, execução local em dry-run, sandbox, backup, restauração, auditoria, health check HTTP, criação de sessão, execução de tarefa e replay idempotente. A tentativa de `live` por operador comum foi bloqueada conforme esperado.
+A validação da release v0.8.2 em 22 de agosto de 2026 confirmou versão, configuração, `doctor`, execução local em dry-run, sandbox, backup, restauração, auditoria, health check HTTP, criação de sessão, execução de tarefa e replay idempotente. O workflow também executou preflight de versão, auditoria de dependências, smoke test de produção, geração de SBOM, checksums e publicação no GHCR. A tentativa de `live` por operador comum foi bloqueada conforme esperado.
 
-O relatório detalhado está em `ETAPA9_VALIDACAO_POS_RELEASE.md`. As evidências desta etapa são locais e não alteram a tag `v0.8.0`.
+O relatório operacional detalhado está em `ETAPA9_VALIDACAO_POS_RELEASE.md`; as evidências da publicação e dos hashes estão registradas no relatório local `V0.8.2_RELEASE_RESULT.md`. As evidências não alteram a tag `v0.8.2`. Para a referência normativa da API, consulte [`docs/API_PUBLICA.md`](docs/API_PUBLICA.md).

@@ -1,4 +1,4 @@
-//! API HTTP persistente do Shaka v0.5.0.
+//! API HTTP persistente do Shaka v0.8.2.
 //!
 //! O servidor mantém a coordenação da fila no host, não no modelo. Cada
 //! trabalho passa pelo `AgentRuntime`, pelo SQLite e pelo auditor existente.
@@ -50,16 +50,30 @@ tokio::task_local! {
     static ACTIVE_CORRELATION: CorrelationContext;
 }
 
+/// Configuração host-side da API HTTP e dos workers da fila.
+///
+/// O padrão mantém o bind em loopback, desabilita execução live e usa uma
+/// política bounded de lease, retry e circuit breaker. Um bind não local
+/// exige `api_key` ou token IAM ativo antes de o servidor ser iniciado.
 #[derive(Debug, Clone)]
 pub struct ApiConfig {
+    /// Endereço no qual o listener HTTP será aberto.
     pub bind_addr: SocketAddr,
+    /// Número de workers de fila; o valor permitido está entre 1 e 32.
     pub worker_count: usize,
+    /// Chave estática opcional para autenticação bearer.
     pub api_key: Option<String>,
+    /// Habilita a configuração de execução live; permanece falso por padrão.
     pub live_enabled: bool,
+    /// Confirmação adicional exigida junto de `live_enabled`.
     pub live_confirmation: bool,
+    /// Duração da lease atribuída a uma tarefa reclamada.
     pub lease_for: Duration,
+    /// Atraso inicial da política de retry.
     pub retry_base_delay: Duration,
+    /// Limite superior do atraso de retry.
     pub retry_max_delay: Duration,
+    /// Configuração persistente do circuit breaker do runtime.
     pub circuit: CircuitConfig,
 }
 
@@ -80,6 +94,7 @@ impl Default for ApiConfig {
 }
 
 impl ApiConfig {
+    /// Valida limites operacionais e requisitos de autenticação da API.
     pub fn validate(&self) -> Result<(), ApiError> {
         if self.worker_count == 0 || self.worker_count > 32 {
             return Err(ApiError::BadRequest(
@@ -108,22 +123,37 @@ impl ApiConfig {
     }
 }
 
+/// Erros sanitizados da fronteira HTTP.
+///
+/// A conversão para resposta inclui `request_id`, mas não inclui tokens,
+/// prompts brutos ou payloads sensíveis.
 #[derive(Debug, Error)]
 pub enum ApiError {
+    /// A credencial está ausente ou não pode ser validada.
     #[error("não autorizado")]
     Unauthorized,
+    /// O principal autenticado não possui a autoridade exigida.
     #[error("operação proibida")]
     Forbidden,
+    /// O recurso não existe no tenant autenticado.
     #[error("recurso não encontrado")]
     NotFound,
+    /// A entrada não atende ao contrato ou aos limites da API.
     #[error("entrada inválida: {0}")]
     BadRequest(String),
+    /// A chave de idempotência foi reutilizada com intenção divergente.
     #[error("conflito de idempotência")]
     Conflict(String),
+    /// O limite de requisições foi atingido; o retry deve respeitar o atraso.
     #[error("rate limit excedido")]
-    RateLimited { retry_after_seconds: u64 },
+    RateLimited {
+        /// Número mínimo de segundos sugerido antes de nova tentativa.
+        retry_after_seconds: u64,
+    },
+    /// A quota persistente do tenant foi atingida.
     #[error("quota excedida: {0}")]
     QuotaExceeded(String),
+    /// Falha persistente não exposta em detalhes ao cliente.
     #[error("falha interna persistente")]
     Internal,
 }
@@ -215,6 +245,11 @@ impl ShutdownFlag {
     }
 }
 
+/// Estado compartilhado pelo roteador HTTP e pelos workers host-side.
+///
+/// O estado mantém a fila, runtime, auditoria, principal autenticado,
+/// circuit breaker e telemetria. Os recursos internos permanecem privados
+/// para impedir que handlers ou consumidores contornem as políticas do host.
 #[derive(Clone)]
 pub struct ApiState {
     queue: Arc<QueueStore>,
@@ -246,6 +281,9 @@ impl std::fmt::Debug for ApiState {
 }
 
 impl ApiState {
+    /// Cria o estado da API e valida bind, autenticação e limites operacionais.
+    ///
+    /// Um bind fora do loopback é rejeitado sem API key ou token IAM ativo.
     pub fn new(
         queue: Arc<QueueStore>,
         runtime: Arc<AgentRuntime>,
@@ -277,6 +315,7 @@ impl ApiState {
         })
     }
 
+    /// Constrói o roteador com endpoints de sessões, tarefas e Plan Engine.
     pub fn router(&self) -> Router {
         Router::new()
             .route("/healthz", get(healthz))
@@ -298,16 +337,19 @@ impl ApiState {
             ))
     }
 
+    /// Retorna o principal local configurado para o estado da API.
     #[must_use]
     pub fn principal(&self) -> &Principal {
         &self.principal
     }
 
+    /// Retorna a fila host-side usada pelos handlers e workers.
     #[must_use]
     pub fn queue(&self) -> &Arc<QueueStore> {
         &self.queue
     }
 
+    /// Retorna a fachada de telemetria sem conceder autoridade de decisão.
     #[must_use]
     pub fn telemetry(&self) -> &Arc<Telemetry> {
         &self.telemetry
@@ -358,19 +400,28 @@ impl ApiState {
     }
 }
 
+/// Corpo da criação de sessão.
 #[derive(Debug, Deserialize, Default)]
 pub struct CreateSessionRequest {
+    /// Metadados operacionais bounded persistidos com a sessão.
     #[serde(default)]
     pub metadata: Value,
 }
 
+/// Representação persistida de uma sessão pertencente a um tenant.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SessionResponse {
+    /// Identificador da sessão.
     pub session_id: Uuid,
+    /// Tenant ao qual a sessão pertence.
     pub tenant_id: TenantId,
+    /// Operador que criou ou possui a sessão.
     pub operator_id: shaka_core::OperatorId,
+    /// Instante de criação em UTC.
     pub created_at: DateTime<Utc>,
+    /// Último acesso observado em UTC.
     pub last_seen_at: DateTime<Utc>,
+    /// Metadados operacionais da sessão, sem segredo.
     pub metadata: Value,
 }
 
@@ -387,13 +438,22 @@ impl From<SessionRecord> for SessionResponse {
     }
 }
 
+/// Corpo de submissão de tarefa.
+///
+/// `dry_run` ausente significa `true`; referências planejadas precisam conter
+/// todos os identificadores e digest e continuam limitadas a dry-run.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct SubmitTaskRequest {
+    /// Objetivo textual bounded da tarefa.
     pub objective: String,
+    /// Prioridade usada pela seleção determinística da fila.
     #[serde(default)]
     pub priority: i32,
+    /// Número máximo de tentativas; o padrão é três.
     pub max_attempts: Option<u32>,
+    /// Define o modo seguro; ausente equivale a `true`.
     pub dry_run: Option<bool>,
+    /// Orçamento de execução validado pelo host.
     pub budget: Option<ExecutionBudget>,
     /// ID da task definida pelo plano; obrigatório quando a referência planejada é usada.
     pub task_id: Option<TaskId>,
@@ -405,25 +465,44 @@ pub struct SubmitTaskRequest {
     pub plan_digest: Option<String>,
 }
 
+/// Estado serializável de uma tarefa e de sua lease.
 #[derive(Debug, Serialize)]
 pub struct TaskResponse {
+    /// Identificador da tarefa.
     pub task_id: TaskId,
+    /// Sessão que originou a tarefa.
     pub session_id: Uuid,
+    /// Estado persistido da tarefa.
     pub status: TaskStatus,
+    /// Prioridade usada pela fila.
     pub priority: i32,
+    /// Número de tentativas já realizadas.
     pub attempts: u32,
+    /// Limite total de tentativas.
     pub max_attempts: u32,
+    /// Próximo instante elegível para tentativa.
     pub next_attempt_at: DateTime<Utc>,
+    /// Indica solicitação de cancelamento cooperativo.
     pub cancel_requested: bool,
+    /// Fim da lease atual, quando houver.
     pub lease_until: Option<DateTime<Utc>>,
+    /// Resultado sanitizado, quando a tarefa terminou.
     pub result: Option<Value>,
+    /// Último erro operacional sanitizado.
     pub last_error: Option<String>,
+    /// Instante de criação em UTC.
     pub created_at: DateTime<Utc>,
+    /// Instante da última atualização em UTC.
     pub updated_at: DateTime<Utc>,
+    /// Instante de conclusão, quando houver.
     pub completed_at: Option<DateTime<Utc>>,
+    /// Plano imutável associado, quando a tarefa é planejada.
     pub plan_id: Option<PlanId>,
+    /// Revisão do plano associado.
     pub plan_revision: Option<u32>,
+    /// Digest SHA-256 da revisão do plano.
     pub plan_digest: Option<String>,
+    /// Etapa do plano atualmente locada pelo worker.
     pub plan_step_id: Option<PlanStepId>,
 }
 
@@ -452,20 +531,28 @@ impl From<TaskRecord> for TaskResponse {
     }
 }
 
+/// Corpo de uma decisão humana de aprovação de plano ou etapa.
 #[derive(Debug, Deserialize)]
 pub struct PlanApprovalRequest {
+    /// Etapa opcional à qual a decisão fica limitada.
     pub step_id: Option<PlanStepId>,
+    /// Decisão tipada que será revalidada pelo host.
     pub decision: PlanApprovalDecision,
+    /// Validade solicitada, limitada a 1 segundo–7 dias.
     pub expires_in_seconds: Option<i64>,
 }
 
+/// Corpo da resolução humana de um plano em `unknown` para retomada.
 #[derive(Debug, Deserialize)]
 pub struct PlanResumeRequest {
+    /// Digest da evidência externa vinculada à análise do incidente.
     pub evidence_digest: String,
 }
 
+/// Corpo de criação de plano; o input deve pertencer ao principal autenticado.
 #[derive(Debug, Deserialize)]
 pub struct PlanCreateRequest {
+    /// Contrato do plano validado e persistido pelo host.
     #[serde(flatten)]
     pub input: PlanSpecInput,
 }
@@ -589,7 +676,7 @@ async fn create_plan(
     }
     if input.mode != PlanMode::DryRun {
         return Err(ApiError::BadRequest(
-            "planos live permanecem bloqueados na v0.8.0".to_owned(),
+            "planos live permanecem bloqueados na v0.8.2".to_owned(),
         ));
     }
     let plan = PlanSpec::new(input).map_err(|error| ApiError::BadRequest(error.to_string()))?;
@@ -950,7 +1037,7 @@ async fn submit_task(
         }
         if !dry_run {
             return Err(ApiError::BadRequest(
-                "tasks planejadas exigem dry-run na v0.8.0".to_owned(),
+                "tasks planejadas exigem dry-run na v0.8.2".to_owned(),
             ));
         }
         Some(
@@ -1069,6 +1156,10 @@ async fn cancel_task(
     Ok((status, Json(record.into())))
 }
 
+/// Executa o servidor HTTP e inicia os workers até o shutdown gracioso.
+///
+/// O bind já deve ter sido validado por [`ApiState::new`]. Falhas do listener
+/// são convertidas em erro interno sem expor detalhes do sistema.
 pub async fn serve(state: ApiState) -> Result<(), ApiError> {
     let listener = TcpListener::bind(state.config.bind_addr)
         .await

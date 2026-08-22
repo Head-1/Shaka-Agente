@@ -2,13 +2,13 @@
 
 O Shaka é um agente de IA **extensível, auditável e governado pelo operador**, implementado em Rust. A arquitetura prioriza contratos tipados, execução mediada pelo host, memória persistente, rastreabilidade e uma fronteira segura para capacidades dinâmicas.
 
-> **Estado atual:** a release estável mais recente é a **v0.8.0**, validada para operação local controlada em `dry-run`. A linha de desenvolvimento da próxima manutenção é `roadmap/v0.8.1`. A API HTTP usa loopback por padrão; planos `live`, mensageria externa, pesquisa autônoma na web, autopromoção de skills e controle irrestrito de subagentes permanecem fora dos limites desta versão.
+> **Estado atual:** a release estável mais recente é a [**v0.8.2**](https://github.com/Head-1/Shaka-Agente/releases/tag/v0.8.2), validada para operação local controlada em `dry-run`. A API HTTP usa loopback por padrão; planos `live`, mensageria externa, pesquisa autônoma na web, autopromoção de skills e controle irrestrito de subagentes permanecem fora dos limites desta versão.
 
-## O que a v0.8.0 entrega
+## O que a v0.8.2 entrega
 
-A v0.8.0 consolida o **Plan Engine governado**: planos possuem contratos tipados, digest canônico, verificação determinística, persistência SQLite, aprovações humanas, compensações declaradas, exposição HTTP/CLI e recuperação fail-closed.
+A v0.8.2 mantém a base do **Plan Engine governado** e adiciona uma cadeia de publicação mais verificável: planos possuem contratos tipados, digest canônico, verificação determinística, persistência SQLite, aprovações humanas, compensações declaradas, exposição HTTP/CLI e recuperação fail-closed; a release também valida a correspondência entre tag, workspace Cargo, `Cargo.lock` e changelog antes de empacotar.
 
-| Capacidade | Estado na v0.8.0 |
+| Capacidade | Estado acumulado na v0.8.2 |
 |---|---|
 | Workspace Cargo com crates separados | Implementado |
 | Memória de trabalho e episódica | Persistente em SQLite |
@@ -30,7 +30,7 @@ A v0.8.0 consolida o **Plan Engine governado**: planos possuem contratos tipados
 | Autopromoção e autoevolução | Proibidas por governança |
 | Subagentes irrestritos | Fora do escopo |
 
-O histórico detalhado está em [`CHANGELOG.md`](CHANGELOG.md). O procedimento de operação sem conhecimento interno de Rust está em [`RUNBOOK_OPERACIONAL.md`](RUNBOOK_OPERACIONAL.md), e as evidências da validação pós-release estão em [`ETAPA9_VALIDACAO_POS_RELEASE.md`](ETAPA9_VALIDACAO_POS_RELEASE.md).
+O histórico detalhado está em [`CHANGELOG.md`](CHANGELOG.md). O procedimento de operação sem conhecimento interno de Rust está em [`RUNBOOK_OPERACIONAL.md`](RUNBOOK_OPERACIONAL.md), o contrato HTTP e Rust público está em [`docs/API_PUBLICA.md`](docs/API_PUBLICA.md), e as evidências da validação pós-release estão em [`ETAPA9_VALIDACAO_POS_RELEASE.md`](ETAPA9_VALIDACAO_POS_RELEASE.md).
 
 ## Modelo de segurança
 
@@ -38,7 +38,7 @@ O Shaka trata conteúdo externo, objetivos do modelo e resultados de ferramentas
 
 A regra operacional é falhar de forma explícita diante de ambiguidade, inconsistência, timeout ou evidência incompleta. No Plan Engine, transições são verificadas por digest, dependências, limites, condições, aprovações, capabilities e estado persistido. Uma fronteira ativa ou ambígua após crash não recebe retry cego: o estado é convertido em `unknown` e exige resolução humana.
 
-A release v0.8.0 não é uma implantação pública pronta por si só. Exposição externa exige, em um ciclo separado, IAM remoto forte, cofre de segredos, HTTPS na borda, armazenamento persistente, backup externo, métricas, alertas, política de dados e revisão de ameaça.
+A release v0.8.2 não é uma implantação pública pronta por si só. Exposição externa exige, em um ciclo separado, IAM remoto forte, cofre de segredos, HTTPS na borda, armazenamento persistente, backup externo, métricas, alertas, política de dados e revisão de ameaça.
 
 ## Requisitos locais
 
@@ -78,7 +78,7 @@ cargo run -p shaka-cli -- run \
   "Descreva em uma frase a política deny-by-default do Shaka"
 ```
 
-A tentativa de execução real não deve ser usada como atalho operacional. Tarefas começam em `dry-run` e planos `live` permanecem bloqueados na v0.8.0. Efeitos externos, quando futuramente autorizados, exigirão mudança formal de governança e novo ciclo de validação.
+A tentativa de execução real não deve ser usada como atalho operacional. Tarefas começam em `dry-run` e planos `live` permanecem bloqueados na v0.8.2. Efeitos externos, quando futuramente autorizados, exigirão mudança formal de governança e novo ciclo de validação.
 
 Para executar a demonstração do sandbox:
 
@@ -104,7 +104,7 @@ Consulte o health check:
 curl --fail --silent http://127.0.0.1:8080/healthz
 ```
 
-A resposta esperada apresenta status operacional `ok`, versão `0.8.0` e circuito `closed`. Os endpoints principais são:
+A resposta esperada apresenta status operacional `ok`, versão `0.8.2` e circuito `closed`. Os endpoints principais e os endpoints de planos estão descritos em [`docs/API_PUBLICA.md`](docs/API_PUBLICA.md).
 
 | Método | Endpoint | Finalidade |
 |---|---|---|
@@ -222,12 +222,12 @@ O workflow [`.github/workflows/release.yml`](.github/workflows/release.yml) é a
 
 As actions de checkout usam a série compatível com Node.js 24. A action `actions/checkout@v5` requer runner Actions `v2.327.1` ou superior; os workflows deste projeto usam `ubuntu-latest`.[1] [2]
 
-Para contribuir na linha v0.8.1:
+Para contribuir, crie uma branch curta a partir da `main` atual e mantenha a alteração limitada ao escopo revisado:
 
 ```bash
 git switch main
 git pull --ff-only origin main
-git switch roadmap/v0.8.1
+git switch -c docs/minha-alteracao
 # implementar uma alteração pequena e verificável
 git diff --check
 ```
@@ -236,7 +236,7 @@ Commits devem ser GPG assinados. A criação de tags, releases e merges deve oco
 
 ## Produção candidata e limitações
 
-A v0.8.0 deve ser entendida como uma base operacional local governada, não como autorização para implantação pública irrestrita. Permanecem fora do escopo IAM remoto, cofre de segredos integrado, backup remoto automatizado, métricas exportáveis, mensageria, pesquisa web, escala horizontal com PostgreSQL/row-level security e subagentes distribuídos.
+A v0.8.2 deve ser entendida como uma base operacional local governada, não como autorização para implantação pública irrestrita. Permanecem fora do escopo IAM remoto, cofre de segredos integrado, backup remoto automatizado, métricas exportáveis, mensageria, pesquisa web, escala horizontal com PostgreSQL/row-level security e subagentes distribuídos.
 
 O Shaka deve preservar as seguintes propriedades: autoridade de tenant e papel derivada no host; tarefas iniciando em `dry-run`; planos `live` bloqueados nesta release; auditoria sem payloads ou segredos; recuperação idempotente; inconsistências convertidas em `unknown`; e decisão humana para aprovação, compensação ou cancelamento de fronteiras ambíguas.
 
