@@ -4,6 +4,18 @@ Todas as mudanças relevantes do Shaka serão registradas neste arquivo. O forma
 
 ## [Unreleased]
 
+### Planejado
+
+- Busca semântica com embeddings e recuperação híbrida.
+- Subagentes paralelos com DAG, orçamento por filho, cancelamento e falha parcial.
+- Build sandbox separado para código gerado e verificação de dependências.
+- Adaptadores de mensageria com autenticação de webhook e idempotência.
+- Pesquisa web com conteúdo marcado como não confiável e mitigação de SSRF.
+- IAM remoto, ABAC, cofre de segredos, multi-tenancy forte e métricas exportáveis.
+- Backup remoto automatizado, migrações formais, RPO/RTO e testes de recuperação em infraestrutura-alvo.
+
+## [0.8.0] - 2026-08-22
+
 ### v0.8.0 — Etapa 6: exposição HTTP/CLI e inspeção operacional de planos
 
 - Exposição dos planos por HTTP com criação, detalhe, validação preflight, aprovação, retomada, cancelamento e consulta de checkpoints.
@@ -96,16 +108,6 @@ Todas as mudanças relevantes do Shaka serão registradas neste arquivo. O forma
 - Spans `queue.admission`, `queue.claim`, `queue.finish`, `queue.lease.recover`, `queue.circuit.*` e `worker.task.process` para correlacionar admissão, leases, tentativas, retries e estados do circuito.
 - Taxonomias de outcome e erro de baixa cardinalidade para `created`, `existing`, `claimed`, `empty`, `succeeded`, `retry_scheduled`, `failed`, `cancelled`, `rate_limited` e classes equivalentes.
 - Registro de worker, attempt, retryability, retry delay, lease state, circuit state e quantidade de leases recuperados sem incluir payloads, mensagens livres ou IDs como labels métricas.
-
-### Planejado
-
-- Busca semântica com embeddings e recuperação híbrida.
-- Subagentes paralelos com DAG, orçamento por filho, cancelamento e falha parcial.
-- Build sandbox separado para código gerado e verificação de dependências.
-- Adaptadores de mensageria com autenticação de webhook e idempotência.
-- Pesquisa web com conteúdo marcado como não confiável e mitigação de SSRF.
-- IAM remoto, ABAC, cofre de segredos, multi-tenancy forte e métricas exportáveis.
-- Backup remoto automatizado, migrações formais, RPO/RTO e testes de recuperação em infraestrutura-alvo.
 
 ## [0.6.0] - 2026-08-21
 
