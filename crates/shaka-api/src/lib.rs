@@ -979,6 +979,7 @@ fn audit_task_finish(state: &ApiState, task: &TaskRecord, outcome: &FinishOutcom
     let outcome_name = match outcome {
         FinishOutcome::Succeeded => "succeeded",
         FinishOutcome::PlanStepSucceeded { .. } => "plan_step_succeeded",
+        FinishOutcome::Compensated => "compensated",
         FinishOutcome::Requeued { .. } => "retry_scheduled",
         FinishOutcome::Failed => "failed",
         FinishOutcome::Cancelled => "cancelled",
@@ -1012,6 +1013,7 @@ fn finish_outcome_name(outcome: &FinishOutcome) -> &'static str {
     match outcome {
         FinishOutcome::Succeeded => "succeeded",
         FinishOutcome::PlanStepSucceeded { .. } => "plan_step_succeeded",
+        FinishOutcome::Compensated => "compensated",
         FinishOutcome::Requeued { .. } => "retry_scheduled",
         FinishOutcome::Failed => "failed",
         FinishOutcome::Cancelled => "cancelled",

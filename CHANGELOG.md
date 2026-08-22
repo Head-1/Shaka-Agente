@@ -4,6 +4,17 @@ Todas as mudanças relevantes do Shaka serão registradas neste arquivo. O forma
 
 ## [Unreleased]
 
+### v0.8.0 — Etapa 5: aprovações, compensações e resolução de unknown
+
+- `approve_plan` com autorização RBAC, separação de funções, escopo por plano/etapa, digest/revisão vinculados e idempotência.
+- Decisão de rejeição terminal e revalidação de aprovação global em cada claim; expiração/revogação não liberam novas etapas.
+- Migração `plan_store` v3 com `idempotency_key` de aprovação e compatibilidade com bancos da Etapa 3.
+- Resolução humana tipada de `unknown` para `resume`, `compensate` ou `cancel`, com digest de evidência e checkpoints de governança.
+- Cancelamento planejado cooperativo, bloqueado enquanto houver fronteira ativa ou ambígua.
+- Compensações limitadas ao subgrafo estático declarado, com claim filtrado, checkpoint próprio e sem loop ou retry autônomo.
+- Falha de compensação retorna a `unknown`; nova tentativa exige nova resolução humana; plano compensado nunca reporta sucesso da operação original.
+- 20 testes do `shaka-queue`, workspace, Clippy e smoke de produção aprovados.
+
 ### v0.8.0 — Etapa 4: integração QueueStore/worker do Plan Engine
 
 - Tasks governadas agora carregam referência imutável ao plano: `plan_id`, revisão, digest e etapa locada.

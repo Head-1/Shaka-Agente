@@ -17,9 +17,10 @@ use uuid::Uuid;
 pub mod plan_store;
 
 pub use plan_store::{
-    PersistedPlan, PlanCheckpoint, PlanCheckpointPhase, PlanCheckpointStatus, PlanClaimContext,
-    PlanResumeReport, PlanResumeStatus, PlanStoreTransition, PlanTaskReference,
-    PlanTransitionEntity, PlanTransitionState,
+    PersistedPlan, PlanApprovalOutcome, PlanCheckpoint, PlanCheckpointPhase, PlanCheckpointStatus,
+    PlanClaimContext, PlanResolutionDecision, PlanResolutionOutcome, PlanResumeReport,
+    PlanResumeStatus, PlanStoreTransition, PlanTaskReference, PlanTransitionEntity,
+    PlanTransitionState,
 };
 
 #[derive(Debug, Error)]
@@ -144,6 +145,8 @@ pub enum FinishOutcome {
     PlanStepSucceeded {
         next_attempt_at: DateTime<Utc>,
     },
+    /// A compensação declarada terminou; a operação original não é reportada como sucesso.
+    Compensated,
     Requeued {
         next_attempt_at: DateTime<Utc>,
     },
@@ -395,7 +398,7 @@ impl QueueStore {
                  version INTEGER NOT NULL
              );
              INSERT OR IGNORE INTO shaka_schema_versions (component, version)
-                 VALUES ('plan_store', 2);
+                 VALUES ('plan_store', 3);
 
              CREATE TABLE IF NOT EXISTS plans (
                  plan_id TEXT NOT NULL,
@@ -455,6 +458,7 @@ impl QueueStore {
                  revoked INTEGER NOT NULL DEFAULT 0,
                  expires_at TEXT NOT NULL,
                  created_at TEXT NOT NULL,
+                 idempotency_key TEXT,
                  FOREIGN KEY (plan_id, revision) REFERENCES plans(plan_id, revision)
              );
              CREATE INDEX IF NOT EXISTS idx_plan_approvals_scope
@@ -489,22 +493,44 @@ impl QueueStore {
              );",
         )?;
         self.ensure_api_task_plan_columns()?;
+        self.ensure_plan_approval_columns()?;
         let schema_version = self.connection.lock().query_row(
             "SELECT version FROM shaka_schema_versions WHERE component = 'plan_store'",
             [],
             |row| row.get::<_, i64>(0),
         )?;
-        if schema_version > 2 {
+        if schema_version > 3 {
             return Err(QueueError::InvalidInput(
                 "schema plan_store mais novo que o suportado".to_owned(),
             ));
         }
-        if schema_version < 2 {
+        if schema_version < 3 {
             self.connection.lock().execute(
-                "UPDATE shaka_schema_versions SET version = 2 WHERE component = 'plan_store'",
+                "UPDATE shaka_schema_versions SET version = 3 WHERE component = 'plan_store'",
                 [],
             )?;
         }
+        Ok(())
+    }
+
+    fn ensure_plan_approval_columns(&self) -> Result<(), QueueError> {
+        let connection = self.connection.lock();
+        let mut statement = connection.prepare("PRAGMA table_info(plan_approvals)")?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        if !columns.iter().any(|column| column == "idempotency_key") {
+            connection.execute(
+                "ALTER TABLE plan_approvals ADD COLUMN idempotency_key TEXT",
+                [],
+            )?;
+        }
+        connection.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_plan_approvals_idempotency
+             ON plan_approvals (plan_id, revision, idempotency_key)",
+            [],
+        )?;
         Ok(())
     }
 
@@ -1283,6 +1309,9 @@ impl QueueStore {
         if task.status.is_terminal() {
             transaction.commit()?;
             return Ok(task);
+        }
+        if task.plan_id.is_some() {
+            plan_store::cancel_planned_task_tx(&transaction, &task, now)?;
         }
         let (status, completed_at): (&str, Option<String>) = match task.status {
             TaskStatus::Queued => (TaskStatus::Cancelled.as_str(), Some(now.to_rfc3339())),

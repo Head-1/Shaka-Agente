@@ -305,7 +305,9 @@ impl PlanState {
                 Self::AwaitingApproval | Self::Approved | Self::Rejected
             ),
             Self::AwaitingApproval => matches!(next, Self::Approved | Self::Rejected),
-            Self::Approved => matches!(next, Self::Running | Self::Rejected),
+            Self::Approved => {
+                matches!(next, Self::Running | Self::Rejected | Self::CancelRequested)
+            }
             Self::Running => matches!(
                 next,
                 Self::Paused
@@ -382,7 +384,8 @@ impl PlanStepState {
                 next,
                 Self::Ready | Self::Failed | Self::Compensating | Self::Cancelled
             ),
-            Self::Succeeded | Self::Blocked | Self::Cancelled | Self::Compensated => false,
+            Self::Succeeded => matches!(next, Self::Compensating),
+            Self::Blocked | Self::Cancelled | Self::Compensated => false,
         };
         if valid {
             Ok(())
