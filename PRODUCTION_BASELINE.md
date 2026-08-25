@@ -1,4 +1,5 @@
 # Baseline de produção do Shaka
+> **Documento histórico:** este registro descreve o baseline inicial de 20 de agosto de 2026 e não é a fonte normativa para operar a v0.8.2. Para a documentação atual, consulte [`README.md`](README.md), [`RUNBOOK_OPERACIONAL.md`](RUNBOOK_OPERACIONAL.md), [`docs/API_PUBLICA.md`](docs/API_PUBLICA.md) e [`CHANGELOG.md`](CHANGELOG.md).
 
 ## Diagnóstico do MVP
 
