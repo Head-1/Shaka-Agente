@@ -116,12 +116,12 @@ impl Principal {
 #[must_use]
 pub fn redact_sensitive(input: &str) -> String {
     let Some(key_pattern) = Regex::new(
-        r"(?i)(api[_-]?key|access[_-]?token|secret|password|authorization)s*[:=]s*([^s,;]+)",
+        r"(?i)(api[_-]?key|access[_-]?token|secret|password|authorization)\s*[:=]\s*([^\s,;]+)",
     )
     .ok() else {
         return input.to_owned();
     };
-    let Some(bearer_pattern) = Regex::new(r"(?i)bearers+[A-Za-z0-9._~+/=-]+").ok() else {
+    let Some(bearer_pattern) = Regex::new(r"(?i)bearer\s+[A-Za-z0-9._~+/=-]+").ok() else {
         return input.to_owned();
     };
     let redacted = bearer_pattern.replace_all(input, "Bearer [REDACTED]");
@@ -1301,6 +1301,15 @@ mod tests {
         let value = "api_key=secret-value Authorization: Bearer abc.def";
         let result = redact_sensitive(value);
         assert!(!result.contains("secret-value"));
+        assert!(!result.contains("abc.def"));
+    }
+
+    #[test]
+    fn common_whitespace_and_standalone_bearer_values_are_redacted() {
+        let value = "api_key: secret-value password = hidden Bearer abc.def";
+        let result = redact_sensitive(value);
+        assert!(!result.contains("secret-value"));
+        assert!(!result.contains("hidden"));
         assert!(!result.contains("abc.def"));
     }
 }
