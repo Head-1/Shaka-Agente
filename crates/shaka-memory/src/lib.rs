@@ -21,6 +21,8 @@ pub enum MemoryError {
     Serialization(#[from] serde_json::Error),
     #[error("registro não encontrado: {0}")]
     NotFound(String),
+    #[error("registro persistido corrompido: {0}")]
+    CorruptRecord(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -178,26 +180,51 @@ impl MemoryStore {
              FROM episodic_memory WHERE tenant_id = ?1 ORDER BY created_at DESC LIMIT ?2",
         )?;
         let rows = statement.query_map(params![tenant_id.0, limit], |row| {
-            let task_id: Option<String> = row.get(1)?;
-            let created_at: String = row.get(7)?;
-            Ok(EpisodicRecord {
-                id: Uuid::parse_str(&row.get::<_, String>(0)?).unwrap_or_else(|_| Uuid::nil()),
-                tenant_id: TenantId(tenant_id.0.clone()),
-                task_id: task_id
-                    .and_then(|value| Uuid::parse_str(&value).ok())
-                    .map(TaskId),
-                kind: row.get(2)?,
-                content: row.get(3)?,
-                outcome: row.get(4)?,
-                cost_microunits: row.get(5)?,
-                elapsed_ms: row.get(6)?,
-                created_at: DateTime::parse_from_rfc3339(&created_at)
-                    .map_or_else(|_| Utc::now(), |value| value.with_timezone(&Utc)),
-            })
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, u64>(5)?,
+                row.get::<_, u64>(6)?,
+                row.get::<_, String>(7)?,
+            ))
         })?;
         let mut episodes = Vec::new();
         for row in rows {
-            episodes.push(row?);
+            let (id, task_id, kind, content, outcome, cost_microunits, elapsed_ms, created_at) =
+                row?;
+            let id = Uuid::parse_str(&id).map_err(|error| {
+                MemoryError::CorruptRecord(format!("episodic_memory.id inválido: {error}"))
+            })?;
+            let task_id = task_id
+                .map(|value| {
+                    Uuid::parse_str(&value).map(TaskId).map_err(|error| {
+                        MemoryError::CorruptRecord(format!(
+                            "episodic_memory.task_id inválido: {error}"
+                        ))
+                    })
+                })
+                .transpose()?;
+            let created_at = DateTime::parse_from_rfc3339(&created_at)
+                .map(|value| value.with_timezone(&Utc))
+                .map_err(|error| {
+                    MemoryError::CorruptRecord(format!(
+                        "episodic_memory.created_at inválido: {error}"
+                    ))
+                })?;
+            episodes.push(EpisodicRecord {
+                id,
+                tenant_id: TenantId(tenant_id.0.clone()),
+                task_id,
+                kind,
+                content,
+                outcome,
+                cost_microunits,
+                elapsed_ms,
+                created_at,
+            });
         }
         Ok(episodes)
     }
@@ -242,7 +269,14 @@ impl MemoryStore {
                         key: key.to_owned(),
                         value: row.get(0)?,
                         expires_at: DateTime::parse_from_rfc3339(&expires_at)
-                            .map_or_else(|_| Utc::now(), |value| value.with_timezone(&Utc)),
+                            .map(|value| value.with_timezone(&Utc))
+                            .map_err(|error| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    1,
+                                    rusqlite::types::Type::Text,
+                                    Box::new(error),
+                                )
+                            })?,
                     })
                 },
             )
@@ -433,6 +467,52 @@ mod tests {
         let episodes = store.recent_episodes(&tenant, 10).unwrap();
         assert_eq!(episodes.len(), 1);
         assert_eq!(episodes[0].content, "resultado");
+    }
+
+    #[test]
+    fn corrupted_episode_metadata_fails_closed() {
+        let store = MemoryStore::in_memory().unwrap();
+        let tenant = TenantId::new("tenant-a").unwrap();
+        store
+            .connection
+            .lock()
+            .execute(
+                "INSERT INTO episodic_memory
+                 (id, tenant_id, task_id, kind, content, outcome, cost_microunits, elapsed_ms, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    "not-a-uuid",
+                    tenant.0,
+                    "also-not-a-uuid",
+                    "corrupt",
+                    "payload",
+                    "unknown",
+                    0_i64,
+                    0_i64,
+                    "not-rfc3339"
+                ],
+            )
+            .unwrap();
+
+        assert!(store.recent_episodes(&tenant, 10).is_err());
+    }
+
+    #[test]
+    fn corrupted_working_memory_expiry_fails_closed() {
+        let store = MemoryStore::in_memory().unwrap();
+        let tenant = TenantId::new("tenant-a").unwrap();
+        let task = TaskId::new();
+        store
+            .connection
+            .lock()
+            .execute(
+                "INSERT INTO working_memory (tenant_id, task_id, key, value, expires_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![tenant.0, task.0.to_string(), "key", "value", "not-rfc3339"],
+            )
+            .unwrap();
+
+        assert!(store.get_working(&tenant, &task, "key").is_err());
     }
 
     #[test]
