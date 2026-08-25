@@ -18,8 +18,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use shaka_core::{
-    Action, ExecutionBudget, PlanApproval, PlanApprovalDecision, PlanId, PlanMode, PlanSpec,
-    PlanSpecInput, PlanStepId, PlanStepState, Principal, TaskEnvelope, TaskId, TenantId,
+    Action, ExecutionBudget, ExecutionContext, PlanApproval, PlanApprovalDecision, PlanId,
+    PlanMode, PlanSpec, PlanSpecInput, PlanStepId, PlanStepState, Principal, TaskEnvelope, TaskId,
+    TenantId,
 };
 use shaka_observability::{AuditLogger, CorrelationContext, Telemetry};
 use shaka_orchestrator::{AgentRuntime, CancellationToken, OrchestratorError};
@@ -1053,6 +1054,7 @@ async fn submit_task(
         request.objective.clone(),
     )
     .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    envelope.execution_context = ExecutionContext::from_principal(&auth.principal);
     envelope.dry_run = dry_run;
     if let Some(task_id) = request.task_id.clone() {
         if plan_reference.is_none() {
@@ -1751,7 +1753,7 @@ mod tests {
         ExecutionBudget, PlanAction, PlanApprovalRequirement, PlanRisk, PlanSpecInput, PlanStep,
     };
     use shaka_memory::MemoryStore;
-    use shaka_orchestrator::{AgentModel, EchoTool, LocalModel, ToolRegistry};
+    use shaka_orchestrator::{AgentModel, EchoTool, LocalModel, OutboundMessageTool, ToolRegistry};
     use shaka_orchestrator::{ModelRequest, ModelResponse};
     use tower::ServiceExt;
 
@@ -1779,6 +1781,134 @@ mod tests {
             ApiConfig::default(),
         )
         .unwrap()
+    }
+
+    #[derive(Debug)]
+    struct RequestScopedMessageModel;
+
+    #[async_trait]
+    impl AgentModel for RequestScopedMessageModel {
+        async fn complete(
+            &self,
+            request: ModelRequest,
+        ) -> Result<ModelResponse, OrchestratorError> {
+            assert!(!request.tools.iter().any(|tool| tool.name == "send_message"));
+            if request.prior_tool_results.is_empty() {
+                Ok(ModelResponse {
+                    content: String::new(),
+                    tool_calls: vec![shaka_orchestrator::ModelToolCall {
+                        tool_name: "send_message".to_owned(),
+                        arguments: json!({"channel":"external","message":"blocked"}),
+                    }],
+                    estimated_cost_microunits: 0,
+                })
+            } else {
+                Ok(ModelResponse {
+                    content: "fim".to_owned(),
+                    tool_calls: Vec::new(),
+                    estimated_cost_microunits: 0,
+                })
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn operator_request_cannot_use_admin_runtime_capability() {
+        let memory = Arc::new(MemoryStore::in_memory().unwrap());
+        let audit = Arc::new(AuditLogger::new(Arc::clone(&memory)));
+        let mut tools = ToolRegistry::with_capabilities(shaka_core::CapabilitySet(vec![
+            shaka_core::Capability::ExternalMessaging,
+        ]));
+        tools.register(Arc::new(OutboundMessageTool)).unwrap();
+        let state = ApiState::new(
+            Arc::new(QueueStore::in_memory().unwrap()),
+            Arc::new(AgentRuntime::new(
+                Arc::new(RequestScopedMessageModel),
+                memory,
+                tools,
+            )),
+            audit,
+            principal(),
+            ApiConfig::default(),
+        )
+        .unwrap();
+        let operator = shaka_core::OperatorId::new("request-operator").unwrap();
+        state
+            .queue
+            .create_user(
+                &operator,
+                &state.principal.tenant_id,
+                &shaka_core::Role::Operator,
+            )
+            .unwrap();
+        let issue = state.queue.issue_token(&operator, None).unwrap();
+        let session_response = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/sessions")
+                    .header("authorization", format!("Bearer {}", issue.token))
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(session_response.status(), StatusCode::CREATED);
+        let session: SessionResponse = serde_json::from_slice(
+            &axum::body::to_bytes(session_response.into_body(), 1_048_576)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let task_response = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/sessions/{}/tasks", session.session_id))
+                    .header("authorization", format!("Bearer {}", issue.token))
+                    .header("idempotency-key", "request-context-1")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        r#"{"objective":"tentar mensageria","dry_run":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(task_response.status(), StatusCode::ACCEPTED);
+        let task: Value = serde_json::from_slice(
+            &axum::body::to_bytes(task_response.into_body(), 1_048_576)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let task_id = TaskId(Uuid::parse_str(task["task_id"].as_str().unwrap()).unwrap());
+        let claimed = state
+            .queue
+            .claim_next(Utc::now(), Duration::seconds(30))
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.task_id, task_id);
+        execute_task(0, state.clone(), claimed).await;
+        let finished = state
+            .queue
+            .get_task(&task_id, &state.principal.tenant_id)
+            .unwrap();
+        let result = finished.result.unwrap();
+        assert_eq!(result["success"], false);
+        assert_eq!(
+            result["tool_results"][0]["error_code"],
+            "tool_execution_failed"
+        );
+        assert!(
+            result["tool_results"][0]["output"]["serialized"]
+                .as_str()
+                .unwrap()
+                .contains("capacidade não autorizada")
+        );
     }
 
     #[test]

@@ -115,3 +115,19 @@ SQLite é copiado pela API de backup online do rusqlite, evitando cópia ingênu
 **Status:** Aceita.
 
 O catálogo é gravado em arquivo temporário sincronizado, renomeado atomicamente e com permissões restritas em sistemas Unix. O fluxo de aprovação pode calcular SHA-256 do artefato real; nenhum caminho de autopromoção foi adicionado.
+
+## ADR-017 — Contexto de execução por request
+
+**Status:** Aceita para a fatia de hardening atual.
+
+**Contexto:** O catálogo de ferramentas é construído no processo do worker, mas a autorização não pode ser herdada desse estado global quando a fila contém solicitações com papéis diferentes. Um envelope enviado pelo cliente também não pode escolher suas próprias capabilities.
+
+**Decisão:** Persistir em `TaskEnvelope.execution_context` o papel e o conjunto efetivo de capabilities da execução. A API HTTP, a CLI e a submissão governada da fila derivam esse contexto do principal autenticado; a fila sobrescreve qualquer contexto fornecido pelo caller antes da transação de admissão. O runtime filtra as definições anunciadas ao modelo e repete a verificação na execução da ferramenta usando o contexto persistido. No claim de planos, as capabilities do envelope substituem as capabilities globais do worker.
+
+**Compatibilidade e limites:** Envelopes antigos sem o campo são desserializados com o contexto conservador `operator` sem capabilities. `tenant_id`, `operator_id`, orçamento, `dry_run` e referências de plano permanecem no `TaskEnvelope` porque já fazem parte do contrato de identidade, execução e persistência da task; esta fatia não adiciona request-id, correlação ou referência de aprovação ao novo tipo. Administrator recebe o conjunto de capabilities atualmente declarado pelo host; Operator e Reviewer permanecem deny-by-default nesta política.
+
+**Consequências:** Uma solicitação autenticada com menor privilégio não recebe definições administrativas no prompt do modelo e também é bloqueada se tentar chamar a ferramenta diretamente. A autorização efetiva deixa de depender apenas do catálogo global, preservando o catálogo como gate de registro do processo. O contexto é serializável e acompanha retries, leases e claims persistidos.
+
+**Alternativas consideradas:** Confiar somente nas capabilities globais do worker, rejeitado por permitir herança entre requests; aceitar capabilities do payload, rejeitado por permitir forgery; criar um novo registro de autorização separado nesta etapa, reservado para quando houver decisão de incluir correlação, aprovação e política de orçamento no mesmo objeto.
+
+**Evidência:** Testes de núcleo, registry, fila e API cobrem derivação least-privilege, sobrescrita na admissão, filtragem de ferramentas e bloqueio na execução, além da suíte completa do workspace.

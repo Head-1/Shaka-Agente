@@ -9,7 +9,10 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use shaka_core::{OperatorId, PlanId, PlanStepId, Principal, Role, TaskEnvelope, TaskId, TenantId};
+use shaka_core::{
+    ExecutionContext, OperatorId, PlanId, PlanStepId, Principal, Role, TaskEnvelope, TaskId,
+    TenantId,
+};
 use std::sync::Arc;
 use thiserror::Error;
 use uuid::Uuid;
@@ -1170,6 +1173,9 @@ impl QueueStore {
         if session_operator != principal.operator_id.0 {
             return Err(QueueError::Forbidden);
         }
+        let mut governed_envelope = envelope.clone();
+        governed_envelope.execution_context = ExecutionContext::from_principal(principal);
+        let envelope = &governed_envelope;
         if let Some(reference) = plan_reference {
             plan_store::verify_plan_admission_tx(&transaction, principal, envelope, reference)?;
         }
@@ -1360,11 +1366,15 @@ impl QueueStore {
             let task = load_task(&transaction, &task_id, &tenant_id)?;
             let selected_step = if task.plan_id.is_some() {
                 let reference = plan_store::task_reference(&task)?;
+                let effective_plan_context = PlanClaimContext {
+                    granted_capabilities: task.envelope.execution_context.capabilities.0.clone(),
+                    ..plan_context.clone()
+                };
                 match plan_store::prepare_planned_claim_tx(
                     &transaction,
                     &task,
                     &reference,
-                    plan_context,
+                    &effective_plan_context,
                     now,
                 )? {
                     Some(step_id) => Some(step_id),
@@ -1997,7 +2007,7 @@ fn load_task(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use shaka_core::{ExecutionBudget, Role};
+    use shaka_core::{Capability, ExecutionBudget, Role};
 
     fn principal() -> Principal {
         Principal {
@@ -2069,6 +2079,13 @@ mod tests {
             )
             .unwrap();
         assert_eq!(first, SubmitOutcome::Created);
+        assert_eq!(task.envelope.execution_context.role, Role::Administrator);
+        assert!(
+            task.envelope
+                .execution_context
+                .capabilities
+                .allows(&[Capability::CodeExecution])
+        );
         let replay = store
             .submit_task_governed(
                 session.session_id,

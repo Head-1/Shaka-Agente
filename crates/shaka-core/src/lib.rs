@@ -112,6 +112,46 @@ impl Principal {
     }
 }
 
+/// Contexto efetivo que deve acompanhar uma execução desde a admissão até o runtime.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutionContext {
+    /// Papel do principal no momento da admissão.
+    pub role: Role,
+    /// Capabilities efetivas concedidas pelo host para esta execução.
+    pub capabilities: CapabilitySet,
+}
+
+impl Default for ExecutionContext {
+    fn default() -> Self {
+        Self {
+            role: Role::Operator,
+            capabilities: CapabilitySet::default(),
+        }
+    }
+}
+
+impl ExecutionContext {
+    /// Deriva capabilities sem privilégio implícito a partir do principal autenticado.
+    #[must_use]
+    pub fn from_principal(principal: &Principal) -> Self {
+        let capabilities = match principal.role {
+            Role::Administrator => CapabilitySet(vec![
+                Capability::Network,
+                Capability::FilesystemRead,
+                Capability::FilesystemWrite,
+                Capability::CodeExecution,
+                Capability::ExternalMessaging,
+                Capability::MemoryWrite,
+            ]),
+            Role::Operator | Role::Reviewer => CapabilitySet::default(),
+        };
+        Self {
+            role: principal.role.clone(),
+            capabilities,
+        }
+    }
+}
+
 /// Remove padrões comuns de credenciais antes de gravar texto em logs ou memória.
 #[must_use]
 pub fn redact_sensitive(input: &str) -> String {
@@ -157,6 +197,8 @@ pub struct TaskEnvelope {
     pub objective: String,
     pub budget: ExecutionBudget,
     pub dry_run: bool,
+    #[serde(default)]
+    pub execution_context: ExecutionContext,
     pub created_at: DateTime<Utc>,
 }
 
@@ -177,6 +219,7 @@ impl TaskEnvelope {
             objective,
             budget: ExecutionBudget::default(),
             dry_run: true,
+            execution_context: ExecutionContext::default(),
             created_at: Utc::now(),
         })
     }
@@ -1025,6 +1068,37 @@ mod tests {
         let tenant = TenantId::new("demo").unwrap();
         let operator = OperatorId::new("operator").unwrap();
         assert!(TaskEnvelope::new(tenant, operator, "  ").is_err());
+    }
+
+    #[test]
+    fn execution_context_derives_least_privilege_from_role() {
+        let operator = Principal {
+            operator_id: OperatorId::new("operator").unwrap(),
+            tenant_id: TenantId::new("tenant").unwrap(),
+            role: Role::Operator,
+        };
+        let operator_context = ExecutionContext::from_principal(&operator);
+        assert!(
+            !operator_context
+                .capabilities
+                .allows(&[Capability::CodeExecution])
+        );
+        assert!(
+            !operator_context
+                .capabilities
+                .allows(&[Capability::ExternalMessaging])
+        );
+
+        let administrator = Principal {
+            role: Role::Administrator,
+            ..operator
+        };
+        let administrator_context = ExecutionContext::from_principal(&administrator);
+        assert!(
+            administrator_context
+                .capabilities
+                .allows(&[Capability::CodeExecution, Capability::ExternalMessaging])
+        );
     }
 
     #[test]

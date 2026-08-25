@@ -9,8 +9,9 @@ use serde_json::{Value, json};
 use shaka_api::{ApiConfig, ApiState, serve as serve_api};
 use shaka_config::{AppConfig, ModelProvider};
 use shaka_core::{
-    Action, AuditEvent, Capability, CapabilitySet, PlanApproval, PlanApprovalDecision, PlanId,
-    PlanState, PlanStepId, Principal, Role, SkillManifest, SkillStatus, TaskEnvelope,
+    Action, AuditEvent, Capability, CapabilitySet, ExecutionContext, PlanApproval,
+    PlanApprovalDecision, PlanId, PlanState, PlanStepId, Principal, Role, SkillManifest,
+    SkillStatus, TaskEnvelope,
 };
 use shaka_memory::MemoryStore;
 use shaka_observability::{AuditLogger, init_tracing};
@@ -349,6 +350,7 @@ async fn run_agent(cli: &Cli, args: &RunArgs) -> Result<()> {
         config.principal.operator_id.clone(),
         args.objective.clone(),
     )?;
+    envelope.execution_context = ExecutionContext::from_principal(&config.principal);
     envelope.dry_run = !config.live_requested;
     let model = build_model(&config)?;
     let mut tools = build_tool_registry(cli, &config)?;
