@@ -134,20 +134,9 @@ impl ExecutionContext {
     /// Deriva capabilities sem privilégio implícito a partir do principal autenticado.
     #[must_use]
     pub fn from_principal(principal: &Principal) -> Self {
-        let capabilities = match principal.role {
-            Role::Administrator => CapabilitySet(vec![
-                Capability::Network,
-                Capability::FilesystemRead,
-                Capability::FilesystemWrite,
-                Capability::CodeExecution,
-                Capability::ExternalMessaging,
-                Capability::MemoryWrite,
-            ]),
-            Role::Operator | Role::Reviewer => CapabilitySet::default(),
-        };
         Self {
             role: principal.role.clone(),
-            capabilities,
+            capabilities: CapabilitySet::for_role(&principal.role),
         }
     }
 }
@@ -911,6 +900,22 @@ pub enum SideEffect {
 pub struct CapabilitySet(pub Vec<Capability>);
 
 impl CapabilitySet {
+    /// Retorna a matriz canônica de capabilities efetivas para um papel RBAC.
+    #[must_use]
+    pub fn for_role(role: &Role) -> Self {
+        match role {
+            Role::Operator | Role::Reviewer => Self::default(),
+            Role::Administrator => Self(vec![
+                Capability::Network,
+                Capability::FilesystemRead,
+                Capability::FilesystemWrite,
+                Capability::CodeExecution,
+                Capability::ExternalMessaging,
+                Capability::MemoryWrite,
+            ]),
+        }
+    }
+
     #[must_use]
     pub fn allows(&self, required: &[Capability]) -> bool {
         required.iter().all(|cap| self.0.contains(cap))
@@ -1098,6 +1103,29 @@ mod tests {
             administrator_context
                 .capabilities
                 .allows(&[Capability::CodeExecution, Capability::ExternalMessaging])
+        );
+    }
+
+    #[test]
+    fn capability_policy_is_explicit_for_every_role() {
+        assert_eq!(
+            CapabilitySet::for_role(&Role::Operator),
+            CapabilitySet::default()
+        );
+        assert_eq!(
+            CapabilitySet::for_role(&Role::Reviewer),
+            CapabilitySet::default()
+        );
+        assert_eq!(
+            CapabilitySet::for_role(&Role::Administrator),
+            CapabilitySet(vec![
+                Capability::Network,
+                Capability::FilesystemRead,
+                Capability::FilesystemWrite,
+                Capability::CodeExecution,
+                Capability::ExternalMessaging,
+                Capability::MemoryWrite,
+            ])
         );
     }
 

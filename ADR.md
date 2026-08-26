@@ -122,7 +122,18 @@ O catálogo é gravado em arquivo temporário sincronizado, renomeado atomicamen
 
 **Contexto:** O catálogo de ferramentas é construído no processo do worker, mas a autorização não pode ser herdada desse estado global quando a fila contém solicitações com papéis diferentes. Um envelope enviado pelo cliente também não pode escolher suas próprias capabilities.
 
-**Decisão:** Persistir em `TaskEnvelope.execution_context` o papel e o conjunto efetivo de capabilities da execução. A API HTTP, a CLI e a submissão governada da fila derivam esse contexto do principal autenticado; a fila sobrescreve qualquer contexto fornecido pelo caller antes da transação de admissão. O runtime filtra as definições anunciadas ao modelo e repete a verificação na execução da ferramenta usando o contexto persistido. No claim de planos, as capabilities do envelope substituem as capabilities globais do worker.
+**Decisão:** Persistir em `TaskEnvelope.execution_context` o papel e o conjunto efetivo de capabilities da execução. A API HTTP, a CLI e a submissão governada da fila derivam esse contexto do principal autenticado; a fila sobrescreve qualquer contexto fornecido pelo caller antes da transação de admissão. O runtime filtra as definições anunciadas ao modelo e repete a verificação na execução da ferramenta usando o contexto persistido. No claim de planos, as capabilities do envelope substituem as capabilities globais do worker. A matriz canônica desta fatia é:
+
+| Capability | Operator | Reviewer | Administrator |
+|---|---:|---:|---:|
+| `Network` | Não | Não | Sim |
+| `FilesystemRead` | Não | Não | Sim |
+| `FilesystemWrite` | Não | Não | Sim |
+| `CodeExecution` | Não | Não | Sim |
+| `ExternalMessaging` | Não | Não | Sim |
+| `MemoryWrite` | Não | Não | Sim |
+
+A matriz é fornecida por `CapabilitySet::for_role`; não existe wildcard implícito e qualquer alteração deve atualizar os testes exatos de todos os papéis.
 
 **Compatibilidade e limites:** Envelopes antigos sem o campo são desserializados com o contexto conservador `operator` sem capabilities. `tenant_id`, `operator_id`, orçamento, `dry_run` e referências de plano permanecem no `TaskEnvelope` porque já fazem parte do contrato de identidade, execução e persistência da task; esta fatia não adiciona request-id, correlação ou referência de aprovação ao novo tipo. Administrator recebe o conjunto de capabilities atualmente declarado pelo host; Operator e Reviewer permanecem deny-by-default nesta política.
 

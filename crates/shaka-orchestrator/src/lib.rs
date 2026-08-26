@@ -933,6 +933,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn role_matrix_controls_tool_visibility() {
+        let mut tools =
+            ToolRegistry::with_capabilities(CapabilitySet::for_role(&Role::Administrator));
+        tools.register(Arc::new(EchoTool)).expect("echo");
+        tools
+            .register(Arc::new(OutboundMessageTool))
+            .expect("send_message");
+
+        let names_for = |role: Role| {
+            tools
+                .definitions_for(&CapabilitySet::for_role(&role))
+                .into_iter()
+                .map(|definition| definition.name)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names_for(Role::Operator), vec!["echo"]);
+        assert_eq!(names_for(Role::Reviewer), vec!["echo"]);
+        assert_eq!(names_for(Role::Administrator), vec!["echo", "send_message"]);
+    }
+
+    #[tokio::test]
     async fn request_context_filters_unauthorized_tools() {
         let mut tools = ToolRegistry::with_capabilities(CapabilitySet(vec![
             shaka_core::Capability::ExternalMessaging,
