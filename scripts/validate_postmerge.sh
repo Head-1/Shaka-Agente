@@ -95,8 +95,13 @@ main() {
   run_step 'version_preflight' env PYTHONDONTWRITEBYTECODE=1 \
     python3 scripts/version_preflight.py --allow-no-tag --allow-unreleased
   echo 'version_preflight=PASS'
-  run_step 'dependency_audit' cargo audit --no-fetch
-  echo 'cargo_audit_no_fetch=PASS'
+  if [[ "${SHAKA_CARGO_AUDIT_NO_FETCH:-0}" == "1" ]]; then
+    run_step 'dependency_audit' cargo audit --no-fetch
+    echo 'cargo_audit_no_fetch=PASS'
+  else
+    run_step 'dependency_audit' cargo audit
+    echo 'cargo_audit=PASS'
+  fi
 
   run_step 'cli_build' cargo build --locked -p shaka-cli
   test -x target/debug/shaka

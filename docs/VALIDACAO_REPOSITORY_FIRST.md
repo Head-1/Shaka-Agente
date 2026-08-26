@@ -8,7 +8,7 @@ O executor `scripts/validate_postmerge.sh` deve ser executado em checkout limpo.
 
 O contrato executa, nesta ordem, a identificação do checkout, validação de toolchain, sintaxe dos scripts, fmt, check locked, testes all-targets, Clippy com as exceções oficiais, secret scan, workflow policy, testes Python, version preflight, auditoria de dependências, build do CLI, smoke de produção e probe de ciclo de vida.
 
-O executor pode receber `SHAKA_EXPECTED_HEAD` para tornar a validação vinculada a um commit específico. Os scripts usam as portas locais `29143` e `29144` por padrão; em hosts compartilhados, o operador deve fornecer portas livres com `SHAKA_SMOKE_API_PORT` e `SHAKA_LIFECYCLE_API_PORT`.
+O executor pode receber `SHAKA_EXPECTED_HEAD` para tornar a validação vinculada a um commit específico. Os scripts usam as portas locais `29143` e `29144` por padrão; em hosts compartilhados, o operador deve fornecer portas livres com `SHAKA_SMOKE_API_PORT` e `SHAKA_LIFECYCLE_API_PORT`. O CI busca o banco de advisories do `cargo-audit` por padrão; `SHAKA_CARGO_AUDIT_NO_FETCH=1` habilita somente o modo offline quando esse banco já estiver instalado.
 
 ## Uso após clone
 
