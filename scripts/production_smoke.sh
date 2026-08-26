@@ -45,7 +45,7 @@ run --role administrator iam limits-set tenant-b --max-active 8 --max-daily 100 
 run --role operator sandbox-demo > "$TMP/sandbox.json"
 
 API_PORT="${SHAKA_SMOKE_API_PORT:-$((18080 + RANDOM % 1000))}"
-run --role operator serve --bind "127.0.0.1:${API_PORT}" --workers 1 > "$TMP/api.log" 2>&1 &
+"$BIN" --database "$DB" --skills-file "$SKILLS" --trust-file "$TRUST" --tenant tenant-a --role operator serve --bind "127.0.0.1:${API_PORT}" --workers 1 > "$TMP/api.log" 2>&1 &
 API_PID=$!
 for _ in $(seq 1 50); do
   if curl -fsS "http://127.0.0.1:${API_PORT}/healthz" > "$TMP/health.json"; then
@@ -77,8 +77,9 @@ sandbox = json.loads((root / "sandbox.json").read_text())
 health = json.loads((root / "health.json").read_text())
 token = json.loads((root / "token-b.json").read_text())
 assert run["success"] is True
-assert approve["approval"]["attestation"]["protocol"] == "shaka-skill-approval-v1"
+assert approve["approval"]["attestation"]["protocol"] == "shaka-skill-approval-v2"
 assert approve["approval"]["attestation"]["key_id"] == "reviewer"
+assert len(approve["approval"]["manifest_authority_sha256"]) == 64
 assert audit["valid"] is True and audit["checked_events"] >= 5
 assert doctor["status"] == "ready"
 assert sandbox["exit_code"] == 42
