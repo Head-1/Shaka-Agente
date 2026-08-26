@@ -22,36 +22,8 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Format
-        run: cargo fmt --all -- --check
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --version 0.22.2 --locked
 
-      - name: Check
-        run: cargo check --workspace --locked
-
-      - name: Test all targets
-        run: cargo test --workspace --locked --all-targets
-
-      - name: Smoke script syntax
-        run: bash -n ./scripts/production_smoke.sh
-
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings -A missing_docs -A clippy::missing_errors_doc
-
-      - name: Secret scan
-        run: python3 ./scripts/secret_scan.py
-
-      - name: Workflow policy
-        run: python3 ./scripts/workflow_policy_check.py
-
-      - name: Version preflight tests
-        run: python3 -m unittest discover -s scripts -p 'test_*.py'
-
-      - name: Version preflight
-        run: python3 ./scripts/version_preflight.py --allow-no-tag --allow-unreleased
-
-      - name: Dependency audit
-        run: cargo install cargo-audit --version 0.22.2 --locked && cargo audit
-
-
-      - name: Production smoke test
-        run: bash ./scripts/production_smoke.sh
+      - name: Repository validation contract
+        run: SHAKA_CARGO_AUDIT_NO_FETCH=0 bash ./scripts/validate_postmerge.sh

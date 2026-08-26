@@ -267,3 +267,15 @@ O MVP não fornece contenção remota automática. O responsável técnico deve 
 A validação da release v0.8.2 em 22 de agosto de 2026 confirmou versão, configuração, `doctor`, execução local em dry-run, sandbox, backup, restauração, auditoria, health check HTTP, criação de sessão, execução de tarefa e replay idempotente. O workflow também executou preflight de versão, auditoria de dependências, smoke test de produção, geração de SBOM, checksums e publicação no GHCR. A tentativa de `live` por operador comum foi bloqueada conforme esperado.
 
 O relatório operacional detalhado está em `ETAPA9_VALIDACAO_POS_RELEASE.md`; as evidências da publicação e dos hashes estão registradas no relatório local `V0.8.2_RELEASE_RESULT.md`. As evidências não alteram a tag `v0.8.2`. Para a referência normativa da API, consulte [`docs/API_PUBLICA.md`](docs/API_PUBLICA.md).
+
+## 13. Validação repository-first
+
+Para validar um checkout limpo diretamente do GitHub, incluindo testes, auditoria, smoke e ciclo de vida do processo, consulte [`docs/VALIDACAO_REPOSITORY_FIRST.md`](docs/VALIDACAO_REPOSITORY_FIRST.md) e execute:
+
+```bash
+SHAKA_EXPECTED_HEAD="$(git rev-parse HEAD)" \
+  SHAKA_VALIDATION_LOG="$HOME/shaka-validation.log" \
+  bash scripts/validate_postmerge.sh
+```
+
+O executor falha fechado diante de SHA divergente, working tree sujo, dependência obrigatória ausente, falha de teste, erro de smoke ou listener residual. Ele não instala dependências, não altera branches e não publica alterações.
