@@ -18,17 +18,18 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use shaka_core::{
-    Action, ExecutionBudget, PlanApproval, PlanApprovalDecision, PlanId, PlanMode, PlanSpec,
-    PlanSpecInput, PlanStepId, PlanStepState, Principal, TaskEnvelope, TaskId, TenantId,
+    Action, ExecutionBudget, ExecutionContext, PlanApproval, PlanApprovalDecision, PlanId,
+    PlanMode, PlanSpec, PlanSpecInput, PlanStepId, PlanStepState, Principal, TaskEnvelope, TaskId,
+    TenantId,
 };
 use shaka_observability::{AuditLogger, CorrelationContext, Telemetry};
 use shaka_orchestrator::{AgentRuntime, CancellationToken, OrchestratorError};
 use shaka_queue::{
     AuthSource, AuthenticatedPrincipal, CircuitBreaker, CircuitConfig, CircuitSnapshot,
-    FinishOutcome, PlanApprovalOutcome, PlanCheckpoint, PlanClaimContext, PlanInspectionIssue,
-    PlanInspectionReport, PlanInspectionStatus, PlanResolutionDecision, PlanResolutionOutcome,
-    PlanTaskReference, QueueError, QueueStore, SessionRecord, SubmitOutcome, TaskRecord,
-    TaskStatus,
+    FinishOutcome, LeaseToken, PlanApprovalOutcome, PlanCheckpoint, PlanClaimContext,
+    PlanInspectionIssue, PlanInspectionReport, PlanInspectionStatus, PlanResolutionDecision,
+    PlanResolutionOutcome, PlanTaskReference, QueueError, QueueStore, SessionRecord, SubmitOutcome,
+    TaskRecord, TaskStatus,
 };
 use std::{
     collections::{BTreeMap, HashMap},
@@ -39,7 +40,10 @@ use std::{
     },
 };
 use thiserror::Error;
-use tokio::{net::TcpListener, time::sleep};
+use tokio::{
+    net::TcpListener,
+    time::{sleep, timeout},
+};
 use tracing::{Instrument, error, info, warn};
 use uuid::Uuid;
 
@@ -109,11 +113,10 @@ impl ApiConfig {
                 "política de tempo da API é inválida".to_owned(),
             ));
         }
-        if !self.bind_addr.ip().is_loopback()
-            && self
-                .api_key
-                .as_ref()
-                .is_some_and(|value| value.trim().is_empty())
+        if self
+            .api_key
+            .as_ref()
+            .is_some_and(|value| value.trim().is_empty())
         {
             return Err(ApiError::BadRequest(
                 "SHAKA_API_KEY não pode ser vazia".to_owned(),
@@ -176,6 +179,7 @@ impl From<QueueError> for ApiError {
             QueueError::InvalidIdentifier(_)
             | QueueError::InvalidInput(_)
             | QueueError::Core(_) => Self::BadRequest(error.to_string()),
+            QueueError::LeaseLost => Self::Conflict("lease da tarefa perdida".to_owned()),
             QueueError::Sqlite(_) | QueueError::Serialization(_) => {
                 warn!(?error, "falha persistente na API");
                 Self::Internal
@@ -292,7 +296,6 @@ impl ApiState {
         config: ApiConfig,
     ) -> Result<Self, ApiError> {
         config.validate()?;
-        queue.bootstrap_principal(&principal)?;
         if !config.bind_addr.ip().is_loopback()
             && config.api_key.is_none()
             && !queue.has_active_tokens()?
@@ -301,6 +304,7 @@ impl ApiState {
                 "bind não local exige SHAKA_API_KEY ou token IAM ativo".to_owned(),
             ));
         }
+        queue.bootstrap_principal(&principal)?;
         let breaker = Arc::new(queue.circuit_breaker("agent-runtime", config.circuit)?);
         Ok(Self {
             queue,
@@ -361,6 +365,12 @@ impl ApiState {
 
     fn cancel_running(&self, task_id: &TaskId) {
         if let Some(token) = self.cancellations.lock().get(&task_id.0).cloned() {
+            token.cancel();
+        }
+    }
+
+    fn cancel_all_running(&self) {
+        for token in self.cancellations.lock().values() {
             token.cancel();
         }
     }
@@ -1053,6 +1063,7 @@ async fn submit_task(
         request.objective.clone(),
     )
     .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    envelope.execution_context = ExecutionContext::from_principal(&auth.principal);
     envelope.dry_run = dry_run;
     if let Some(task_id) = request.task_id.clone() {
         if plan_reference.is_none() {
@@ -1073,7 +1084,8 @@ async fn submit_task(
         Some(session_id),
         Some(&envelope.task_id),
     );
-    let submission = state.queue.submit_task_governed_with_plan(
+    let request_id = active_request_id();
+    let submission = state.queue.submit_task_governed_with_plan_and_provenance(
         session_id,
         &auth.principal,
         idempotency_key,
@@ -1082,6 +1094,7 @@ async fn submit_task(
         request.priority,
         max_attempts,
         plan_reference.as_ref(),
+        Some(&request_id),
     );
     let (outcome, task) = match submission {
         Ok((outcome, task)) => {
@@ -1167,15 +1180,22 @@ pub async fn serve(state: ApiState) -> Result<(), ApiError> {
             error!(?error, "não foi possível abrir o listener HTTP");
             ApiError::Internal
         })?;
-    let workers = start_workers(&state);
+    let workers = start_workers(&state).await;
     info!(address = %state.config.bind_addr, workers = state.config.worker_count, "API persistente iniciada");
     let server_result = axum::serve(listener, state.router())
         .with_graceful_shutdown(shutdown_signal())
         .await;
     state.shutdown.cancel();
-    for worker in workers {
-        if let Err(error) = worker.await {
-            warn!(?error, "worker da fila terminou com erro");
+    state.cancel_all_running();
+    for mut worker in workers {
+        match timeout(std::time::Duration::from_secs(5), &mut worker).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => warn!(?error, "worker da fila terminou com erro"),
+            Err(_) => {
+                warn!("worker da fila excedeu a janela de shutdown; abortando handle próprio");
+                worker.abort();
+                let _ = worker.await;
+            }
         }
     }
     server_result.map_err(|error| {
@@ -1184,9 +1204,22 @@ pub async fn serve(state: ApiState) -> Result<(), ApiError> {
     })
 }
 
-fn start_workers(state: &ApiState) -> Vec<tokio::task::JoinHandle<()>> {
+async fn queue_blocking<T, F>(operation: F) -> Result<T, QueueError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, QueueError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(operation)
+        .await
+        .map_err(|error| {
+            QueueError::InvalidInput(format!("operação de fila bloqueada terminou: {error}"))
+        })?
+}
+
+async fn start_workers(state: &ApiState) -> Vec<tokio::task::JoinHandle<()>> {
     let recovery_span = correlation_span(state, "queue.lease.recover", None, None);
-    match state.queue.recover_expired_leases(Utc::now()) {
+    let queue = Arc::clone(&state.queue);
+    match queue_blocking(move || queue.recover_expired_leases(Utc::now())).await {
         Ok(recovered) => {
             recovery_span.record("outcome", "success");
             recovery_span.record("lease_state", "recovered");
@@ -1214,7 +1247,8 @@ async fn worker_loop(worker_id: usize, state: ApiState) {
         }
         let now = Utc::now();
         let circuit_span = correlation_span(&state, "queue.circuit.allow", None, None);
-        match state.breaker.allow(now) {
+        let breaker = Arc::clone(&state.breaker);
+        match queue_blocking(move || breaker.allow(now)).await {
             Ok(true) => {
                 circuit_span.record("outcome", "allowed");
                 circuit_span.record("circuit_state", state.breaker.snapshot().state.as_str());
@@ -1241,9 +1275,12 @@ async fn worker_loop(worker_id: usize, state: ApiState) {
             remaining_budget: None,
             state_digest: None,
         };
-        match state
-            .queue
-            .claim_next_with_plan_context(now, state.config.lease_for, &plan_context)
+        let queue = Arc::clone(&state.queue);
+        let lease_for = state.config.lease_for;
+        match queue_blocking(move || {
+            queue.claim_next_with_plan_context(now, lease_for, &plan_context)
+        })
+        .await
         {
             Ok(Some(task)) => {
                 claim_span.record("outcome", "claimed");
@@ -1264,63 +1301,118 @@ async fn worker_loop(worker_id: usize, state: ApiState) {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn execute_task(worker_id: usize, state: ApiState, task: TaskRecord) {
     let task_id = task.task_id.clone();
-    let task_span = correlation_span(&state, "worker.task.process", None, Some(&task_id));
-    task_span.record("worker_id", worker_id);
-    task_span.record("attempt", task.attempts);
-    task_span.record("lease_state", "held");
-    if let Some(plan_id) = &task.plan_id {
-        task_span.record("plan_mode", "planned");
-        task_span.record("plan_revision", task.plan_revision.unwrap_or_default());
-        task_span.record(
-            "plan_step",
-            task.plan_step_id
-                .as_ref()
-                .map_or("none", |id| id.0.as_str()),
-        );
-        task_span.record("plan_reference", plan_id.0.to_string());
-    } else {
-        task_span.record("plan_mode", "direct");
-    }
-    let token = CancellationToken::new();
-    state.register_cancellation(&task_id, token.clone());
-    let execution = state
-        .runtime
-        .run_with_cancellation(task.envelope.clone(), token)
-        .instrument(task_span.clone())
-        .await;
-    state.remove_cancellation(&task_id);
-    let now = Utc::now();
-    match execution {
-        Ok(result) => {
-            task_span.record("outcome", "runtime_succeeded");
-            record_circuit_success(worker_id, &state);
-            finish_success(
-                worker_id,
-                &state,
-                &task,
-                &task_id,
-                serde_json::to_value(&result).ok(),
-                now,
-            );
-        }
-        Err(error) => {
-            let retryable = is_retryable(&error);
-            task_span.record("outcome", "runtime_failed");
-            task_span.record("retryable", retryable);
-            task_span.record("error_type", orchestrator_error_type(&error));
-            if retryable {
-                record_circuit_failure(worker_id, &state, now);
+    let correlation = task
+        .envelope
+        .execution_context
+        .provenance
+        .request_id
+        .as_deref()
+        .and_then(|request_id| CorrelationContext::with_request_id(request_id).ok())
+        .unwrap_or_else(|| {
+            CorrelationContext::with_request_id(format!("task-{}", task_id.0)).unwrap_or_default()
+        });
+    ACTIVE_CORRELATION
+        .scope(correlation, async move {
+            let task_span = correlation_span(&state, "worker.task.process", None, Some(&task_id));
+            task_span.record("worker_id", worker_id);
+            task_span.record("attempt", task.attempts);
+            task_span.record("lease_state", "held");
+            if let Some(plan_id) = &task.plan_id {
+                task_span.record("plan_mode", "planned");
+                task_span.record("plan_revision", task.plan_revision.unwrap_or_default());
+                task_span.record(
+                    "plan_step",
+                    task.plan_step_id
+                        .as_ref()
+                        .map_or("none", |id| id.0.as_str()),
+                );
+                task_span.record("plan_reference", plan_id.0.to_string());
+            } else {
+                task_span.record("plan_mode", "direct");
             }
-            finish_failure(worker_id, &state, &task, &task_id, &error, retryable, now);
-        }
-    }
+            let Some(lease_token) = task.lease_token else {
+                task_span.record("outcome", "lease_missing");
+                let task_label = task_id.0.to_string();
+                warn!(worker_id, task_id = %task_label, "task reclamada sem token de lease; execução bloqueada");
+                return;
+            };
+            let token = CancellationToken::new();
+            state.register_cancellation(&task_id, token.clone());
+            let execution = state
+                .runtime
+                .run_with_cancellation_and_scope(
+                    task.envelope.clone(),
+                    token,
+                    task.plan_execution_scope.clone(),
+                )
+                .instrument(task_span.clone())
+                .await;
+            state.remove_cancellation(&task_id);
+            let now = Utc::now();
+            match execution {
+                Ok(result) => {
+                    task_span.record("outcome", "runtime_succeeded");
+                    record_circuit_success(worker_id, &state).await;
+                    finish_success(
+                        worker_id,
+                        &state,
+                        &task,
+                        &task_id,
+                        lease_token,
+                        serde_json::to_value(&result).ok(),
+                        now,
+                    )
+                    .await;
+                }
+                Err(error) => {
+                    if matches!(error, OrchestratorError::Cancelled)
+                        && state.shutdown.is_cancelled()
+                    {
+                        let queue = Arc::clone(&state.queue);
+                        let cancel_task_id = task_id.clone();
+                        let cancel_tenant_id = task.tenant_id.clone();
+                        if let Err(cancel_error) = queue_blocking(move || {
+                            queue.request_cancel(&cancel_task_id, &cancel_tenant_id).map(|_| ())
+                        })
+                        .await
+                        {
+                            warn!(
+                                worker_id,
+                                ?cancel_error,
+                                "não foi possível marcar tarefa como cancelada durante shutdown"
+                            );
+                        }
+                    }
+                    let retryable = is_retryable(&error);
+                    task_span.record("outcome", "runtime_failed");
+                    task_span.record("retryable", retryable);
+                    task_span.record("error_type", orchestrator_error_type(&error));
+                    if retryable {
+                        record_circuit_failure(worker_id, &state, now).await;
+                    }
+                    finish_failure(
+                        worker_id,
+                        &state,
+                        &task,
+                        lease_token,
+                        &error,
+                        retryable,
+                        now,
+                    )
+                    .await;
+                }
+            }
+        })
+        .await;
 }
 
-fn record_circuit_success(worker_id: usize, state: &ApiState) {
+async fn record_circuit_success(worker_id: usize, state: &ApiState) {
     let circuit_span = correlation_span(state, "queue.circuit.record_success", None, None);
-    match state.breaker.record_success() {
+    let breaker = Arc::clone(&state.breaker);
+    match queue_blocking(move || breaker.record_success()).await {
         Ok(()) => {
             circuit_span.record("outcome", "success");
             circuit_span.record("circuit_state", state.breaker.snapshot().state.as_str());
@@ -1337,9 +1429,10 @@ fn record_circuit_success(worker_id: usize, state: &ApiState) {
     }
 }
 
-fn record_circuit_failure(worker_id: usize, state: &ApiState, now: DateTime<Utc>) {
+async fn record_circuit_failure(worker_id: usize, state: &ApiState, now: DateTime<Utc>) {
     let circuit_span = correlation_span(state, "queue.circuit.record_failure", None, None);
-    match state.breaker.record_failure(now) {
+    let breaker = Arc::clone(&state.breaker);
+    match queue_blocking(move || breaker.record_failure(now)).await {
         Ok(()) => {
             circuit_span.record("outcome", "failure");
             circuit_span.record("circuit_state", state.breaker.snapshot().state.as_str());
@@ -1356,31 +1449,42 @@ fn record_circuit_failure(worker_id: usize, state: &ApiState, now: DateTime<Utc>
     }
 }
 
-fn finish_success(
+async fn finish_success(
     worker_id: usize,
     state: &ApiState,
     task: &TaskRecord,
     task_id: &TaskId,
+    lease_token: LeaseToken,
     result_json: Option<Value>,
     now: DateTime<Utc>,
 ) {
     let finish_span = correlation_span(state, "queue.finish", None, Some(task_id));
     let plan_context = worker_plan_context(state);
-    match state.queue.finish_task_with_plan_context(
-        task_id,
-        &task.tenant_id,
-        result_json,
-        None,
-        false,
-        now,
-        state.config.retry_base_delay,
-        state.config.retry_max_delay,
-        &plan_context,
-    ) {
+    let queue = Arc::clone(&state.queue);
+    let task_id_owned = task_id.clone();
+    let tenant_id = task.tenant_id.clone();
+    let retry_base_delay = state.config.retry_base_delay;
+    let retry_max_delay = state.config.retry_max_delay;
+    let outcome = queue_blocking(move || {
+        queue.finish_task_with_plan_context(
+            &task_id_owned,
+            &tenant_id,
+            lease_token,
+            result_json,
+            None,
+            false,
+            now,
+            retry_base_delay,
+            retry_max_delay,
+            &plan_context,
+        )
+    })
+    .await;
+    match outcome {
         Ok(outcome) => {
             finish_span.record("outcome", finish_outcome_name(&outcome));
             finish_span.record("lease_state", "released");
-            audit_task_finish(state, task, &outcome);
+            audit_task_finish(state, task, &outcome).await;
         }
         Err(error) => {
             finish_span.record("outcome", "failed");
@@ -1394,29 +1498,39 @@ fn finish_success(
     }
 }
 
-fn finish_failure(
+async fn finish_failure(
     worker_id: usize,
     state: &ApiState,
     task: &TaskRecord,
-    task_id: &TaskId,
+    lease_token: LeaseToken,
     error: &OrchestratorError,
     retryable: bool,
     now: DateTime<Utc>,
 ) {
     let safe_error = shaka_core::redact_sensitive(&error.to_string());
-    let finish_span = correlation_span(state, "queue.finish", None, Some(task_id));
+    let finish_span = correlation_span(state, "queue.finish", None, Some(&task.task_id));
     let plan_context = worker_plan_context(state);
-    match state.queue.finish_task_with_plan_context(
-        task_id,
-        &task.tenant_id,
-        None,
-        Some(safe_error.as_str()),
-        retryable,
-        now,
-        state.config.retry_base_delay,
-        state.config.retry_max_delay,
-        &plan_context,
-    ) {
+    let queue = Arc::clone(&state.queue);
+    let task_id = task.task_id.clone();
+    let tenant_id = task.tenant_id.clone();
+    let retry_base_delay = state.config.retry_base_delay;
+    let retry_max_delay = state.config.retry_max_delay;
+    let outcome = queue_blocking(move || {
+        queue.finish_task_with_plan_context(
+            &task_id,
+            &tenant_id,
+            lease_token,
+            None,
+            Some(safe_error.as_str()),
+            retryable,
+            now,
+            retry_base_delay,
+            retry_max_delay,
+            &plan_context,
+        )
+    })
+    .await;
+    match outcome {
         Ok(outcome) => {
             finish_span.record("outcome", finish_outcome_name(&outcome));
             finish_span.record("retryable", retryable);
@@ -1430,7 +1544,7 @@ fn finish_failure(
                     (*next_attempt_at - now).num_milliseconds().max(0),
                 );
             }
-            audit_task_finish(state, task, &outcome);
+            audit_task_finish(state, task, &outcome).await;
         }
         Err(queue_error) => {
             finish_span.record("outcome", "failed");
@@ -1453,7 +1567,7 @@ fn worker_plan_context(state: &ApiState) -> PlanClaimContext {
     }
 }
 
-fn audit_task_finish(state: &ApiState, task: &TaskRecord, outcome: &FinishOutcome) {
+async fn audit_task_finish(state: &ApiState, task: &TaskRecord, outcome: &FinishOutcome) {
     let outcome_name = match outcome {
         FinishOutcome::Succeeded => "succeeded",
         FinishOutcome::PlanStepSucceeded { .. } => "plan_step_succeeded",
@@ -1462,15 +1576,45 @@ fn audit_task_finish(state: &ApiState, task: &TaskRecord, outcome: &FinishOutcom
         FinishOutcome::Failed => "failed",
         FinishOutcome::Cancelled => "cancelled",
     };
-    audit_identity(
-        state,
-        &task.tenant_id,
-        &task.envelope.operator_id,
-        Some(task.task_id.clone()),
-        "api.task.finish",
-        outcome_name,
-        BTreeMap::new(),
-    );
+    let mut metadata = BTreeMap::new();
+    if let Some(approval_id) = task
+        .envelope
+        .execution_context
+        .provenance
+        .admission_approval_id
+    {
+        metadata.insert("admission_approval_id".to_owned(), approval_id.to_string());
+    }
+    if let Some(context) = active_correlation() {
+        metadata.insert(
+            "correlation_request_id".to_owned(),
+            context.request_id().to_owned(),
+        );
+        if let Some(trace_id) = context.trace_id() {
+            metadata.insert("correlation_trace_id".to_owned(), trace_id.to_owned());
+        }
+    }
+    let audit = Arc::clone(&state.audit);
+    let tenant_id = task.tenant_id.clone();
+    let operator_id = task.envelope.operator_id.0.clone();
+    let task_id = Some(task.task_id.clone());
+    let outcome_name = outcome_name.to_owned();
+    match tokio::task::spawn_blocking(move || {
+        audit.record(
+            task_id,
+            tenant_id,
+            operator_id,
+            "api.task.finish",
+            outcome_name,
+            metadata,
+        )
+    })
+    .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => warn!(?error, "evento de finalização não pôde ser auditado"),
+        Err(error) => warn!(?error, "thread de auditoria terminou com erro"),
+    }
 }
 
 fn is_retryable(error: &OrchestratorError) -> bool {
@@ -1511,6 +1655,7 @@ fn queue_error_type(error: &QueueError) -> &'static str {
         QueueError::Forbidden => "forbidden",
         QueueError::QuotaExceeded(_) => "quota_exceeded",
         QueueError::RateLimited { .. } => "rate_limited",
+        QueueError::LeaseLost => "lease_lost",
     }
 }
 
@@ -1521,6 +1666,7 @@ fn orchestrator_error_type(error: &OrchestratorError) -> &'static str {
         OrchestratorError::Http(_) => "http",
         OrchestratorError::InvalidModelResponse(_) => "invalid_model_response",
         OrchestratorError::ToolNotFound(_) => "tool_not_found",
+        OrchestratorError::PlanActionDenied(_) => "plan_action_denied",
         OrchestratorError::ToolExecution(_) => "tool_execution",
         OrchestratorError::DeadlineExceeded => "deadline_exceeded",
         OrchestratorError::Cancelled => "cancelled",
@@ -1737,6 +1883,31 @@ fn audit_identity(
 }
 
 async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut sigterm =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(signal) => signal,
+                Err(error) => {
+                    warn!(?error, "não foi possível registrar SIGTERM");
+                    if let Err(ctrl_c_error) = tokio::signal::ctrl_c().await {
+                        warn!(?ctrl_c_error, "não foi possível aguardar Ctrl-C");
+                    }
+                    return;
+                }
+            };
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                if let Err(error) = result {
+                    warn!(?error, "não foi possível aguardar Ctrl-C");
+                }
+            }
+            _ = sigterm.recv() => {
+                info!("SIGTERM recebido; iniciando shutdown graceful");
+            }
+        }
+    }
+    #[cfg(not(unix))]
     if let Err(error) = tokio::signal::ctrl_c().await {
         warn!(?error, "não foi possível aguardar Ctrl-C");
     }
@@ -1748,10 +1919,11 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use shaka_core::{
-        ExecutionBudget, PlanAction, PlanApprovalRequirement, PlanRisk, PlanSpecInput, PlanStep,
+        ExecutionBudget, MAX_EXECUTION_STEPS, PlanAction, PlanApprovalRequirement, PlanRisk,
+        PlanSpecInput, PlanStep,
     };
     use shaka_memory::MemoryStore;
-    use shaka_orchestrator::{AgentModel, EchoTool, LocalModel, ToolRegistry};
+    use shaka_orchestrator::{AgentModel, EchoTool, LocalModel, OutboundMessageTool, ToolRegistry};
     use shaka_orchestrator::{ModelRequest, ModelResponse};
     use tower::ServiceExt;
 
@@ -1779,6 +1951,268 @@ mod tests {
             ApiConfig::default(),
         )
         .unwrap()
+    }
+
+    #[derive(Debug)]
+    struct RequestScopedMessageModel;
+
+    #[async_trait]
+    impl AgentModel for RequestScopedMessageModel {
+        async fn complete(
+            &self,
+            request: ModelRequest,
+        ) -> Result<ModelResponse, OrchestratorError> {
+            assert!(!request.tools.iter().any(|tool| tool.name == "send_message"));
+            if request.prior_tool_results.is_empty() {
+                Ok(ModelResponse {
+                    content: String::new(),
+                    tool_calls: vec![shaka_orchestrator::ModelToolCall {
+                        tool_name: "send_message".to_owned(),
+                        arguments: json!({"channel":"external","message":"blocked"}),
+                    }],
+                    estimated_cost_microunits: 0,
+                })
+            } else {
+                Ok(ModelResponse {
+                    content: "fim".to_owned(),
+                    tool_calls: Vec::new(),
+                    estimated_cost_microunits: 0,
+                })
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn operator_request_cannot_use_admin_runtime_capability() {
+        let memory = Arc::new(MemoryStore::in_memory().unwrap());
+        let audit = Arc::new(AuditLogger::new(Arc::clone(&memory)));
+        let mut tools = ToolRegistry::with_capabilities(shaka_core::CapabilitySet(vec![
+            shaka_core::Capability::ExternalMessaging,
+        ]));
+        tools.register(Arc::new(OutboundMessageTool)).unwrap();
+        let state = ApiState::new(
+            Arc::new(QueueStore::in_memory().unwrap()),
+            Arc::new(AgentRuntime::new(
+                Arc::new(RequestScopedMessageModel),
+                memory,
+                tools,
+            )),
+            audit,
+            principal(),
+            ApiConfig::default(),
+        )
+        .unwrap();
+        let operator = shaka_core::OperatorId::new("request-operator").unwrap();
+        state
+            .queue
+            .create_user(
+                &operator,
+                &state.principal.tenant_id,
+                &shaka_core::Role::Operator,
+            )
+            .unwrap();
+        let issue = state
+            .queue
+            .issue_token(
+                &operator,
+                Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+            )
+            .unwrap();
+        let session_response = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/sessions")
+                    .header("authorization", format!("Bearer {}", issue.token))
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(session_response.status(), StatusCode::CREATED);
+        let session: SessionResponse = serde_json::from_slice(
+            &axum::body::to_bytes(session_response.into_body(), 1_048_576)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let task_response = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/sessions/{}/tasks", session.session_id))
+                    .header("authorization", format!("Bearer {}", issue.token))
+                    .header("x-request-id", "operator-request-1")
+                    .header("idempotency-key", "request-context-1")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        r#"{"objective":"tentar mensageria","dry_run":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(task_response.status(), StatusCode::ACCEPTED);
+        let task: Value = serde_json::from_slice(
+            &axum::body::to_bytes(task_response.into_body(), 1_048_576)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let task_id = TaskId(Uuid::parse_str(task["task_id"].as_str().unwrap()).unwrap());
+        let claimed = state
+            .queue
+            .claim_next(Utc::now(), Duration::seconds(30))
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.task_id, task_id);
+        assert_eq!(
+            claimed
+                .envelope
+                .execution_context
+                .provenance
+                .request_id
+                .as_deref(),
+            Some("operator-request-1")
+        );
+        execute_task(0, state.clone(), claimed).await;
+        let finished = state
+            .queue
+            .get_task(&task_id, &state.principal.tenant_id)
+            .unwrap();
+        assert_eq!(
+            finished
+                .envelope
+                .execution_context
+                .provenance
+                .request_id
+                .as_deref(),
+            Some("operator-request-1")
+        );
+        let result = finished.result.unwrap();
+        assert_eq!(result["success"], false);
+        assert_eq!(
+            result["tool_results"][0]["error_code"],
+            "tool_execution_failed"
+        );
+        assert!(
+            result["tool_results"][0]["output"]["serialized"]
+                .as_str()
+                .unwrap()
+                .contains("capacidade não autorizada")
+        );
+    }
+
+    #[test]
+    fn empty_static_api_key_is_rejected_even_on_loopback() {
+        let base = state();
+        let config = ApiConfig {
+            api_key: Some(String::new()),
+            ..ApiConfig::default()
+        };
+        let configured = ApiState::new(
+            base.queue.clone(),
+            base.runtime.clone(),
+            base.audit.clone(),
+            base.principal.clone(),
+            config,
+        );
+        assert!(matches!(
+            configured,
+            Err(ApiError::BadRequest(message)) if message.contains("não pode ser vazia")
+        ));
+    }
+
+    #[tokio::test]
+    async fn api_rejects_oversized_json_body_before_handler() {
+        let payload = format!(
+            r#"{{"metadata":{{"padding":"{}"}}}}"#,
+            "x".repeat(3 * 1024 * 1024)
+        );
+        let response = state()
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/sessions")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(payload))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn api_rejects_budget_above_host_maximum() {
+        let state = state();
+        let issue = state
+            .queue
+            .issue_token(
+                &state.principal().operator_id,
+                Some(Utc::now() + Duration::hours(1)),
+            )
+            .unwrap();
+        let session_response = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/sessions")
+                    .header("authorization", format!("Bearer {}", issue.token))
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(session_response.status(), StatusCode::CREATED);
+        let session: SessionResponse = serde_json::from_slice(
+            &axum::body::to_bytes(session_response.into_body(), 1_048_576)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+
+        let response = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/sessions/{}/tasks", session.session_id))
+                    .header("authorization", format!("Bearer {}", issue.token))
+                    .header("idempotency-key", "budget-above-max-1")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::to_vec(&json!({
+                            "objective": "budget acima do máximo",
+                            "dry_run": true,
+                            "budget": {
+                                "max_steps": MAX_EXECUTION_STEPS + 1,
+                                "max_tool_calls": 16,
+                                "max_elapsed_ms": 30_000,
+                                "max_cost_microunits": 1_000_000
+                            }
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 1_048_576)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(body.to_string().contains("budget.max_steps"));
     }
 
     #[test]
@@ -2035,7 +2469,13 @@ mod tests {
                 &shaka_core::Role::Reviewer,
             )
             .unwrap();
-        let token = state.queue.issue_token(&reviewer, None).unwrap();
+        let token = state
+            .queue
+            .issue_token(
+                &reviewer,
+                Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+            )
+            .unwrap();
         let response = state
             .router()
             .oneshot(
@@ -2225,7 +2665,13 @@ mod tests {
             .queue
             .create_user(&operator, &tenant, &shaka_core::Role::Operator)
             .unwrap();
-        let issue = state.queue.issue_token(&operator, None).unwrap();
+        let issue = state
+            .queue
+            .issue_token(
+                &operator,
+                Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+            )
+            .unwrap();
         let response = state
             .router()
             .oneshot(
@@ -2260,6 +2706,60 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn rejected_non_local_bind_does_not_persist_bootstrap_principal() {
+        let memory = Arc::new(MemoryStore::in_memory().unwrap());
+        let audit = Arc::new(AuditLogger::new(Arc::clone(&memory)));
+        let mut tools = ToolRegistry::with_capabilities(shaka_core::CapabilitySet(Vec::new()));
+        tools.register(Arc::new(EchoTool)).unwrap();
+        let runtime = Arc::new(AgentRuntime::new(Arc::new(LocalModel), memory, tools));
+        let queue = Arc::new(QueueStore::in_memory().unwrap());
+        let principal = Principal {
+            operator_id: shaka_core::OperatorId::new("bootstrap-operator").unwrap(),
+            tenant_id: TenantId::new("bootstrap-tenant").unwrap(),
+            role: shaka_core::Role::Administrator,
+        };
+        assert!(queue.list_tenants().unwrap().is_empty());
+        let config = ApiConfig {
+            bind_addr: "0.0.0.0:8080".parse().unwrap(),
+            ..ApiConfig::default()
+        };
+        let result = ApiState::new(queue.clone(), runtime, audit, principal, config);
+        assert!(matches!(
+            result,
+            Err(ApiError::BadRequest(message)) if message.contains("bind não local")
+        ));
+        assert!(queue.list_tenants().unwrap().is_empty());
+        assert!(!queue.has_active_tokens().unwrap());
+    }
+
+    #[test]
+    fn non_local_bind_with_api_key_bootstraps_principal() {
+        let memory = Arc::new(MemoryStore::in_memory().unwrap());
+        let audit = Arc::new(AuditLogger::new(Arc::clone(&memory)));
+        let mut tools = ToolRegistry::with_capabilities(shaka_core::CapabilitySet(Vec::new()));
+        tools.register(Arc::new(EchoTool)).unwrap();
+        let queue = Arc::new(QueueStore::in_memory().unwrap());
+        let principal = Principal {
+            operator_id: shaka_core::OperatorId::new("api-key-operator").unwrap(),
+            tenant_id: TenantId::new("api-key-tenant").unwrap(),
+            role: shaka_core::Role::Administrator,
+        };
+        let _state = ApiState::new(
+            queue.clone(),
+            Arc::new(AgentRuntime::new(Arc::new(LocalModel), memory, tools)),
+            audit,
+            principal,
+            ApiConfig {
+                bind_addr: "0.0.0.0:8080".parse().unwrap(),
+                api_key: Some("non-empty-key".to_owned()),
+                ..ApiConfig::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(queue.list_tenants().unwrap().len(), 1);
     }
 
     #[test]

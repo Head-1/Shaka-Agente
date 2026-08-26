@@ -5,11 +5,14 @@
 
 use chrono::{DateTime, Duration, Utc};
 use parking_lot::Mutex;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use shaka_core::{OperatorId, PlanId, PlanStepId, Principal, Role, TaskEnvelope, TaskId, TenantId};
+use shaka_core::{
+    ExecutionContext, OperatorId, PlanExecutionScope, PlanId, PlanStep, PlanStepId, Principal,
+    Role, TaskEnvelope, TaskId, TenantId,
+};
 use std::sync::Arc;
 use thiserror::Error;
 use uuid::Uuid;
@@ -65,6 +68,9 @@ pub enum QueueError {
         /// Segundos sugeridos até uma nova tentativa.
         retry_after_seconds: u64,
     },
+    /// O worker perdeu a lease antes de persistir a finalização.
+    #[error("lease da tarefa perdida; finalização rejeitada")]
+    LeaseLost,
 }
 
 /// Estado persistido de uma tarefa da fila.
@@ -131,6 +137,19 @@ pub struct SessionRecord {
     pub metadata: Value,
 }
 
+/// Token de fencing emitido a cada claim de worker.
+///
+/// O token é host-side, opaco e deve acompanhar toda finalização. Um token
+/// anterior não pode ser reutilizado depois de recovery ou novo claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeaseToken(Uuid);
+
+impl LeaseToken {
+    fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
 /// Registro persistido da tarefa e de sua lease.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskRecord {
@@ -160,6 +179,12 @@ pub struct TaskRecord {
     pub cancel_requested: bool,
     /// Fim da lease atribuída ao worker.
     pub lease_until: Option<DateTime<Utc>>,
+    /// Token de fencing da lease atual, ausente para tarefas ainda não reclamadas.
+    #[serde(skip)]
+    pub lease_token: Option<LeaseToken>,
+    /// Escopo host-side da etapa de plano atualmente reclamada.
+    #[serde(skip)]
+    pub plan_execution_scope: Option<PlanExecutionScope>,
     /// Resultado serializado quando disponível.
     pub result: Option<Value>,
     /// Último erro sanitizado observado.
@@ -228,6 +253,9 @@ pub struct AuthenticatedPrincipal {
     pub source: AuthSource,
 }
 
+/// Vida máxima permitida para um token IAM emitido pelo host.
+pub const MAX_TOKEN_LIFETIME_SECONDS: i64 = 90 * 24 * 60 * 60;
+
 /// Resultado da emissão de um token. O campo `token` deve ser exibido uma única vez.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TokenIssue {
@@ -239,7 +267,8 @@ pub struct TokenIssue {
     pub token_prefix: String,
     /// Principal ao qual o token foi vinculado.
     pub principal: Principal,
-    /// Expiração opcional em UTC.
+    /// Expiração UTC; sempre preenchida para tokens emitidos nesta versão.
+    /// O `Option` é mantido apenas para compatibilidade de desserialização.
     pub expires_at: Option<DateTime<Utc>>,
 }
 
@@ -370,6 +399,7 @@ impl QueueStore {
     /// Abre ou cria um banco SQLite e executa migrações idempotentes.
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, QueueError> {
         let connection = Connection::open(path)?;
+        connection.busy_timeout(std::time::Duration::from_secs(5))?;
         let store = Self {
             connection: Mutex::new(connection),
         };
@@ -380,6 +410,7 @@ impl QueueStore {
     /// Cria um store efêmero para testes e validações locais.
     pub fn in_memory() -> Result<Self, QueueError> {
         let connection = Connection::open_in_memory()?;
+        connection.busy_timeout(std::time::Duration::from_secs(5))?;
         let store = Self {
             connection: Mutex::new(connection),
         };
@@ -421,6 +452,7 @@ impl QueueStore {
                  next_attempt_at TEXT NOT NULL,
                  cancel_requested INTEGER NOT NULL DEFAULT 0,
                  lease_until TEXT,
+                 lease_token TEXT,
                  result_json TEXT,
                  last_error TEXT,
                  created_at TEXT NOT NULL,
@@ -642,6 +674,7 @@ impl QueueStore {
             ("plan_revision", "INTEGER"),
             ("plan_digest", "TEXT"),
             ("plan_step_id", "TEXT"),
+            ("lease_token", "TEXT"),
         ] {
             if !columns.iter().any(|column| column == name) {
                 connection.execute(
@@ -665,7 +698,7 @@ impl QueueStore {
         let now = Utc::now().to_rfc3339();
         let role = serde_json::to_string(&principal.role)?;
         let mut connection = self.connection.lock();
-        let transaction = connection.transaction()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
             "INSERT OR IGNORE INTO api_tenants
              (tenant_id, display_name, active, created_at) VALUES (?1, ?2, 1, ?3)",
@@ -692,7 +725,7 @@ impl QueueStore {
         validate_key(display_name, "display_name", 256)?;
         let now = Utc::now();
         let mut connection = self.connection.lock();
-        let transaction = connection.transaction()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
             "INSERT INTO api_tenants (tenant_id, display_name, active, created_at)
              VALUES (?1, ?2, 1, ?3)",
@@ -739,11 +772,24 @@ impl QueueStore {
         if !user.active {
             return Err(QueueError::Unauthorized);
         }
+        let now = Utc::now();
+        let expires_at = expires_at.ok_or_else(|| {
+            QueueError::InvalidInput("token IAM exige expiração explícita".to_owned())
+        })?;
+        if expires_at <= now {
+            return Err(QueueError::InvalidInput(
+                "token IAM deve expirar no futuro".to_owned(),
+            ));
+        }
+        if expires_at > now + Duration::seconds(MAX_TOKEN_LIFETIME_SECONDS) {
+            return Err(QueueError::InvalidInput(format!(
+                "vida do token IAM não pode exceder {MAX_TOKEN_LIFETIME_SECONDS} segundos"
+            )));
+        }
         let token_id = format!("tok_{}", Uuid::new_v4());
         let token = format!("shk_{}_{}", Uuid::new_v4(), Uuid::new_v4());
         let token_prefix = token.chars().take(12).collect::<String>();
         let token_hash = sha256_hex(&token);
-        let now = Utc::now();
         self.connection.lock().execute(
             "INSERT INTO api_tokens
              (token_id, token_hash, token_prefix, operator_id, created_at, expires_at, revoked_at, last_used_at)
@@ -754,7 +800,7 @@ impl QueueStore {
                 token_prefix,
                 operator_id.0,
                 now.to_rfc3339(),
-                expires_at.map(|value| value.to_rfc3339()),
+                Some(expires_at.to_rfc3339()),
             ],
         )?;
         Ok(TokenIssue {
@@ -766,7 +812,7 @@ impl QueueStore {
                 tenant_id: user.tenant_id,
                 role: user.role,
             },
-            expires_at,
+            expires_at: Some(expires_at),
         })
     }
 
@@ -1036,8 +1082,10 @@ impl QueueStore {
         Ok(())
     }
 
+    /// Primitiva de teste não governada; entradas externas devem usar `submit_task_governed*`.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
-    pub fn submit_task(
+    pub(crate) fn submit_task(
         &self,
         session_id: Uuid,
         tenant_id: &TenantId,
@@ -1061,7 +1109,7 @@ impl QueueStore {
         }
         let now = Utc::now();
         let mut connection = self.connection.lock();
-        let transaction = connection.transaction()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some(existing_id) = transaction
             .query_row(
                 "SELECT task_id FROM api_tasks
@@ -1118,7 +1166,8 @@ impl QueueStore {
         priority: i32,
         max_attempts: u32,
     ) -> Result<(SubmitOutcome, TaskRecord), QueueError> {
-        self.submit_task_governed_with_plan(
+        let request_id = Uuid::new_v4().to_string();
+        self.submit_task_governed_with_plan_and_provenance(
             session_id,
             principal,
             idempotency_key,
@@ -1127,9 +1176,9 @@ impl QueueStore {
             priority,
             max_attempts,
             None,
+            Some(&request_id),
         )
     }
-
     /// Submete uma task governada e, quando informado, valida sua revisão de plano na admissão.
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub fn submit_task_governed_with_plan(
@@ -1143,13 +1192,44 @@ impl QueueStore {
         max_attempts: u32,
         plan_reference: Option<&PlanTaskReference>,
     ) -> Result<(SubmitOutcome, TaskRecord), QueueError> {
+        let request_id = Uuid::new_v4().to_string();
+        self.submit_task_governed_with_plan_and_provenance(
+            session_id,
+            principal,
+            idempotency_key,
+            request_fingerprint,
+            envelope,
+            priority,
+            max_attempts,
+            plan_reference,
+            Some(&request_id),
+        )
+    }
+    /// Submete uma task governada com request ID derivado pelo host e validação opcional de plano.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    pub fn submit_task_governed_with_plan_and_provenance(
+        &self,
+        session_id: Uuid,
+        principal: &Principal,
+        idempotency_key: &str,
+        request_fingerprint: &str,
+        envelope: &TaskEnvelope,
+        priority: i32,
+        max_attempts: u32,
+        plan_reference: Option<&PlanTaskReference>,
+        request_id: Option<&str>,
+    ) -> Result<(SubmitOutcome, TaskRecord), QueueError> {
         validate_key(idempotency_key, "idempotency_key", 256)?;
         validate_key(request_fingerprint, "request_fingerprint", 128)?;
+        if let Some(request_id) = request_id {
+            validate_key(request_id, "request_id", 128)?;
+        }
         if max_attempts == 0 || max_attempts > 10 {
             return Err(QueueError::InvalidInput(
                 "max_attempts deve estar entre 1 e 10".to_owned(),
             ));
         }
+        envelope.budget.validate()?;
         if envelope.tenant_id != principal.tenant_id
             || envelope.operator_id != principal.operator_id
         {
@@ -1157,7 +1237,7 @@ impl QueueStore {
         }
         let now = Utc::now();
         let mut connection = self.connection.lock();
-        let transaction = connection.transaction()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let session_operator = transaction
             .query_row(
                 "SELECT operator_id FROM api_sessions
@@ -1170,9 +1250,8 @@ impl QueueStore {
         if session_operator != principal.operator_id.0 {
             return Err(QueueError::Forbidden);
         }
-        if let Some(reference) = plan_reference {
-            plan_store::verify_plan_admission_tx(&transaction, principal, envelope, reference)?;
-        }
+        let mut governed_envelope = envelope.clone();
+        governed_envelope.execution_context = ExecutionContext::from_principal(principal);
         let limits = load_limits_tx(&transaction, &principal.tenant_id)?;
         let window_start = fixed_window_start(now, limits.window_seconds);
         for scope in [
@@ -1235,6 +1314,20 @@ impl QueueStore {
             transaction.commit()?;
             return Ok((SubmitOutcome::Existing, existing));
         }
+        let admission_approval_id = if let Some(reference) = plan_reference {
+            plan_store::record_plan_admission_tx(
+                &transaction,
+                principal,
+                &governed_envelope,
+                reference,
+            )?
+        } else {
+            None
+        };
+        governed_envelope.execution_context = governed_envelope
+            .execution_context
+            .with_provenance(request_id.map(str::to_owned), admission_approval_id);
+        let envelope = &governed_envelope;
         let active_count: i64 = transaction.query_row(
             "SELECT COUNT(*) FROM api_tasks
              WHERE tenant_id = ?1 AND status IN ('queued', 'running', 'cancel_requested')",
@@ -1278,19 +1371,16 @@ impl QueueStore {
                 "max_daily_cost_microunits".to_owned(),
             ));
         }
-        if let Some(reference) = plan_reference {
-            plan_store::record_plan_admission_tx(&transaction, principal, envelope, reference)?;
-        }
         let task_id = envelope.task_id.clone();
         let envelope_json = serde_json::to_string(envelope)?;
         transaction.execute(
             "INSERT INTO api_tasks
              (task_id, session_id, tenant_id, idempotency_key, request_fingerprint,
               objective, envelope_json, status, priority, attempts, max_attempts,
-              next_attempt_at, cancel_requested, lease_until, result_json, last_error,
+              next_attempt_at, cancel_requested, lease_until, lease_token, result_json, last_error,
               created_at, updated_at, completed_at, plan_id, plan_revision, plan_digest, plan_step_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'queued', ?8, 0, ?9, ?10, 0,
-                     NULL, NULL, NULL, ?10, ?10, NULL, ?11, ?12, ?13, NULL)",
+                     NULL, NULL, NULL, NULL, ?10, ?10, NULL, ?11, ?12, ?13, NULL)",
             params![
                 task_id.0.to_string(),
                 session_id.to_string(),
@@ -1342,7 +1432,7 @@ impl QueueStore {
             ));
         }
         let mut connection = self.connection.lock();
-        let transaction = connection.transaction()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut statement = transaction.prepare(
             "SELECT task_id, tenant_id FROM api_tasks
              WHERE status = 'queued' AND cancel_requested = 0 AND next_attempt_at <= ?1
@@ -1358,34 +1448,46 @@ impl QueueStore {
         for (task_id, tenant_id_raw) in candidates {
             let tenant_id = TenantId::new(tenant_id_raw)?;
             let task = load_task(&transaction, &task_id, &tenant_id)?;
-            let selected_step = if task.plan_id.is_some() {
+            let mut plan_id_for_scope = None;
+            let selected_step: Option<PlanStep> = if task.plan_id.is_some() {
                 let reference = plan_store::task_reference(&task)?;
+                plan_id_for_scope = Some(reference.plan_id.clone());
+                let effective_plan_context = PlanClaimContext {
+                    granted_capabilities: task.envelope.execution_context.capabilities.0.clone(),
+                    ..plan_context.clone()
+                };
                 match plan_store::prepare_planned_claim_tx(
                     &transaction,
                     &task,
                     &reference,
-                    plan_context,
+                    &effective_plan_context,
                     now,
                 )? {
-                    Some(step_id) => Some(step_id),
+                    Some(step) => Some(step),
                     None => continue,
                 }
             } else {
                 None
             };
+            let lease_token = LeaseToken::new();
             transaction.execute(
                 "UPDATE api_tasks SET status = 'running', attempts = attempts + 1,
-                 lease_until = ?1, plan_step_id = ?2, updated_at = ?3
-                 WHERE task_id = ?4 AND tenant_id = ?5 AND status = 'queued'",
+                 lease_until = ?1, lease_token = ?2, plan_step_id = ?3, updated_at = ?4
+                 WHERE task_id = ?5 AND tenant_id = ?6 AND status = 'queued'",
                 params![
                     lease_until.to_rfc3339(),
-                    selected_step.as_ref().map(|step_id| step_id.0.clone()),
+                    lease_token.0.to_string(),
+                    selected_step.as_ref().map(|step| step.step_id.0.clone()),
                     now.to_rfc3339(),
                     task_id,
                     tenant_id.0,
                 ],
             )?;
-            let claimed = load_task(&transaction, &task_id, &tenant_id)?;
+            let mut claimed = load_task(&transaction, &task_id, &tenant_id)?;
+            if let (Some(plan_id), Some(step)) = (plan_id_for_scope, selected_step) {
+                claimed.plan_execution_scope =
+                    Some(PlanExecutionScope::new(plan_id, step.step_id, step.action));
+            }
             transaction.commit()?;
             return Ok(Some(claimed));
         }
@@ -1399,7 +1501,7 @@ impl QueueStore {
         tenant_id: &TenantId,
     ) -> Result<TaskRecord, QueueError> {
         let mut connection = self.connection.lock();
-        let transaction = connection.transaction()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let task = load_task(&transaction, &task_id.0.to_string(), tenant_id)?;
         let now = Utc::now();
         if task.status.is_terminal() {
@@ -1435,8 +1537,37 @@ impl QueueStore {
         Ok(updated)
     }
 
+    #[cfg(not(test))]
     #[allow(clippy::too_many_arguments)]
     pub fn finish_task(
+        &self,
+        task_id: &TaskId,
+        tenant_id: &TenantId,
+        lease_token: LeaseToken,
+        result: Option<Value>,
+        error: Option<&str>,
+        retryable: bool,
+        now: DateTime<Utc>,
+        base_delay: Duration,
+        max_delay: Duration,
+    ) -> Result<FinishOutcome, QueueError> {
+        self.finish_task_with_lease_token(
+            task_id,
+            tenant_id,
+            &lease_token,
+            result,
+            error,
+            retryable,
+            now,
+            base_delay,
+            max_delay,
+            &PlanClaimContext::default(),
+        )
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn finish_task(
         &self,
         task_id: &TaskId,
         tenant_id: &TenantId,
@@ -1447,9 +1578,12 @@ impl QueueStore {
         base_delay: Duration,
         max_delay: Duration,
     ) -> Result<FinishOutcome, QueueError> {
-        self.finish_task_with_plan_context(
+        let current = self.get_task(task_id, tenant_id)?;
+        let lease_token = current.lease_token.unwrap_or_else(LeaseToken::new);
+        self.finish_task_with_lease_token(
             task_id,
             tenant_id,
+            &lease_token,
             result,
             error,
             retryable,
@@ -1461,8 +1595,66 @@ impl QueueStore {
     }
 
     /// Finaliza uma task usando facts host-side para as pós-condições do plano.
+    #[cfg(not(test))]
     #[allow(clippy::too_many_arguments)]
     pub fn finish_task_with_plan_context(
+        &self,
+        task_id: &TaskId,
+        tenant_id: &TenantId,
+        lease_token: LeaseToken,
+        result: Option<Value>,
+        error: Option<&str>,
+        retryable: bool,
+        now: DateTime<Utc>,
+        base_delay: Duration,
+        max_delay: Duration,
+        plan_context: &PlanClaimContext,
+    ) -> Result<FinishOutcome, QueueError> {
+        self.finish_task_with_lease_token(
+            task_id,
+            tenant_id,
+            &lease_token,
+            result,
+            error,
+            retryable,
+            now,
+            base_delay,
+            max_delay,
+            plan_context,
+        )
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn finish_task_with_lease_token_for_test(
+        &self,
+        task_id: &TaskId,
+        tenant_id: &TenantId,
+        lease_token: LeaseToken,
+        result: Option<Value>,
+        error: Option<&str>,
+        retryable: bool,
+        now: DateTime<Utc>,
+        base_delay: Duration,
+        max_delay: Duration,
+    ) -> Result<FinishOutcome, QueueError> {
+        self.finish_task_with_lease_token(
+            task_id,
+            tenant_id,
+            &lease_token,
+            result,
+            error,
+            retryable,
+            now,
+            base_delay,
+            max_delay,
+            &PlanClaimContext::default(),
+        )
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn finish_task_with_plan_context(
         &self,
         task_id: &TaskId,
         tenant_id: &TenantId,
@@ -1474,19 +1666,52 @@ impl QueueStore {
         max_delay: Duration,
         plan_context: &PlanClaimContext,
     ) -> Result<FinishOutcome, QueueError> {
+        let current = self.get_task(task_id, tenant_id)?;
+        let lease_token = current.lease_token.unwrap_or_else(LeaseToken::new);
+        self.finish_task_with_lease_token(
+            task_id,
+            tenant_id,
+            &lease_token,
+            result,
+            error,
+            retryable,
+            now,
+            base_delay,
+            max_delay,
+            plan_context,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_task_with_lease_token(
+        &self,
+        task_id: &TaskId,
+        tenant_id: &TenantId,
+        lease_token: &LeaseToken,
+        result: Option<Value>,
+        error: Option<&str>,
+        retryable: bool,
+        now: DateTime<Utc>,
+        base_delay: Duration,
+        max_delay: Duration,
+        plan_context: &PlanClaimContext,
+    ) -> Result<FinishOutcome, QueueError> {
         let mut connection = self.connection.lock();
-        let transaction = connection.transaction()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let task = load_task(&transaction, &task_id.0.to_string(), tenant_id)?;
         if task.status.is_terminal() {
             transaction.commit()?;
-            return Ok(match task.status {
-                TaskStatus::Succeeded => FinishOutcome::Succeeded,
-                TaskStatus::Cancelled => FinishOutcome::Cancelled,
-                _ => FinishOutcome::Failed,
-            });
+            return Ok(finish_outcome_for_terminal_status(task.status));
         }
-        if task.plan_id.is_some() {
-            let outcome = plan_store::finish_planned_step_tx(
+        if task.lease_token.as_ref() != Some(lease_token)
+            || task
+                .lease_until
+                .is_none_or(|lease_until| lease_until <= now)
+        {
+            return Err(QueueError::LeaseLost);
+        }
+        let outcome = if task.plan_id.is_some() {
+            plan_store::finish_planned_step_tx(
                 &transaction,
                 &task,
                 result,
@@ -1496,23 +1721,10 @@ impl QueueStore {
                 base_delay,
                 max_delay,
                 plan_context,
-            )?;
-            transaction.commit()?;
-            return Ok(outcome);
-        }
-        if task.cancel_requested || task.status == TaskStatus::CancelRequested {
-            transaction.execute(
-                "UPDATE api_tasks SET status = 'cancelled', cancel_requested = 1,
-                 lease_until = NULL, updated_at = ?1, completed_at = ?1 WHERE task_id = ?2",
-                params![now.to_rfc3339(), task_id.0.to_string()],
-            )?;
-            transaction.commit()?;
-            return Ok(FinishOutcome::Cancelled);
-        }
-        let safe_error = error
-            .as_ref()
-            .map(|value| value.chars().take(4_096).collect::<String>());
-        if retryable && task.attempts < task.max_attempts {
+            )?
+        } else if task.cancel_requested || task.status == TaskStatus::CancelRequested {
+            finish_direct_cancel_tx(&transaction, task_id, tenant_id, lease_token, now)?
+        } else if retryable && task.attempts < task.max_attempts {
             let exponent = task.attempts.saturating_sub(1).min(10);
             let multiplier = 1_i64 << exponent;
             let delay_ms = base_delay
@@ -1520,54 +1732,48 @@ impl QueueStore {
                 .saturating_mul(multiplier)
                 .min(max_delay.num_milliseconds());
             let next_attempt_at = now + Duration::milliseconds(delay_ms.max(0));
-            transaction.execute(
-                "UPDATE api_tasks SET status = 'queued', lease_until = NULL,
-                 next_attempt_at = ?1, result_json = NULL, last_error = ?2,
-                 updated_at = ?3 WHERE task_id = ?4",
-                params![
-                    next_attempt_at.to_rfc3339(),
-                    safe_error,
-                    now.to_rfc3339(),
-                    task_id.0.to_string(),
-                ],
-            )?;
-            transaction.commit()?;
-            return Ok(FinishOutcome::Requeued { next_attempt_at });
-        }
-        let status = if error.is_some() {
-            TaskStatus::Failed
+            let safe_error = error
+                .as_ref()
+                .map(|value| value.chars().take(4_096).collect::<String>());
+            finish_direct_requeue_tx(
+                &transaction,
+                task_id,
+                tenant_id,
+                lease_token,
+                safe_error.as_deref(),
+                next_attempt_at,
+                now,
+            )?
         } else {
-            TaskStatus::Succeeded
+            let status = if error.is_some() {
+                TaskStatus::Failed
+            } else {
+                TaskStatus::Succeeded
+            };
+            let safe_error = error
+                .as_ref()
+                .map(|value| value.chars().take(4_096).collect::<String>());
+            finish_direct_terminal_tx(
+                &transaction,
+                &task,
+                lease_token,
+                result,
+                safe_error.as_deref(),
+                status,
+                now,
+            )?
         };
-        let result_json = result
-            .map(|value| serde_json::to_string(&value))
-            .transpose()?;
-        transaction.execute(
-            "UPDATE api_tasks SET status = ?1, lease_until = NULL, result_json = ?2,
-             last_error = ?3, updated_at = ?4, completed_at = ?4 WHERE task_id = ?5",
-            params![
-                status.as_str(),
-                result_json,
-                safe_error,
-                now.to_rfc3339(),
-                task_id.0.to_string(),
-            ],
-        )?;
         transaction.commit()?;
-        Ok(if status == TaskStatus::Succeeded {
-            FinishOutcome::Succeeded
-        } else {
-            FinishOutcome::Failed
-        })
+        Ok(outcome)
     }
 
     pub fn recover_expired_leases(&self, now: DateTime<Utc>) -> Result<u64, QueueError> {
         let mut connection = self.connection.lock();
-        let transaction = connection.transaction()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut statement = transaction.prepare(
             "SELECT task_id, tenant_id FROM api_tasks
              WHERE status IN ('running', 'cancel_requested')
-               AND lease_until IS NOT NULL AND lease_until < ?1
+               AND lease_until IS NOT NULL AND lease_until <= ?1
              ORDER BY updated_at ASC LIMIT 128",
         )?;
         let candidates = statement
@@ -1585,7 +1791,7 @@ impl QueueStore {
             } else {
                 transaction.execute(
                     "UPDATE api_tasks SET status = CASE WHEN cancel_requested = 1 THEN 'cancelled' ELSE 'queued' END,
-                     lease_until = NULL,
+                     lease_until = NULL, lease_token = NULL,
                      completed_at = CASE WHEN cancel_requested = 1 THEN ?1 ELSE completed_at END,
                      updated_at = ?1 WHERE task_id = ?2 AND tenant_id = ?3",
                     params![now.to_rfc3339(), task_id, tenant_id.0],
@@ -1639,10 +1845,13 @@ impl QueueStore {
             )?;
             return Ok(snapshot);
         };
+        let failure_count = u32::try_from(failure_count).map_err(|error| {
+            QueueError::InvalidInput(format!("failure_count persistido inválido: {error}"))
+        })?;
         Ok(CircuitSnapshot {
             name: name.to_owned(),
             state: CircuitState::parse(&state)?,
-            failure_count: u32::try_from(failure_count).unwrap_or(u32::MAX),
+            failure_count,
             opened_at: opened_at.as_deref().map(parse_datetime).transpose()?,
             next_probe_at: next_probe_at.as_deref().map(parse_datetime).transpose()?,
         })
@@ -1896,6 +2105,152 @@ fn to_sql_error(error: QueueError) -> rusqlite::Error {
     rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
 }
 
+fn finish_outcome_for_terminal_status(status: TaskStatus) -> FinishOutcome {
+    match status {
+        TaskStatus::Succeeded => FinishOutcome::Succeeded,
+        TaskStatus::Cancelled => FinishOutcome::Cancelled,
+        _ => FinishOutcome::Failed,
+    }
+}
+
+fn finish_direct_cancel_tx(
+    transaction: &rusqlite::Transaction<'_>,
+    task_id: &TaskId,
+    tenant_id: &TenantId,
+    lease_token: &LeaseToken,
+    now: DateTime<Utc>,
+) -> Result<FinishOutcome, QueueError> {
+    transaction.execute(
+        "UPDATE api_tasks SET status = 'cancelled', cancel_requested = 1,
+         lease_until = NULL, lease_token = NULL, updated_at = ?1, completed_at = ?1
+         WHERE task_id = ?2 AND tenant_id = ?3 AND lease_token = ?4",
+        params![
+            now.to_rfc3339(),
+            task_id.0.to_string(),
+            tenant_id.0,
+            lease_token.0.to_string(),
+        ],
+    )?;
+    Ok(FinishOutcome::Cancelled)
+}
+
+fn finish_direct_requeue_tx(
+    transaction: &rusqlite::Transaction<'_>,
+    task_id: &TaskId,
+    tenant_id: &TenantId,
+    lease_token: &LeaseToken,
+    error: Option<&str>,
+    next_attempt_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+) -> Result<FinishOutcome, QueueError> {
+    transaction.execute(
+        "UPDATE api_tasks SET status = 'queued', lease_until = NULL, lease_token = NULL,
+         next_attempt_at = ?1, result_json = NULL, last_error = ?2,
+         updated_at = ?3 WHERE task_id = ?4 AND tenant_id = ?5 AND lease_token = ?6",
+        params![
+            next_attempt_at.to_rfc3339(),
+            error,
+            updated_at.to_rfc3339(),
+            task_id.0.to_string(),
+            tenant_id.0,
+            lease_token.0.to_string(),
+        ],
+    )?;
+    Ok(FinishOutcome::Requeued { next_attempt_at })
+}
+
+fn finish_direct_terminal_tx(
+    transaction: &rusqlite::Transaction<'_>,
+    task: &TaskRecord,
+    lease_token: &LeaseToken,
+    result: Option<Value>,
+    error: Option<&str>,
+    status: TaskStatus,
+    now: DateTime<Utc>,
+) -> Result<FinishOutcome, QueueError> {
+    let result_json = result
+        .map(|value| serde_json::to_string(&value))
+        .transpose()?;
+    transaction.execute(
+        "UPDATE api_tasks SET status = ?1, lease_until = NULL, lease_token = NULL,
+         result_json = ?2, last_error = ?3, updated_at = ?4, completed_at = ?4
+         WHERE task_id = ?5 AND tenant_id = ?6 AND lease_token = ?7",
+        params![
+            status.as_str(),
+            result_json,
+            error,
+            now.to_rfc3339(),
+            task.task_id.0.to_string(),
+            task.tenant_id.0,
+            lease_token.0.to_string(),
+        ],
+    )?;
+    Ok(if status == TaskStatus::Succeeded {
+        FinishOutcome::Succeeded
+    } else {
+        FinishOutcome::Failed
+    })
+}
+
+struct PersistedTaskRow {
+    session_id: String,
+    idempotency_key: String,
+    request_fingerprint: String,
+    envelope_json: String,
+    status: String,
+    priority: i64,
+    attempts: i64,
+    max_attempts: i64,
+    next_attempt_at: String,
+    cancel_requested: i64,
+    lease_until: Option<String>,
+    lease_token: Option<String>,
+    result_json: Option<String>,
+    last_error: Option<String>,
+    created_at: String,
+    updated_at: String,
+    completed_at: Option<String>,
+    plan_id: Option<String>,
+    plan_revision: Option<i64>,
+    plan_digest: Option<String>,
+    plan_step_id: Option<String>,
+}
+
+fn load_persisted_task_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PersistedTaskRow> {
+    Ok(PersistedTaskRow {
+        session_id: row.get(0)?,
+        idempotency_key: row.get(1)?,
+        request_fingerprint: row.get(2)?,
+        envelope_json: row.get(3)?,
+        status: row.get(4)?,
+        priority: row.get(5)?,
+        attempts: row.get(6)?,
+        max_attempts: row.get(7)?,
+        next_attempt_at: row.get(8)?,
+        cancel_requested: row.get(9)?,
+        lease_until: row.get(10)?,
+        lease_token: row.get(11)?,
+        result_json: row.get(12)?,
+        last_error: row.get(13)?,
+        created_at: row.get(14)?,
+        updated_at: row.get(15)?,
+        completed_at: row.get(16)?,
+        plan_id: row.get(17)?,
+        plan_revision: row.get(18)?,
+        plan_digest: row.get(19)?,
+        plan_step_id: row.get(20)?,
+    })
+}
+
+fn parse_optional_uuid(value: Option<&str>, field: &str) -> Result<Option<Uuid>, QueueError> {
+    value
+        .map(|raw| {
+            Uuid::parse_str(raw)
+                .map_err(|error| QueueError::InvalidInput(format!("{field} inválido: {error}")))
+        })
+        .transpose()
+}
+
 fn load_task(
     connection: &Connection,
     task_id: &str,
@@ -1905,99 +2260,101 @@ fn load_task(
         .query_row(
             "SELECT session_id, idempotency_key, request_fingerprint, envelope_json,
                     status, priority, attempts, max_attempts, next_attempt_at,
-                    cancel_requested, lease_until, result_json, last_error,
+                    cancel_requested, lease_until, lease_token, result_json, last_error,
                     created_at, updated_at, completed_at,
                     plan_id, plan_revision, plan_digest, plan_step_id
              FROM api_tasks WHERE task_id = ?1 AND tenant_id = ?2",
             params![task_id, tenant_id.0],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, i64>(5)?,
-                    row.get::<_, i64>(6)?,
-                    row.get::<_, i64>(7)?,
-                    row.get::<_, String>(8)?,
-                    row.get::<_, i64>(9)?,
-                    row.get::<_, Option<String>>(10)?,
-                    row.get::<_, Option<String>>(11)?,
-                    row.get::<_, Option<String>>(12)?,
-                    row.get::<_, String>(13)?,
-                    row.get::<_, String>(14)?,
-                    row.get::<_, Option<String>>(15)?,
-                    row.get::<_, Option<String>>(16)?,
-                    row.get::<_, Option<i64>>(17)?,
-                    row.get::<_, Option<String>>(18)?,
-                    row.get::<_, Option<String>>(19)?,
-                ))
-            },
+            load_persisted_task_row,
         )
         .optional()?
         .ok_or_else(|| QueueError::NotFound(format!("task {task_id}")))?;
-    let task_id = Uuid::parse_str(task_id)
-        .map_err(|error| QueueError::InvalidInput(format!("task_id inválido: {error}")))?;
-    let session_id = Uuid::parse_str(&row.0)
-        .map_err(|error| QueueError::InvalidInput(format!("session_id inválido: {error}")))?;
-    let plan_id = row
-        .16
-        .as_deref()
-        .map(|value| {
-            Uuid::parse_str(value)
-                .map(PlanId)
-                .map_err(|error| QueueError::InvalidInput(format!("plan_id inválido: {error}")))
-        })
-        .transpose()?;
+    let task_id = parse_uuid(task_id, "task_id")?;
+    let session_id = parse_uuid(&row.session_id, "session_id")?;
+    let lease_token =
+        parse_optional_uuid(row.lease_token.as_deref(), "lease_token")?.map(LeaseToken);
+    let plan_id = parse_optional_uuid(row.plan_id.as_deref(), "plan_id")?.map(PlanId);
     let plan_revision = row
-        .17
+        .plan_revision
         .map(|value| {
             u32::try_from(value).map_err(|error| {
                 QueueError::InvalidInput(format!("plan_revision inválida: {error}"))
             })
         })
         .transpose()?;
-    let plan_step_id = row.19.as_deref().map(PlanStepId::new).transpose()?;
+    let plan_step_id = row
+        .plan_step_id
+        .as_deref()
+        .map(PlanStepId::new)
+        .transpose()?;
     if plan_id.is_some() != plan_revision.is_some()
-        || plan_id.is_some() != row.18.is_some()
+        || plan_id.is_some() != row.plan_digest.is_some()
         || plan_step_id.is_some() && plan_id.is_none()
     {
         return Err(QueueError::InvalidInput(
             "referência de plano parcialmente persistida".to_owned(),
         ));
     }
+    let priority = i32::try_from(row.priority).map_err(|error| {
+        QueueError::InvalidInput(format!("priority persistida inválida: {error}"))
+    })?;
+    let attempts = u32::try_from(row.attempts).map_err(|error| {
+        QueueError::InvalidInput(format!("attempts persistido inválido: {error}"))
+    })?;
+    let max_attempts = u32::try_from(row.max_attempts).map_err(|error| {
+        QueueError::InvalidInput(format!("max_attempts persistido inválido: {error}"))
+    })?;
+    if max_attempts == 0 || max_attempts > 10 {
+        return Err(QueueError::InvalidInput(
+            "invariantes de retry persistidas inválidas".to_owned(),
+        ));
+    }
     Ok(TaskRecord {
         task_id: TaskId(task_id),
         session_id,
         tenant_id: tenant_id.clone(),
-        idempotency_key: row.1,
-        request_fingerprint: row.2,
-        envelope: serde_json::from_str(&row.3)?,
-        status: TaskStatus::parse(&row.4)?,
-        priority: i32::try_from(row.5).unwrap_or(i32::MAX),
-        attempts: u32::try_from(row.6).unwrap_or(u32::MAX),
-        max_attempts: u32::try_from(row.7).unwrap_or(u32::MAX),
-        next_attempt_at: parse_datetime(&row.8)?,
-        cancel_requested: row.9 != 0,
-        lease_until: row.10.as_deref().map(parse_datetime).transpose()?,
-        result: row.11.as_deref().map(serde_json::from_str).transpose()?,
-        last_error: row.12,
-        created_at: parse_datetime(&row.13)?,
-        updated_at: parse_datetime(&row.14)?,
-        completed_at: row.15.as_deref().map(parse_datetime).transpose()?,
+        idempotency_key: row.idempotency_key,
+        request_fingerprint: row.request_fingerprint,
+        envelope: serde_json::from_str(&row.envelope_json)?,
+        status: TaskStatus::parse(&row.status)?,
+        priority,
+        attempts,
+        max_attempts,
+        next_attempt_at: parse_datetime(&row.next_attempt_at)?,
+        cancel_requested: row.cancel_requested != 0,
+        lease_until: row.lease_until.as_deref().map(parse_datetime).transpose()?,
+        lease_token,
+        plan_execution_scope: None,
+        result: row
+            .result_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()?,
+        last_error: row.last_error,
+        created_at: parse_datetime(&row.created_at)?,
+        updated_at: parse_datetime(&row.updated_at)?,
+        completed_at: row
+            .completed_at
+            .as_deref()
+            .map(parse_datetime)
+            .transpose()?,
         plan_id,
         plan_revision,
-        plan_digest: row.18,
+        plan_digest: row.plan_digest,
         plan_step_id,
     })
+}
+
+fn parse_uuid(value: &str, field: &str) -> Result<Uuid, QueueError> {
+    Uuid::parse_str(value)
+        .map_err(|error| QueueError::InvalidInput(format!("{field} inválido: {error}")))
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use shaka_core::{ExecutionBudget, Role};
+    use shaka_core::{Capability, ExecutionBudget, Role};
 
     fn principal() -> Principal {
         Principal {
@@ -2017,6 +2374,46 @@ mod tests {
     }
 
     #[test]
+    fn iam_token_issue_requires_finite_future_expiry() {
+        let store = QueueStore::in_memory().unwrap();
+        let tenant = TenantId::new("tenant-iam-policy").unwrap();
+        store.create_tenant(&tenant, "Tenant IAM Policy").unwrap();
+        let operator = OperatorId::new("user-iam-policy").unwrap();
+        store
+            .create_user(&operator, &tenant, &Role::Operator)
+            .unwrap();
+
+        assert!(matches!(
+            store.issue_token(&operator, None),
+            Err(QueueError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            store.issue_token(&operator, Some(Utc::now() - Duration::seconds(1))),
+            Err(QueueError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            store.issue_token(
+                &operator,
+                Some(Utc::now() + Duration::seconds(MAX_TOKEN_LIFETIME_SECONDS + 1)),
+            ),
+            Err(QueueError::InvalidInput(_))
+        ));
+
+        let issue = store
+            .issue_token(&operator, Some(Utc::now() + Duration::hours(1)))
+            .unwrap();
+        assert!(issue.expires_at.is_some());
+        assert_eq!(
+            store
+                .authenticate_token(&issue.token)
+                .unwrap()
+                .principal
+                .operator_id,
+            operator
+        );
+    }
+
+    #[test]
     fn iam_token_is_resolved_without_persisting_plaintext_in_contract() {
         let store = QueueStore::in_memory().unwrap();
         let tenant = TenantId::new("tenant-iam").unwrap();
@@ -2025,7 +2422,9 @@ mod tests {
         store
             .create_user(&operator, &tenant, &Role::Operator)
             .unwrap();
-        let issue = store.issue_token(&operator, None).unwrap();
+        let issue = store
+            .issue_token(&operator, Some(Utc::now() + Duration::hours(1)))
+            .unwrap();
         assert!(issue.token.starts_with("shk_"));
         let authenticated = store.authenticate_token(&issue.token).unwrap();
         assert_eq!(authenticated.principal.tenant_id, tenant);
@@ -2036,6 +2435,80 @@ mod tests {
             store.authenticate_token(&issue.token),
             Err(QueueError::Unauthorized)
         ));
+    }
+
+    #[test]
+    fn corrupted_circuit_failure_count_fails_closed() {
+        let store = QueueStore::in_memory().unwrap();
+        store.load_circuit("corrupt-circuit").unwrap();
+        store
+            .connection
+            .lock()
+            .execute(
+                "UPDATE api_circuit_breaker SET failure_count = -1 WHERE name = ?1",
+                params!["corrupt-circuit"],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.load_circuit("corrupt-circuit"),
+            Err(QueueError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn corrupted_task_attempts_fail_closed() {
+        let store = QueueStore::in_memory().unwrap();
+        let principal = principal();
+        store.bootstrap_principal(&principal).unwrap();
+        let session = store
+            .create_session(principal.clone(), Value::Null)
+            .unwrap();
+        let task = envelope(&principal);
+        let task_id = task.task_id.clone();
+        store
+            .submit_task(
+                session.session_id,
+                &principal.tenant_id,
+                "corrupt-counter",
+                "corrupt-counter-fingerprint",
+                &task,
+                0,
+                2,
+            )
+            .unwrap();
+        for (column, value) in [
+            ("priority", i64::MAX),
+            ("attempts", -1_i64),
+            ("max_attempts", i64::MAX),
+        ] {
+            store
+                .connection
+                .lock()
+                .execute(
+                    &format!("UPDATE api_tasks SET {column} = ?1 WHERE task_id = ?2"),
+                    params![value, task_id.0.to_string()],
+                )
+                .unwrap();
+            assert!(
+                store.get_task(&task_id, &principal.tenant_id).is_err(),
+                "{column} corrompido deve falhar fechado"
+            );
+            store
+                .connection
+                .lock()
+                .execute(
+                    &format!("UPDATE api_tasks SET {column} = ?1 WHERE task_id = ?2"),
+                    params![
+                        match column {
+                            "priority" | "attempts" => 0_i64,
+                            "max_attempts" => 2_i64,
+                            _ => unreachable!(),
+                        },
+                        task_id.0.to_string()
+                    ],
+                )
+                .unwrap();
+        }
     }
 
     #[test]
@@ -2069,6 +2542,20 @@ mod tests {
             )
             .unwrap();
         assert_eq!(first, SubmitOutcome::Created);
+        assert_eq!(task.envelope.execution_context.role, Role::Administrator);
+        assert!(
+            task.envelope
+                .execution_context
+                .capabilities
+                .allows(&[Capability::CodeExecution])
+        );
+        assert!(
+            task.envelope
+                .execution_context
+                .provenance
+                .request_id
+                .is_some()
+        );
         let replay = store
             .submit_task_governed(
                 session.session_id,
@@ -2081,6 +2568,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(replay.0, SubmitOutcome::Existing);
+        assert_eq!(
+            task.envelope.execution_context.provenance.request_id,
+            replay.1.envelope.execution_context.provenance.request_id
+        );
         let second = store.submit_task_governed(
             session.session_id,
             &principal,
@@ -2092,6 +2583,48 @@ mod tests {
         );
         assert!(matches!(second, Err(QueueError::QuotaExceeded(_))));
         assert_eq!(task.task_id, replay.1.task_id);
+    }
+
+    #[test]
+    fn governed_submission_overwrites_forged_request_provenance() {
+        let store = QueueStore::in_memory().unwrap();
+        let principal = principal();
+        store.bootstrap_principal(&principal).unwrap();
+        let session = store
+            .create_session(principal.clone(), Value::Null)
+            .unwrap();
+        let mut forged = envelope(&principal);
+        forged.execution_context = forged
+            .execution_context
+            .with_provenance(Some("forged-request".to_owned()), Some(Uuid::nil()));
+        let (_, task) = store
+            .submit_task_governed_with_plan_and_provenance(
+                session.session_id,
+                &principal,
+                "provenance-1",
+                "provenance-fingerprint",
+                &forged,
+                1,
+                1,
+                None,
+                Some("canonical-request"),
+            )
+            .unwrap();
+        assert_eq!(
+            task.envelope
+                .execution_context
+                .provenance
+                .request_id
+                .as_deref(),
+            Some("canonical-request")
+        );
+        assert_eq!(
+            task.envelope
+                .execution_context
+                .provenance
+                .admission_approval_id,
+            None
+        );
     }
 
     #[test]
@@ -2140,6 +2673,198 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn legacy_schema_adds_lease_token_column() {
+        let path = std::env::temp_dir().join(format!("shaka-lease-{}.sqlite", Uuid::new_v4()));
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE api_tasks (
+                    task_id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    tenant_id TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL,
+                    request_fingerprint TEXT NOT NULL,
+                    objective TEXT NOT NULL,
+                    envelope_json TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    priority INTEGER NOT NULL,
+                    attempts INTEGER NOT NULL,
+                    max_attempts INTEGER NOT NULL,
+                    next_attempt_at TEXT NOT NULL,
+                    cancel_requested INTEGER NOT NULL DEFAULT 0,
+                    lease_until TEXT,
+                    result_json TEXT,
+                    last_error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    plan_id TEXT,
+                    plan_revision INTEGER,
+                    plan_digest TEXT,
+                    plan_step_id TEXT,
+                    UNIQUE (tenant_id, idempotency_key)
+                );",
+            )
+            .unwrap();
+        drop(connection);
+
+        let _store = QueueStore::open(&path).unwrap();
+        let connection = Connection::open(&path).unwrap();
+        let columns = connection
+            .prepare("PRAGMA table_info(api_tasks)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(columns.iter().any(|column| column == "lease_token"));
+        drop(connection);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+    }
+
+    #[test]
+    fn task_record_serialization_omits_lease_token() {
+        let store = QueueStore::in_memory().unwrap();
+        let principal = principal();
+        let session = store
+            .create_session(principal.clone(), Value::Null)
+            .unwrap();
+        let task = envelope(&principal);
+        let task_id = task.task_id.clone();
+        store
+            .submit_task(
+                session.session_id,
+                &principal.tenant_id,
+                "serialized-lease",
+                "serialized-lease",
+                &task,
+                0,
+                1,
+            )
+            .unwrap();
+        let claimed = store
+            .claim_next(Utc::now(), Duration::seconds(30))
+            .unwrap()
+            .unwrap();
+        assert!(claimed.lease_token.is_some());
+        let serialized = serde_json::to_value(&claimed).unwrap();
+        assert!(serialized.get("lease_token").is_none());
+        let restored: TaskRecord = serde_json::from_value(serialized).unwrap();
+        assert_eq!(restored.task_id, task_id);
+        assert!(restored.lease_token.is_none());
+    }
+
+    #[test]
+    fn stale_worker_token_cannot_finish_after_reclaim() {
+        let store = QueueStore::in_memory().unwrap();
+        let principal = principal();
+        let session = store
+            .create_session(principal.clone(), Value::Null)
+            .unwrap();
+        let task = envelope(&principal);
+        let task_id = task.task_id.clone();
+        store
+            .submit_task(
+                session.session_id,
+                &principal.tenant_id,
+                "stale-reclaim",
+                "stale-reclaim",
+                &task,
+                0,
+                2,
+            )
+            .unwrap();
+        let claimed_at = Utc::now();
+        let first_claim = store
+            .claim_next(claimed_at, Duration::seconds(1))
+            .unwrap()
+            .unwrap();
+        let first_token = first_claim.lease_token.unwrap();
+        let recovered_at = claimed_at + Duration::seconds(2);
+        assert_eq!(store.recover_expired_leases(recovered_at).unwrap(), 1);
+        let second_claim = store
+            .claim_next(recovered_at, Duration::seconds(30))
+            .unwrap()
+            .unwrap();
+        assert_ne!(second_claim.lease_token, Some(first_token));
+
+        let stale_finish = store.finish_task_with_lease_token_for_test(
+            &task_id,
+            &principal.tenant_id,
+            first_token,
+            Some(serde_json::json!({"winner": "stale-worker"})),
+            None,
+            false,
+            recovered_at,
+            Duration::milliseconds(10),
+            Duration::seconds(1),
+        );
+        assert!(matches!(stale_finish, Err(QueueError::LeaseLost)));
+        let after_stale = store.get_task(&task_id, &principal.tenant_id).unwrap();
+        assert_eq!(after_stale.status, TaskStatus::Running);
+        assert_eq!(after_stale.lease_token, second_claim.lease_token);
+        assert!(after_stale.result.is_none());
+
+        let current_token = second_claim.lease_token.unwrap();
+        let current_finish = store.finish_task_with_lease_token_for_test(
+            &task_id,
+            &principal.tenant_id,
+            current_token,
+            Some(serde_json::json!({"winner": "current-worker"})),
+            None,
+            false,
+            recovered_at,
+            Duration::milliseconds(10),
+            Duration::seconds(1),
+        );
+        assert_eq!(current_finish.unwrap(), FinishOutcome::Succeeded);
+    }
+
+    #[test]
+    fn expired_lease_rejects_finish_before_recovery() {
+        let store = QueueStore::in_memory().unwrap();
+        let principal = principal();
+        let session = store
+            .create_session(principal.clone(), Value::Null)
+            .unwrap();
+        let task = envelope(&principal);
+        let task_id = task.task_id.clone();
+        store
+            .submit_task(
+                session.session_id,
+                &principal.tenant_id,
+                "expired-lease",
+                "expired-lease",
+                &task,
+                0,
+                1,
+            )
+            .unwrap();
+        let claimed_at = Utc::now();
+        let claimed = store
+            .claim_next(claimed_at, Duration::seconds(1))
+            .unwrap()
+            .unwrap();
+        let finish = store.finish_task_with_lease_token_for_test(
+            &task_id,
+            &principal.tenant_id,
+            claimed.lease_token.unwrap(),
+            Some(serde_json::json!({"winner": "expired-worker"})),
+            None,
+            false,
+            claimed_at + Duration::seconds(1),
+            Duration::milliseconds(10),
+            Duration::seconds(1),
+        );
+        assert!(matches!(finish, Err(QueueError::LeaseLost)));
+        let after = store.get_task(&task_id, &principal.tenant_id).unwrap();
+        assert_eq!(after.status, TaskStatus::Running);
+        assert!(after.result.is_none());
     }
 
     #[test]
