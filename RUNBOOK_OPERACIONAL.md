@@ -270,7 +270,7 @@ O relatório operacional detalhado está em `ETAPA9_VALIDACAO_POS_RELEASE.md`; a
 
 ## 13. Validação repository-first
 
-Para validar um checkout limpo diretamente do GitHub, incluindo testes, auditoria, smoke e ciclo de vida do processo, consulte [`docs/VALIDACAO_REPOSITORY_FIRST.md`](docs/VALIDACAO_REPOSITORY_FIRST.md) e execute:
+Para validar um checkout limpo diretamente do GitHub, incluindo testes, auditoria, smoke, ciclo de vida do processo e probes multiprocesso de QueueStore/auditoria, consulte [`docs/VALIDACAO_REPOSITORY_FIRST.md`](docs/VALIDACAO_REPOSITORY_FIRST.md) e execute:
 
 ```bash
 SHAKA_EXPECTED_HEAD="$(git rev-parse HEAD)" \
@@ -278,4 +278,4 @@ SHAKA_EXPECTED_HEAD="$(git rev-parse HEAD)" \
   bash scripts/validate_postmerge.sh
 ```
 
-O executor falha fechado diante de SHA divergente, working tree sujo, dependência obrigatória ausente, falha de teste, erro de smoke ou listener residual. Ele não instala dependências, não altera branches e não publica alterações.
+O executor falha fechado diante de SHA divergente, working tree sujo, dependência obrigatória ausente, falha de teste, erro de smoke, falha de crash/recovery ou listener residual. Ele não instala dependências, não altera branches e não publica alterações.

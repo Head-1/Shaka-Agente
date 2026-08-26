@@ -70,6 +70,7 @@ main() {
   for script in \
     scripts/production_smoke.sh \
     scripts/process_lifecycle_probe.sh \
+    scripts/process_crash_probes.sh \
     scripts/validate_postmerge.sh; do
     run_step "syntax:$script" bash -n "$script"
   done
@@ -106,6 +107,10 @@ main() {
   run_step 'cli_build' cargo build --locked -p shaka-cli
   test -x target/debug/shaka
   echo 'shaka_cli_build=PASS'
+  run_step 'process_probe_build' cargo build --locked -p shaka-probes --bins
+  test -x target/debug/queue-process-crash-probe
+  test -x target/debug/audit-process-crash-probe
+  echo 'process_probe_build=PASS'
 
   if port_is_listening "$SMOKE_PORT"; then
     echo "smoke port already in use: $SMOKE_PORT" >&2
@@ -133,6 +138,9 @@ main() {
     echo "lifecycle port remained in use: $LIFECYCLE_PORT" >&2
     return 4
   fi
+
+  run_step 'process_crash_probes' bash scripts/process_crash_probes.sh
+  echo 'process_crash_probes=PASS'
 
   test -z "$(git status --porcelain)"
   echo 'working_tree=clean'
