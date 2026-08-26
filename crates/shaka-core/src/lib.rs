@@ -11,7 +11,10 @@ use chrono::{DateTime, Utc};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::OnceLock,
+};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -112,6 +115,17 @@ impl Principal {
     }
 }
 
+/// Proveniência estável da intenção que originou uma execução.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RequestProvenance {
+    /// Identificador de correlação fornecido pelo host de admissão.
+    #[serde(default)]
+    pub request_id: Option<String>,
+    /// Aprovação global usada na admissão de uma task planejada, quando houver.
+    #[serde(default)]
+    pub admission_approval_id: Option<Uuid>,
+}
+
 /// Contexto efetivo que deve acompanhar uma execução desde a admissão até o runtime.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExecutionContext {
@@ -119,6 +133,9 @@ pub struct ExecutionContext {
     pub role: Role,
     /// Capabilities efetivas concedidas pelo host para esta execução.
     pub capabilities: CapabilitySet,
+    /// Proveniência estável da requisição e da aprovação de admissão.
+    #[serde(default)]
+    pub provenance: RequestProvenance,
 }
 
 impl Default for ExecutionContext {
@@ -126,6 +143,7 @@ impl Default for ExecutionContext {
         Self {
             role: Role::Operator,
             capabilities: CapabilitySet::default(),
+            provenance: RequestProvenance::default(),
         }
     }
 }
@@ -137,27 +155,67 @@ impl ExecutionContext {
         Self {
             role: principal.role.clone(),
             capabilities: CapabilitySet::for_role(&principal.role),
+            provenance: RequestProvenance::default(),
         }
     }
+
+    /// Anexa proveniência derivada pelo host sem alterar a autorização efetiva.
+    #[must_use]
+    pub fn with_provenance(
+        mut self,
+        request_id: Option<String>,
+        admission_approval_id: Option<Uuid>,
+    ) -> Self {
+        self.provenance = RequestProvenance {
+            request_id,
+            admission_approval_id,
+        };
+        self
+    }
+}
+
+fn sensitive_text_pattern() -> &'static Result<Regex, regex::Error> {
+    static PATTERN: OnceLock<Result<Regex, regex::Error>> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(concat!(
+            r"(?i)\b(?:authorization|proxy-authorization)\s*[:=]\s*Bearer\s+[A-Za-z0-9._~+/=-]+|\bBearer\s+[A-Za-z0-9._~+/=-]+|",
+            r#"(?:["']?)(?:api[_-]?key|access[_-]?token|secret|password|authorization|cookie|set-cookie|private[_-]?key|token)(?:["']?)"#,
+            r#"\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s,;}\]]+)"#
+        ))
+    })
 }
 
 /// Remove padrões comuns de credenciais antes de gravar texto em logs ou memória.
 #[must_use]
 pub fn redact_sensitive(input: &str) -> String {
-    let Some(key_pattern) = Regex::new(
-        r"(?i)(api[_-]?key|access[_-]?token|secret|password|authorization)s*[:=]s*([^s,;]+)",
-    )
-    .ok() else {
-        return input.to_owned();
-    };
-    let Some(bearer_pattern) = Regex::new(r"(?i)bearers+[A-Za-z0-9._~+/=-]+").ok() else {
-        return input.to_owned();
-    };
-    let redacted = bearer_pattern.replace_all(input, "Bearer [REDACTED]");
-    key_pattern
-        .replace_all(&redacted, "$1=[REDACTED]")
-        .into_owned()
+    match sensitive_text_pattern() {
+        Ok(pattern) => pattern
+            .replace_all(input, |captures: &regex::Captures<'_>| {
+                let value = captures.get(0).map_or("", |match_| match_.as_str());
+                if value.to_ascii_lowercase().starts_with("bearer") {
+                    "Bearer [REDACTED]".to_owned()
+                } else {
+                    let key = value
+                        .split([':', '='])
+                        .next()
+                        .unwrap_or("secret")
+                        .trim_matches(|character| character == '"' || character == char::from(39));
+                    format!("{key}=[REDACTED]")
+                }
+            })
+            .into_owned(),
+        Err(_) => "[REDACTION_FAILED]".to_owned(),
+    }
 }
+
+/// Limites superiores host-side para evitar budgets patológicos.
+pub const MAX_EXECUTION_STEPS: u32 = 256;
+/// Limite superior de chamadas de ferramentas por execução.
+pub const MAX_TOOL_CALLS: u32 = 512;
+/// Limite superior de duração de uma execução, em milissegundos.
+pub const MAX_EXECUTION_ELAPSED_MS: u64 = 300_000;
+/// Limite superior de custo contabilizado, em microunits.
+pub const MAX_EXECUTION_COST_MICROUNITS: u64 = 10_000_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExecutionBudget {
@@ -165,6 +223,33 @@ pub struct ExecutionBudget {
     pub max_tool_calls: u32,
     pub max_elapsed_ms: u64,
     pub max_cost_microunits: u64,
+}
+
+impl ExecutionBudget {
+    /// Valida limites de segurança antes de admitir ou executar uma task.
+    pub fn validate(&self) -> Result<(), CoreError> {
+        if self.max_steps == 0 || self.max_steps > MAX_EXECUTION_STEPS {
+            return Err(CoreError::InvalidInput(format!(
+                "budget.max_steps deve estar entre 1 e {MAX_EXECUTION_STEPS}"
+            )));
+        }
+        if self.max_tool_calls > MAX_TOOL_CALLS {
+            return Err(CoreError::InvalidInput(format!(
+                "budget.max_tool_calls não pode exceder {MAX_TOOL_CALLS}"
+            )));
+        }
+        if self.max_elapsed_ms == 0 || self.max_elapsed_ms > MAX_EXECUTION_ELAPSED_MS {
+            return Err(CoreError::InvalidInput(format!(
+                "budget.max_elapsed_ms deve estar entre 1 e {MAX_EXECUTION_ELAPSED_MS}"
+            )));
+        }
+        if self.max_cost_microunits > MAX_EXECUTION_COST_MICROUNITS {
+            return Err(CoreError::InvalidInput(format!(
+                "budget.max_cost_microunits não pode exceder {MAX_EXECUTION_COST_MICROUNITS}"
+            )));
+        }
+        Ok(())
+    }
 }
 
 impl Default for ExecutionBudget {
@@ -508,6 +593,43 @@ impl PlanAction {
     }
 }
 
+/// Escopo host-side da etapa de plano atualmente aprovada e reclamada.
+///
+/// O escopo não é serializado na resposta pública nem aceito pelo cliente.
+/// Ele é reconstruído a partir da revisão imutável do plano no claim e
+/// revalidado no ponto de execução da ferramenta.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlanExecutionScope {
+    /// Plano cuja revisão foi vinculada à tarefa.
+    pub plan_id: PlanId,
+    /// Etapa atualmente autorizada.
+    pub step_id: PlanStepId,
+    /// Ação aprovada para a etapa.
+    pub action: PlanAction,
+}
+
+impl PlanExecutionScope {
+    /// Cria um escopo para a etapa selecionada pelo reducer persistente.
+    #[must_use]
+    pub const fn new(plan_id: PlanId, step_id: PlanStepId, action: PlanAction) -> Self {
+        Self {
+            plan_id,
+            step_id,
+            action,
+        }
+    }
+
+    /// Informa se uma definição de ferramenta pertence exatamente ao escopo.
+    ///
+    /// Ações textuais (`ReadOnly`, `Mutation` e `ExternalEffect`) não são
+    /// convertidas implicitamente em nomes de ferramentas: sem um registry
+    /// explícito de operações, elas não concedem tool calls.
+    #[must_use]
+    pub fn allows_tool(&self, definition: &ToolDefinition) -> bool {
+        matches!(&self.action, PlanAction::ExecuteTool { tool_name } if tool_name == &definition.name)
+    }
+}
+
 /// Etapa declarativa, imutável após a aprovação da revisão.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PlanStep {
@@ -608,6 +730,7 @@ impl PlanSpec {
             state: PlanState::Draft,
             created_at: Utc::now(),
         };
+        plan.budget.validate()?;
         plan.validate_structure()?;
         plan.digest = plan.calculate_digest()?;
         Ok(plan)
@@ -1076,6 +1199,61 @@ mod tests {
     }
 
     #[test]
+    fn execution_budget_accepts_defaults_and_exact_host_limits() {
+        assert!(ExecutionBudget::default().validate().is_ok());
+        let at_limits = ExecutionBudget {
+            max_steps: MAX_EXECUTION_STEPS,
+            max_tool_calls: MAX_TOOL_CALLS,
+            max_elapsed_ms: MAX_EXECUTION_ELAPSED_MS,
+            max_cost_microunits: MAX_EXECUTION_COST_MICROUNITS,
+        };
+        assert!(at_limits.validate().is_ok());
+    }
+
+    #[test]
+    fn execution_budget_rejects_each_invalid_boundary() {
+        let invalid_budgets = [
+            ExecutionBudget {
+                max_steps: 0,
+                ..ExecutionBudget::default()
+            },
+            ExecutionBudget {
+                max_steps: MAX_EXECUTION_STEPS + 1,
+                ..ExecutionBudget::default()
+            },
+            ExecutionBudget {
+                max_tool_calls: MAX_TOOL_CALLS + 1,
+                ..ExecutionBudget::default()
+            },
+            ExecutionBudget {
+                max_elapsed_ms: 0,
+                ..ExecutionBudget::default()
+            },
+            ExecutionBudget {
+                max_elapsed_ms: MAX_EXECUTION_ELAPSED_MS + 1,
+                ..ExecutionBudget::default()
+            },
+            ExecutionBudget {
+                max_cost_microunits: MAX_EXECUTION_COST_MICROUNITS + 1,
+                ..ExecutionBudget::default()
+            },
+        ];
+        for budget in invalid_budgets {
+            assert!(matches!(budget.validate(), Err(CoreError::InvalidInput(_))));
+        }
+    }
+
+    #[test]
+    fn execution_budget_allows_zero_tool_calls_and_zero_cost() {
+        let budget = ExecutionBudget {
+            max_tool_calls: 0,
+            max_cost_microunits: 0,
+            ..ExecutionBudget::default()
+        };
+        assert!(budget.validate().is_ok());
+    }
+
+    #[test]
     fn execution_context_derives_least_privilege_from_role() {
         let operator = Principal {
             operator_id: OperatorId::new("operator").unwrap(),
@@ -1104,6 +1282,31 @@ mod tests {
                 .capabilities
                 .allows(&[Capability::CodeExecution, Capability::ExternalMessaging])
         );
+        assert_eq!(operator_context.provenance, RequestProvenance::default());
+    }
+
+    #[test]
+    fn request_provenance_round_trips_and_defaults_for_legacy_envelopes() {
+        let provenance = RequestProvenance {
+            request_id: Some("request-1".to_owned()),
+            admission_approval_id: Some(Uuid::nil()),
+        };
+        let context = ExecutionContext::from_principal(&Principal {
+            operator_id: OperatorId::new("operator").unwrap(),
+            tenant_id: TenantId::new("tenant").unwrap(),
+            role: Role::Operator,
+        })
+        .with_provenance(
+            provenance.request_id.clone(),
+            provenance.admission_approval_id,
+        );
+        let encoded = serde_json::to_string(&context).unwrap();
+        let decoded: ExecutionContext = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.provenance, provenance);
+
+        let legacy: ExecutionContext =
+            serde_json::from_str(r#"{"role":"Operator","capabilities":[]}"#).unwrap();
+        assert_eq!(legacy.provenance, RequestProvenance::default());
     }
 
     #[test]
@@ -1395,7 +1598,7 @@ mod tests {
                 PlanApprovalRequirement::None,
             )],
         });
-        assert!(matches!(no_budget, Err(CoreError::PlanInvalid(_))));
+        assert!(matches!(no_budget, Err(CoreError::InvalidInput(_))));
     }
 
     #[test]
@@ -1404,5 +1607,45 @@ mod tests {
         let result = redact_sensitive(value);
         assert!(!result.contains("secret-value"));
         assert!(!result.contains("abc.def"));
+    }
+
+    #[test]
+    fn sensitive_values_with_quotes_and_common_keys_are_redacted() {
+        let api_key_value = ["sec", "ret"].concat();
+        let access_token_value = "tok-value-123";
+        let password_value = "hidden";
+        let bearer_value = "abc.def";
+        let private_key_value = "pem-secret";
+        let value = format!(
+            "{}='{}' {}: {} {}=\"{}\" {}: Bearer {} {}={}",
+            "api_key",
+            api_key_value,
+            "access-token",
+            access_token_value,
+            "password",
+            password_value,
+            "Authorization",
+            bearer_value,
+            "private_key",
+            private_key_value,
+        );
+        let result = redact_sensitive(&value);
+        for secret in [
+            api_key_value.as_str(),
+            access_token_value,
+            password_value,
+            bearer_value,
+            private_key_value,
+        ] {
+            assert!(
+                !result.contains(secret),
+                "segredo permaneceu na saída: {secret}; saída: {result}"
+            );
+        }
+        assert!(result.contains("api_key=[REDACTED]"));
+        assert!(result.contains("access-token=[REDACTED]"));
+        assert!(result.contains("password=[REDACTED]"));
+        assert!(result.contains("Authorization=[REDACTED]"));
+        assert!(result.contains("private_key=[REDACTED]"));
     }
 }

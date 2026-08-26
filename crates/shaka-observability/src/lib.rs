@@ -4,15 +4,11 @@
 //! Exporters e instrumentação dos componentes serão adicionados em etapas
 //! posteriores sem permitir que telemetria altere decisões de autorização.
 
-use regex::Regex;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
-use shaka_core::{AuditEvent, TaskId, TenantId};
+use shaka_core::{AuditEvent, TaskId, TenantId, redact_sensitive};
 use shaka_memory::{MemoryError, MemoryStore};
-use std::{
-    collections::BTreeMap,
-    sync::{Arc, OnceLock},
-};
+use std::{collections::BTreeMap, sync::Arc};
 use thiserror::Error;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
@@ -274,17 +270,6 @@ fn validate_correlation_id(field: &str, value: String) -> Result<String, Telemet
     }
 }
 
-fn sensitive_text_pattern() -> &'static Result<Regex, regex::Error> {
-    static PATTERN: OnceLock<Result<Regex, regex::Error>> = OnceLock::new();
-    PATTERN.get_or_init(|| {
-        Regex::new(concat!(
-            r"(?i)\b(?:authorization|proxy-authorization)\s*[:=]\s*Bearer\s+[A-Za-z0-9._~+/=-]+|\bBearer\s+[A-Za-z0-9._~+/=-]+|",
-            r#"(?:[\"']?)(?:api[_-]?key|access[_-]?token|secret|password|authorization|cookie|set-cookie|private[_-]?key|token)(?:[\"']?)"#,
-            r#"\s*[:=]\s*(?:\"[^\"]*\"|'[^']*'|[^\s,;}\]]+)"#
-        ))
-    })
-}
-
 fn normalized_key(key: &str) -> String {
     key.to_ascii_lowercase().replace('-', "_")
 }
@@ -387,25 +372,7 @@ impl Redactor {
     /// Redacta padrões conhecidos de segredo e limita o tamanho do texto.
     #[must_use]
     pub fn redact_text(&self, input: &str) -> String {
-        let redacted = match sensitive_text_pattern() {
-            Ok(pattern) => pattern
-                .replace_all(input, |captures: &regex::Captures<'_>| {
-                    let value = captures.get(0).map_or("", |match_| match_.as_str());
-                    if value.to_ascii_lowercase().starts_with("bearer") {
-                        "Bearer [REDACTED]".to_owned()
-                    } else {
-                        let key = value
-                            .split([':', '='])
-                            .next()
-                            .unwrap_or("secret")
-                            .trim_matches(['"', '\'']);
-                        format!("{key}=[REDACTED]")
-                    }
-                })
-                .into_owned(),
-            Err(_) => "[REDACTION_FAILED]".to_owned(),
-        };
-        truncate_text(&redacted, self.text)
+        truncate_text(&redact_sensitive(input), self.text)
     }
 
     /// Redacta recursivamente um valor JSON, removendo valores de chaves sensíveis.

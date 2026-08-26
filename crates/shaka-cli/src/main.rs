@@ -162,7 +162,7 @@ enum IamCommand {
     TokenIssue {
         operator_id: String,
         #[arg(long)]
-        expires_in_seconds: Option<i64>,
+        expires_in_seconds: i64,
     },
     TokenRevoke {
         token_id: String,
@@ -350,7 +350,8 @@ async fn run_agent(cli: &Cli, args: &RunArgs) -> Result<()> {
         config.principal.operator_id.clone(),
         args.objective.clone(),
     )?;
-    envelope.execution_context = ExecutionContext::from_principal(&config.principal);
+    envelope.execution_context = ExecutionContext::from_principal(&config.principal)
+        .with_provenance(Some(Uuid::new_v4().to_string()), None);
     envelope.dry_run = !config.live_requested;
     let model = build_model(&config)?;
     let mut tools = build_tool_registry(cli, &config)?;
@@ -403,8 +404,13 @@ fn build_tool_registry(cli: &Cli, config: &AppConfig) -> Result<ToolRegistry> {
         .with_context(|| "nenhuma skill ativa legada ou não confiável pode ser carregada")?
     {
         let skill_name = artifact.name.clone();
-        let tool = WasmSkillTool::from_approved_artifact(artifact, &trust_store)
-            .with_context(|| format!("carregando skill ativa {skill_name}"))?;
+        let tool = WasmSkillTool::from_approved_artifact_with_revalidation(
+            artifact,
+            &trust_store,
+            config.skills_file.clone(),
+            cli.trust_file.clone(),
+        )
+        .with_context(|| format!("carregando skill ativa {skill_name}"))?;
         tools.register(Arc::new(tool))?;
     }
     Ok(tools)
@@ -854,6 +860,7 @@ fn parse_approval_decision(value: &str) -> Result<PlanApprovalDecision, String> 
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn iam_command(cli: &Cli, command: &IamCommand) -> Result<()> {
     let config = build_config(cli, false, false)?;
     authorize(&config, &Action::ManageIam)?;
@@ -898,10 +905,15 @@ fn iam_command(cli: &Cli, command: &IamCommand) -> Result<()> {
             operator_id,
             expires_in_seconds,
         } => {
+            if !(1..=shaka_queue::MAX_TOKEN_LIFETIME_SECONDS).contains(expires_in_seconds) {
+                bail!(
+                    "expires_in_seconds deve estar entre 1 e {}",
+                    shaka_queue::MAX_TOKEN_LIFETIME_SECONDS
+                );
+            }
             let operator_id = shaka_core::OperatorId::new(operator_id.clone())?;
-            let expires_at =
-                expires_in_seconds.map(|seconds| chrono::Utc::now() + Duration::seconds(seconds));
-            let issue = queue.issue_token(&operator_id, expires_at)?;
+            let expires_at = Utc::now() + Duration::seconds(*expires_in_seconds);
+            let issue = queue.issue_token(&operator_id, Some(expires_at))?;
             append_control_audit(
                 &open_memory(&config.database)?,
                 &config.principal,

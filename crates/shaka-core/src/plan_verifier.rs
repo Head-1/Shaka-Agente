@@ -608,7 +608,8 @@ impl PlanVerifier {
 
 impl PlanVerificationReport {
     fn push(&mut self, max_violations: usize, violation: PlanViolation) {
-        if self.violations.len() < max_violations {
+        let retention_limit = max_violations.max(1);
+        if self.violations.len() < retention_limit {
             self.violations.push(violation);
         }
     }
@@ -863,7 +864,33 @@ mod tests {
     }
 
     #[test]
-    fn verifier_rejects_used_idempotency_key_and_unknown_target() {
+    fn zero_violation_budget_cannot_hide_terminal_plan_state() {
+        let mut plan = read_only_plan(vec![step(
+            "read",
+            &[],
+            PlanAction::ReadOnly {
+                operation: "inspect".to_owned(),
+            },
+            PlanRisk::ReadOnly,
+            PlanApprovalRequirement::None,
+            Vec::new(),
+            Vec::new(),
+        )]);
+        plan.state = PlanState::Succeeded;
+        let verifier = PlanVerifier {
+            max_violations: 0,
+            ..PlanVerifier::default()
+        };
+        let report = verifier.verify(
+            &plan,
+            &PlanVerificationContext::new(PlanVerificationPhase::Preflight),
+        );
+        assert_eq!(report.status, PlanVerificationStatus::Invalid);
+        assert!(!report.violations.is_empty());
+    }
+
+    #[test]
+    fn verifier_rejects_missing_dependency() {
         let plan = read_only_plan(vec![step(
             "read",
             &[],

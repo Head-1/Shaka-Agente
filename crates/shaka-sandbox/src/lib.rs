@@ -15,12 +15,22 @@ use std::{
     time::Duration,
 };
 use thiserror::Error;
-use wasmtime::{Config, Engine, Instance, Module, Store};
+use wasmtime::{Config, Engine, Instance, Module, Store, StoreLimits, StoreLimitsBuilder};
+
+/// Limite máximo host-side para memória linear de uma execução WASM.
+pub const MAX_SANDBOX_MEMORY_BYTES: u64 = 64 * 1024 * 1024;
+
+const fn default_max_memory_bytes() -> u64 {
+    16 * 1024 * 1024
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SandboxPolicy {
     pub max_fuel: u64,
     pub max_elapsed_ms: u64,
+    /// Limite de memória linear do guest em bytes.
+    #[serde(default = "default_max_memory_bytes")]
+    pub max_memory_bytes: u64,
     pub allow_network: bool,
     pub allow_filesystem: bool,
 }
@@ -30,6 +40,7 @@ impl Default for SandboxPolicy {
         Self {
             max_fuel: 100_000,
             max_elapsed_ms: 1_000,
+            max_memory_bytes: default_max_memory_bytes(),
             allow_network: false,
             allow_filesystem: false,
         }
@@ -46,6 +57,11 @@ impl SandboxPolicy {
         }
         if required.contains(&Capability::FilesystemWrite) && !self.allow_filesystem {
             return Err(SandboxError::CapabilityDenied(Capability::FilesystemWrite));
+        }
+        if self.max_memory_bytes == 0 || self.max_memory_bytes > MAX_SANDBOX_MEMORY_BYTES {
+            return Err(SandboxError::InvalidPolicy(format!(
+                "max_memory_bytes deve estar entre 1 e {MAX_SANDBOX_MEMORY_BYTES}"
+            )));
         }
         Ok(())
     }
@@ -73,6 +89,11 @@ pub enum SandboxError {
     Execution(String),
 }
 
+struct SandboxStoreState {
+    limits: StoreLimits,
+}
+
+#[derive(Clone)]
 pub struct WasmExecutor {
     engine: Engine,
 }
@@ -95,6 +116,21 @@ impl WasmExecutor {
         Ok(Self { engine })
     }
 
+    /// Executa WASM fora das threads assíncronas, preservando o contrato síncrono.
+    pub async fn execute_async(
+        &self,
+        wasm: Vec<u8>,
+        required_capabilities: Vec<Capability>,
+        policy: SandboxPolicy,
+    ) -> Result<SandboxResult, SandboxError> {
+        let executor = self.clone();
+        tokio::task::spawn_blocking(move || {
+            executor.execute(&wasm, &required_capabilities, &policy)
+        })
+        .await
+        .map_err(|error| SandboxError::Execution(format!("thread do sandbox terminou: {error}")))?
+    }
+
     pub fn execute(
         &self,
         wasm: &[u8],
@@ -112,7 +148,12 @@ impl WasmExecutor {
         if module.imports().next().is_some() {
             return Err(SandboxError::HostImportsDenied);
         }
-        let mut store = Store::new(&self.engine, ());
+        let memory_limit = usize::try_from(policy.max_memory_bytes).map_err(|_| {
+            SandboxError::InvalidPolicy("max_memory_bytes não cabe em usize".to_owned())
+        })?;
+        let limits = StoreLimitsBuilder::new().memory_size(memory_limit).build();
+        let mut store = Store::new(&self.engine, SandboxStoreState { limits });
+        store.limiter(|state| &mut state.limits);
         store
             .set_fuel(policy.max_fuel)
             .map_err(|error| SandboxError::InvalidPolicy(error.to_string()))?;
@@ -174,6 +215,62 @@ mod tests {
     }
 
     #[test]
+    fn memory_policy_rejects_zero_and_above_host_maximum() {
+        let zero = SandboxPolicy {
+            max_memory_bytes: 0,
+            ..SandboxPolicy::default()
+        };
+        assert!(matches!(
+            zero.validate(&[]),
+            Err(SandboxError::InvalidPolicy(message)) if message.contains("max_memory_bytes")
+        ));
+
+        let above_maximum = SandboxPolicy {
+            max_memory_bytes: MAX_SANDBOX_MEMORY_BYTES + 1,
+            ..SandboxPolicy::default()
+        };
+        assert!(matches!(
+            above_maximum.validate(&[]),
+            Err(SandboxError::InvalidPolicy(message)) if message.contains("max_memory_bytes")
+        ));
+    }
+
+    #[test]
+    fn legacy_memory_policy_deserializes_to_safe_default() {
+        let policy: SandboxPolicy = serde_json::from_str(
+            r#"{
+                "max_fuel": 100000,
+                "max_elapsed_ms": 1000,
+                "allow_network": false,
+                "allow_filesystem": false
+            }"#,
+        )
+        .expect("legacy sandbox policy");
+        assert_eq!(policy.max_memory_bytes, 16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn guest_memory_growth_is_bounded_by_policy() {
+        let executor = WasmExecutor::new().expect("executor");
+        let wasm = wat::parse_str(
+            r#"(module
+                (memory 1)
+                (func (export "run") (result i32)
+                    i32.const 1
+                    memory.grow))"#,
+        )
+        .expect("wat");
+        let policy = SandboxPolicy {
+            max_memory_bytes: 64 * 1024,
+            ..SandboxPolicy::default()
+        };
+        let result = executor
+            .execute(&wasm, &[], &policy)
+            .expect("memory.grow should fail inside guest, not trap the host");
+        assert_eq!(result.exit_code, -1);
+    }
+
+    #[test]
     fn rejects_host_imports() {
         let executor = WasmExecutor::new().expect("executor");
         let wasm = wat::parse_str(
@@ -182,6 +279,32 @@ mod tests {
         .expect("wat");
         let result = executor.execute(&wasm, &[], &SandboxPolicy::default());
         assert!(matches!(result, Err(SandboxError::HostImportsDenied)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_execution_does_not_block_executor() {
+        let executor = WasmExecutor::new().expect("executor");
+        let wasm = wat::parse_str(
+            r#"(module (func (export "run") (result i32) (loop br 0) i32.const 0))"#,
+        )
+        .expect("wat");
+        let policy = SandboxPolicy {
+            max_fuel: u64::MAX,
+            max_elapsed_ms: 150,
+            ..SandboxPolicy::default()
+        };
+        let started = std::time::Instant::now();
+        let execution = tokio::spawn({
+            let executor = executor.clone();
+            async move { executor.execute_async(wasm, Vec::new(), policy).await }
+        });
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        let tick_elapsed_ms = started.elapsed().as_millis();
+        let result = execution.await.expect("join");
+        assert!(
+            matches!(result, Err(SandboxError::Execution(message)) if message.contains("tempo"))
+        );
+        assert!(tick_elapsed_ms < 100, "ticker atrasou {tick_elapsed_ms} ms");
     }
 
     #[test]

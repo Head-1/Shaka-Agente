@@ -2540,8 +2540,10 @@ name = "shaka-sandbox"
 version = "0.8.2"
 dependencies = [
  "serde",
+ "serde_json",
  "shaka-core",
  "thiserror",
+ "tokio",
  "wasmtime",
  "wat",
 ]

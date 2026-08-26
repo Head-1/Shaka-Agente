@@ -13,8 +13,10 @@ use std::{
 };
 use thiserror::Error;
 
-/// Versão do protocolo de atestação de aprovação humana.
+/// Versão legada do protocolo de atestação; nunca é executável.
 pub const APPROVAL_PROTOCOL_V1: &str = "shaka-skill-approval-v1";
+/// Versão do protocolo que vincula a autoridade declarativa do manifesto.
+pub const APPROVAL_PROTOCOL_V2: &str = "shaka-skill-approval-v2";
 
 #[derive(Debug, Error)]
 pub enum SkillError {
@@ -30,6 +32,10 @@ pub enum SkillError {
     UnsignedApproval,
     #[error("assinatura da aprovação é inválida")]
     InvalidSignature,
+    #[error("protocolo de aprovação legado ou não suportado")]
+    UnsupportedApprovalProtocol,
+    #[error("autoridade declarativa da skill não corresponde à aprovação")]
+    ManifestAuthorityMismatch,
     #[error("chave de assinatura inválida: {0}")]
     InvalidKey(String),
     #[error("chave não confiável: {0}")]
@@ -64,11 +70,46 @@ pub struct ApprovalAttestation {
     pub signature_hex: String,
 }
 
+/// Campos imutáveis que identificam a decisão de aprovação V2.
+#[derive(Debug, Clone, Copy)]
+pub struct ApprovalBinding<'a> {
+    pub name: &'a str,
+    pub version: &'a str,
+    pub operator_id: &'a OperatorId,
+    pub artifact_sha256: &'a str,
+    pub reason: &'a str,
+    pub manifest_authority_sha256: &'a str,
+}
+
+impl<'a> ApprovalBinding<'a> {
+    #[must_use]
+    pub const fn new(
+        name: &'a str,
+        version: &'a str,
+        operator_id: &'a OperatorId,
+        artifact_sha256: &'a str,
+        reason: &'a str,
+        manifest_authority_sha256: &'a str,
+    ) -> Self {
+        Self {
+            name,
+            version,
+            operator_id,
+            artifact_sha256,
+            reason,
+            manifest_authority_sha256,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ApprovalRecord {
     pub operator_id: OperatorId,
     pub approved_at: DateTime<Utc>,
     pub artifact_sha256: String,
+    /// Digest V2 de permissões e schemas aprovados; ausente em registros legados.
+    #[serde(default)]
+    pub manifest_authority_sha256: Option<String>,
     #[serde(default)]
     pub artifact_path: Option<PathBuf>,
     pub reason: String,
@@ -185,15 +226,11 @@ impl TrustStore {
     /// Verifica uma atestação contra a chave confiável e o payload canônico.
     pub fn verify_attestation(
         &self,
-        name: &str,
-        version: &str,
-        operator_id: &OperatorId,
-        artifact_sha256: &str,
-        reason: &str,
+        binding: &ApprovalBinding<'_>,
         attestation: &ApprovalAttestation,
     ) -> Result<(), SkillError> {
-        if attestation.protocol != APPROVAL_PROTOCOL_V1 {
-            return Err(SkillError::InvalidSignature);
+        if attestation.protocol != APPROVAL_PROTOCOL_V2 {
+            return Err(SkillError::UnsupportedApprovalProtocol);
         }
         let trusted = self
             .keys
@@ -210,7 +247,7 @@ impl TrustStore {
             hex::decode(&attestation.signature_hex).map_err(|_| SkillError::InvalidSignature)?;
         let signature =
             Signature::from_slice(&signature_bytes).map_err(|_| SkillError::InvalidSignature)?;
-        let payload = approval_payload(name, version, operator_id, artifact_sha256, reason);
+        let payload = approval_payload_v2(binding);
         verifying_key
             .verify(&payload, &signature)
             .map_err(|_| SkillError::InvalidSignature)
@@ -220,6 +257,15 @@ impl TrustStore {
 #[derive(Debug, Default)]
 pub struct SkillRegistry {
     skills: HashMap<String, SkillRecord>,
+}
+
+struct AttestedApproval {
+    operator_id: OperatorId,
+    artifact_sha256: String,
+    artifact_path: PathBuf,
+    reason: String,
+    manifest_authority_sha256: String,
+    attestation: ApprovalAttestation,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -232,6 +278,7 @@ pub struct ActiveSkillArtifact {
     pub output_schema: serde_json::Value,
     pub artifact_path: PathBuf,
     pub artifact_sha256: String,
+    pub manifest_authority_sha256: String,
     pub attestation: ApprovalAttestation,
     pub approval_operator_id: OperatorId,
     pub approval_reason: String,
@@ -293,22 +340,30 @@ impl SkillRegistry {
             .ok_or_else(|| SkillError::NotFound(name.to_owned()))?;
         let key_id = validate_key_id(key_id.into())?;
         let reason = validate_reason(reason.into())?;
-        let attestation = sign_approval(
+        let manifest_authority_sha256 = manifest_authority_sha256(
+            &record.manifest.permissions,
+            &record.manifest.input_schema,
+            &record.manifest.output_schema,
+        )?;
+        let binding = ApprovalBinding::new(
             name,
             &record.manifest.version,
             &operator_id,
             &artifact_sha256,
             &reason,
-            key_id,
-            signing_key,
+            &manifest_authority_sha256,
         );
+        let attestation = sign_approval_v2(&binding, key_id, signing_key);
         self.approve_with_attestation(
             name,
-            operator_id,
-            artifact_sha256,
-            canonical_path,
-            reason,
-            attestation,
+            AttestedApproval {
+                operator_id,
+                artifact_sha256,
+                artifact_path: canonical_path,
+                reason,
+                manifest_authority_sha256,
+                attestation,
+            },
         )
     }
 
@@ -365,6 +420,7 @@ impl SkillRegistry {
             operator_id,
             approved_at: Utc::now(),
             artifact_sha256,
+            manifest_authority_sha256: None,
             artifact_path: None,
             reason,
             attestation: None,
@@ -394,6 +450,7 @@ impl SkillRegistry {
             operator_id,
             approved_at: Utc::now(),
             artifact_sha256,
+            manifest_authority_sha256: None,
             artifact_path: Some(artifact_path),
             reason,
             attestation: None,
@@ -405,27 +462,24 @@ impl SkillRegistry {
     fn approve_with_attestation(
         &mut self,
         name: &str,
-        operator_id: OperatorId,
-        artifact_sha256: String,
-        artifact_path: PathBuf,
-        reason: String,
-        attestation: ApprovalAttestation,
+        approval: AttestedApproval,
     ) -> Result<SkillRecord, SkillError> {
         let record = self
             .skills
             .get_mut(name)
             .ok_or_else(|| SkillError::NotFound(name.to_owned()))?;
         ensure_candidate(record)?;
-        let artifact_sha256 = validate_hash(artifact_sha256)?;
+        let artifact_sha256 = validate_hash(approval.artifact_sha256)?;
         record.manifest.status = SkillStatus::Active;
         record.manifest.artifact_sha256 = Some(artifact_sha256.clone());
         record.approval = Some(ApprovalRecord {
-            operator_id,
+            operator_id: approval.operator_id,
             approved_at: Utc::now(),
             artifact_sha256,
-            artifact_path: Some(artifact_path),
-            reason,
-            attestation: Some(attestation),
+            manifest_authority_sha256: Some(approval.manifest_authority_sha256),
+            artifact_path: Some(approval.artifact_path),
+            reason: approval.reason,
+            attestation: Some(approval.attestation),
         });
         record.updated_at = Utc::now();
         Ok(record.clone())
@@ -489,12 +543,27 @@ impl SkillRegistry {
             {
                 return Err(SkillError::ArtifactHashMismatch);
             }
+            let approved_manifest_authority_sha256 = approval
+                .manifest_authority_sha256
+                .as_deref()
+                .ok_or(SkillError::UnsupportedApprovalProtocol)?;
+            let current_manifest_authority_sha256 = manifest_authority_sha256(
+                &record.manifest.permissions,
+                &record.manifest.input_schema,
+                &record.manifest.output_schema,
+            )?;
+            if current_manifest_authority_sha256 != approved_manifest_authority_sha256 {
+                return Err(SkillError::ManifestAuthorityMismatch);
+            }
             trust_store.verify_attestation(
-                &record.manifest.name,
-                &record.manifest.version,
-                &approval.operator_id,
-                &approval.artifact_sha256,
-                &approval.reason,
+                &ApprovalBinding::new(
+                    &record.manifest.name,
+                    &record.manifest.version,
+                    &approval.operator_id,
+                    &approval.artifact_sha256,
+                    &approval.reason,
+                    approved_manifest_authority_sha256,
+                ),
                 attestation,
             )?;
             artifacts.push(ActiveSkillArtifact {
@@ -506,6 +575,7 @@ impl SkillRegistry {
                 output_schema: record.manifest.output_schema.clone(),
                 artifact_path,
                 artifact_sha256: approval.artifact_sha256.clone(),
+                manifest_authority_sha256: approved_manifest_authority_sha256.to_owned(),
                 attestation: attestation.clone(),
                 approval_operator_id: approval.operator_id.clone(),
                 approval_reason: approval.reason.clone(),
@@ -535,6 +605,7 @@ impl SkillRegistry {
                     output_schema: record.manifest.output_schema.clone(),
                     artifact_path,
                     artifact_sha256,
+                    manifest_authority_sha256: approval.manifest_authority_sha256.clone()?,
                     attestation,
                     approval_operator_id: approval.operator_id.clone(),
                     approval_reason: approval.reason.clone(),
@@ -544,7 +615,7 @@ impl SkillRegistry {
     }
 }
 
-/// Assina a decisão de aprovação sobre um payload canônico e versionado.
+/// Assina uma decisão V1 para fixtures e migração; o caminho executável rejeita V1.
 #[must_use]
 pub fn sign_approval(
     name: &str,
@@ -555,10 +626,27 @@ pub fn sign_approval(
     key_id: String,
     signing_key: &SigningKey,
 ) -> ApprovalAttestation {
-    let payload = approval_payload(name, version, operator_id, artifact_sha256, reason);
+    let payload = approval_payload_v1(name, version, operator_id, artifact_sha256, reason);
     let signature = signing_key.sign(&payload);
     ApprovalAttestation {
         protocol: APPROVAL_PROTOCOL_V1.to_owned(),
+        key_id,
+        public_key_hex: hex::encode(signing_key.verifying_key().to_bytes()),
+        signature_hex: hex::encode(signature.to_bytes()),
+    }
+}
+
+/// Assina uma decisão V2 vinculada ao snapshot de autoridade do manifesto.
+#[must_use]
+pub fn sign_approval_v2(
+    binding: &ApprovalBinding<'_>,
+    key_id: String,
+    signing_key: &SigningKey,
+) -> ApprovalAttestation {
+    let payload = approval_payload_v2(binding);
+    let signature = signing_key.sign(&payload);
+    ApprovalAttestation {
+        protocol: APPROVAL_PROTOCOL_V2.to_owned(),
         key_id,
         public_key_hex: hex::encode(signing_key.verifying_key().to_bytes()),
         signature_hex: hex::encode(signature.to_bytes()),
@@ -621,22 +709,104 @@ pub fn sha256_file(path: impl AsRef<Path>) -> Result<String, SkillError> {
     Ok(hex::encode(digest.finalize()))
 }
 
-fn approval_payload(
+#[derive(Debug, Serialize)]
+struct ManifestAuthorityPayload {
+    permissions: Vec<&'static str>,
+    input_schema: serde_json::Value,
+    output_schema: serde_json::Value,
+}
+
+/// Calcula o digest canônico dos campos do manifesto que alteram autoridade no runtime.
+pub fn manifest_authority_sha256(
+    permissions: &[Capability],
+    input_schema: &serde_json::Value,
+    output_schema: &serde_json::Value,
+) -> Result<String, SkillError> {
+    let mut canonical_permissions: Vec<_> = permissions.iter().map(capability_label).collect();
+    canonical_permissions.sort_unstable();
+    canonical_permissions.dedup();
+    let authority = ManifestAuthorityPayload {
+        permissions: canonical_permissions,
+        input_schema: canonicalize_json(input_schema),
+        output_schema: canonicalize_json(output_schema),
+    };
+    let encoded = serde_json::to_vec(&authority)?;
+    let mut digest = Sha256::new();
+    digest.update(b"shaka-skill-manifest-authority-v1");
+    digest.update([0]);
+    digest.update(encoded);
+    Ok(hex::encode(digest.finalize()))
+}
+
+fn capability_label(capability: &Capability) -> &'static str {
+    match capability {
+        Capability::Network => "network",
+        Capability::FilesystemRead => "filesystem_read",
+        Capability::FilesystemWrite => "filesystem_write",
+        Capability::CodeExecution => "code_execution",
+        Capability::ExternalMessaging => "external_messaging",
+        Capability::MemoryWrite => "memory_write",
+    }
+}
+
+fn canonicalize_json(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(object) => {
+            let mut fields: Vec<_> = object.iter().collect();
+            fields.sort_unstable_by_key(|(key, _)| *key);
+            let mut canonical = serde_json::Map::new();
+            for (key, value) in fields {
+                canonical.insert(key.clone(), canonicalize_json(value));
+            }
+            serde_json::Value::Object(canonical)
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(canonicalize_json).collect())
+        }
+        scalar => scalar.clone(),
+    }
+}
+
+fn approval_payload_v1(
     name: &str,
     version: &str,
     operator_id: &OperatorId,
     artifact_sha256: &str,
     reason: &str,
 ) -> Vec<u8> {
-    let mut payload = Vec::from(APPROVAL_PROTOCOL_V1.as_bytes());
+    approval_payload(
+        APPROVAL_PROTOCOL_V1,
+        [
+            ("name", name),
+            ("version", version),
+            ("operator_id", operator_id.0.as_str()),
+            ("artifact_sha256", artifact_sha256),
+            ("reason", reason),
+        ],
+    )
+}
+
+fn approval_payload_v2(binding: &ApprovalBinding<'_>) -> Vec<u8> {
+    approval_payload(
+        APPROVAL_PROTOCOL_V2,
+        [
+            ("name", binding.name),
+            ("version", binding.version),
+            ("operator_id", binding.operator_id.0.as_str()),
+            ("artifact_sha256", binding.artifact_sha256),
+            ("reason", binding.reason),
+            (
+                "manifest_authority_sha256",
+                binding.manifest_authority_sha256,
+            ),
+        ],
+    )
+}
+
+fn approval_payload<const N: usize>(protocol: &str, fields: [(&str, &str); N]) -> Vec<u8> {
+    let mut payload = Vec::from(protocol.as_bytes());
     payload.push(0);
-    for (label, value) in [
-        ("name", name),
-        ("version", version),
-        ("operator_id", operator_id.0.as_str()),
-        ("artifact_sha256", artifact_sha256),
-        ("reason", reason),
-    ] {
+    for (label, value) in fields {
         payload.extend_from_slice(label.as_bytes());
         payload.push(b'=');
         payload.extend_from_slice(value.len().to_string().as_bytes());
@@ -853,15 +1023,192 @@ mod tests {
     }
 
     #[test]
-    fn changed_reason_invalidates_signature() {
+    fn manifest_authority_digest_is_order_independent_for_permissions() {
+        let input_schema = json!({"type": "object"});
+        let output_schema = json!({"type": "object"});
+        let first = manifest_authority_sha256(
+            &[
+                Capability::MemoryWrite,
+                Capability::CodeExecution,
+                Capability::MemoryWrite,
+            ],
+            &input_schema,
+            &output_schema,
+        )
+        .unwrap();
+        let second = manifest_authority_sha256(
+            &[Capability::CodeExecution, Capability::MemoryWrite],
+            &input_schema,
+            &output_schema,
+        )
+        .unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn signed_v1_approval_is_not_executable() {
+        let mut registry = SkillRegistry::default();
+        registry.register_candidate(candidate()).unwrap();
+        let path = fixture_path("legacy-signed");
+        let hash = sha256_file(&path).unwrap();
         let key = signing_key();
         let operator = OperatorId::new("reviewer").unwrap();
+        let authority_hash = manifest_authority_sha256(
+            &registry.get("demo").unwrap().manifest.permissions,
+            &registry.get("demo").unwrap().manifest.input_schema,
+            &registry.get("demo").unwrap().manifest.output_schema,
+        )
+        .unwrap();
         let attestation = sign_approval(
             "demo",
             "0.1.0",
             &operator,
-            &"a".repeat(64),
-            "motivo original",
+            &hash,
+            "aprovação V1 legada",
+            "review-key".to_owned(),
+            &key,
+        );
+        registry
+            .approve_with_attestation(
+                "demo",
+                AttestedApproval {
+                    operator_id: operator.clone(),
+                    artifact_sha256: hash,
+                    artifact_path: path.clone(),
+                    reason: "aprovação V1 legada".to_owned(),
+                    manifest_authority_sha256: authority_hash,
+                    attestation,
+                },
+            )
+            .unwrap();
+        let mut trust = TrustStore::default();
+        trust
+            .add_key("review-key", public_key_hex(&key), "chave", operator)
+            .unwrap();
+        assert!(matches!(
+            registry.active_verified_artifacts(&trust),
+            Err(SkillError::UnsupportedApprovalProtocol)
+        ));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn manifest_authority_changes_require_new_approval() {
+        let mut registry = SkillRegistry::default();
+        registry.register_candidate(candidate()).unwrap();
+        let path = fixture_path("manifest-authority");
+        let key = signing_key();
+        let operator = OperatorId::new("reviewer").unwrap();
+        registry
+            .approve_signed_artifact(
+                "demo",
+                operator.clone(),
+                &path,
+                "review-key",
+                &key,
+                "manifesto aprovado",
+            )
+            .unwrap();
+        let mut trust = TrustStore::default();
+        trust
+            .add_key("review-key", public_key_hex(&key), "chave", operator)
+            .unwrap();
+        registry
+            .skills
+            .get_mut("demo")
+            .unwrap()
+            .manifest
+            .permissions
+            .push(Capability::ExternalMessaging);
+        assert!(matches!(
+            registry.active_verified_artifacts(&trust),
+            Err(SkillError::ManifestAuthorityMismatch)
+        ));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn manifest_schema_changes_require_new_approval() {
+        let mut registry = SkillRegistry::default();
+        registry.register_candidate(candidate()).unwrap();
+        let path = fixture_path("manifest-schema");
+        let key = signing_key();
+        let operator = OperatorId::new("reviewer").unwrap();
+        registry
+            .approve_signed_artifact(
+                "demo",
+                operator.clone(),
+                &path,
+                "review-key",
+                &key,
+                "schema aprovado",
+            )
+            .unwrap();
+        let mut trust = TrustStore::default();
+        trust
+            .add_key("review-key", public_key_hex(&key), "chave", operator)
+            .unwrap();
+        registry
+            .skills
+            .get_mut("demo")
+            .unwrap()
+            .manifest
+            .input_schema = json!({"type": "string"});
+        assert!(matches!(
+            registry.active_verified_artifacts(&trust),
+            Err(SkillError::ManifestAuthorityMismatch)
+        ));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn manifest_output_schema_changes_require_new_approval() {
+        let mut registry = SkillRegistry::default();
+        registry.register_candidate(candidate()).unwrap();
+        let path = fixture_path("manifest-output-schema");
+        let key = signing_key();
+        let operator = OperatorId::new("reviewer").unwrap();
+        registry
+            .approve_signed_artifact(
+                "demo",
+                operator.clone(),
+                &path,
+                "review-key",
+                &key,
+                "output schema aprovado",
+            )
+            .unwrap();
+        let mut trust = TrustStore::default();
+        trust
+            .add_key("review-key", public_key_hex(&key), "chave", operator)
+            .unwrap();
+        registry
+            .skills
+            .get_mut("demo")
+            .unwrap()
+            .manifest
+            .output_schema = json!({"type": "string"});
+        assert!(matches!(
+            registry.active_verified_artifacts(&trust),
+            Err(SkillError::ManifestAuthorityMismatch)
+        ));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn changed_reason_invalidates_signature() {
+        let key = signing_key();
+        let operator = OperatorId::new("reviewer").unwrap();
+        let manifest_authority_sha256 = "b".repeat(64);
+        let attestation = sign_approval_v2(
+            &ApprovalBinding::new(
+                "demo",
+                "0.1.0",
+                &operator,
+                &"a".repeat(64),
+                "motivo original",
+                &manifest_authority_sha256,
+            ),
             "review-key".to_owned(),
             &key,
         );
@@ -876,11 +1223,14 @@ mod tests {
             .unwrap();
         assert!(matches!(
             trust.verify_attestation(
-                "demo",
-                "0.1.0",
-                &operator,
-                &"a".repeat(64),
-                "motivo adulterado",
+                &ApprovalBinding::new(
+                    "demo",
+                    "0.1.0",
+                    &operator,
+                    &"a".repeat(64),
+                    "motivo adulterado",
+                    &manifest_authority_sha256,
+                ),
                 &attestation,
             ),
             Err(SkillError::InvalidSignature)
@@ -968,11 +1318,14 @@ mod tests {
             };
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 trust.verify_attestation(
-                    "demo",
-                    "0.1.0",
-                    &operator,
-                    &"a".repeat(64),
-                    "fixture",
+                    &ApprovalBinding::new(
+                        "demo",
+                        "0.1.0",
+                        &operator,
+                        &"a".repeat(64),
+                        "fixture",
+                        &"b".repeat(64),
+                    ),
                     &attestation,
                 )
             }));
@@ -996,22 +1349,28 @@ mod tests {
             )
             .unwrap();
         trust.revoke_key("review-key").unwrap();
-        let attestation = sign_approval(
-            "demo",
-            "0.1.0",
-            &operator,
-            &"a".repeat(64),
-            "motivo",
-            "review-key".to_owned(),
-            &key,
-        );
-        assert!(matches!(
-            trust.verify_attestation(
+        let attestation = sign_approval_v2(
+            &ApprovalBinding::new(
                 "demo",
                 "0.1.0",
                 &operator,
                 &"a".repeat(64),
                 "motivo",
+                &"b".repeat(64),
+            ),
+            "review-key".to_owned(),
+            &key,
+        );
+        assert!(matches!(
+            trust.verify_attestation(
+                &ApprovalBinding::new(
+                    "demo",
+                    "0.1.0",
+                    &operator,
+                    &"a".repeat(64),
+                    "motivo",
+                    &"b".repeat(64),
+                ),
                 &attestation,
             ),
             Err(SkillError::RevokedKey(_))
