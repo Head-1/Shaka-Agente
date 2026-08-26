@@ -11,6 +11,7 @@ members = [
     "crates/shaka-config",
     "crates/shaka-queue",
     "crates/shaka-api",
+    "crates/shaka-probes",
 ]
 
 [workspace.package]

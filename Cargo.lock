@@ -2520,6 +2520,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "shaka-probes"
+version = "0.8.2"
+dependencies = [
+ "chrono",
+ "serde_json",
+ "shaka-core",
+ "shaka-memory",
+ "shaka-queue",
+ "uuid",
+]
+
+[[package]]
 name = "shaka-queue"
 version = "0.8.2"
 dependencies = [

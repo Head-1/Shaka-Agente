@@ -58,7 +58,7 @@ class RepositoryValidationScriptTests(unittest.TestCase):
             self.assertIn("validation_exit=2", log.read_text(encoding="utf-8"))
 
     def test_shell_scripts_are_syntactically_valid(self) -> None:
-        for script in (VALIDATOR, LIFECYCLE):
+        for script in (VALIDATOR, LIFECYCLE, ROOT / "scripts" / "process_crash_probes.sh"):
             with self.subTest(script=script.name):
                 result = subprocess.run(
                     ["bash", "-n", str(script)],
@@ -79,6 +79,9 @@ class RepositoryValidationScriptTests(unittest.TestCase):
             "scripts/secret_scan.py",
             "scripts/workflow_policy_check.py",
             "scripts/process_lifecycle_probe.sh",
+            "scripts/process_crash_probes.sh",
+            "cargo build --locked -p shaka-probes --bins",
+            "process_crash_probes=PASS",
             "working_tree=clean",
         ):
             with self.subTest(expected=expected):

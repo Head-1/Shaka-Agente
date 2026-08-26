@@ -1,0 +1,25 @@
+[package]
+name = "shaka-probes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "queue-process-crash-probe"
+path = "src/bin/queue_process_crash_probe.rs"
+
+[[bin]]
+name = "audit-process-crash-probe"
+path = "src/bin/audit_process_crash_probe.rs"
+
+[dependencies]
+chrono.workspace = true
+serde_json.workspace = true
+shaka-core = { path = "../shaka-core" }
+shaka-memory = { path = "../shaka-memory" }
+shaka-queue = { path = "../shaka-queue" }
+uuid.workspace = true
+
+[lints]
+workspace = true
