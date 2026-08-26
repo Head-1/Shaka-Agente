@@ -19,6 +19,11 @@ def fail(message: str) -> None:
 
 
 def main() -> None:
+    validator = ROOT / "scripts" / "validate_postmerge.sh"
+    if not validator.is_file():
+        fail(f"executor de validação ausente: {validator}")
+    validator_text = validator.read_text(encoding="utf-8")
+
     for workflow in WORKFLOWS:
         if not workflow.is_file():
             fail(f"arquivo ausente: {workflow}")
@@ -37,12 +42,13 @@ def main() -> None:
                 fail(f"action {action} usa ref não versionada {ref} em {workflow.name}")
         if workflow.name == "fuzz.yml":
             continue
-        if "cargo check --workspace --locked" not in text:
-            fail(f"cargo check sem --locked em {workflow.name}")
-        if "cargo test --workspace --locked" not in text:
-            fail(f"cargo test sem --locked em {workflow.name}")
-        if "cargo clippy --workspace --all-targets --locked" not in text:
-            fail(f"cargo clippy sem --locked em {workflow.name}")
+        validation_text = text + "\n" + validator_text
+        if "cargo check --workspace --locked" not in validation_text:
+            fail(f"cargo check sem --locked em {workflow.name} ou no executor")
+        if "cargo test --workspace --locked" not in validation_text:
+            fail(f"cargo test sem --locked em {workflow.name} ou no executor")
+        if "cargo clippy --workspace --all-targets --locked" not in validation_text:
+            fail(f"cargo clippy sem --locked em {workflow.name} ou no executor")
         cargo_audit_pinned = (
             "cargo install cargo-audit --version 0.22.2 --locked" in text
             or (
