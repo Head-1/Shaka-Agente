@@ -244,7 +244,7 @@ A memória episódica deve seguir a política do tenant:
 ./shaka-linux-x86_64 memory purge --days 30
 ```
 
-Antes do expurgo, confirme backup, retenção e eventuais obrigações de preservação. O expurgo do MVP não substitui processo formal de privacidade ou restauração.
+Antes do expurgo, confirme backup, retenção e eventuais obrigações de preservação. O parâmetro `--days` deve ser zero ou positivo; valores negativos são rejeitados para impedir que a operação transforme o cutoff em uma data futura e apague memória recente. O expurgo do MVP não substitui processo formal de privacidade ou restauração.
 
 ## 10. Sandbox WASM
 
@@ -254,7 +254,7 @@ Execute o exemplo seguro:
 ./shaka-linux-x86_64 sandbox-demo
 ```
 
-O resultado esperado contém `exit_code: 42` e `fuel_consumed` positivo. O comportamento de segurança esperado é: módulo puro executa; módulo que importa função do host é rejeitado; rede, filesystem, WASI e imports do host permanecem negados por padrão.
+O resultado esperado contém `exit_code: 42` e `fuel_consumed` positivo. O comportamento de segurança esperado é: módulo puro executa; módulo que importa função do host é rejeitado; rede, filesystem, WASI e imports do host permanecem negados por padrão. A memória linear do guest é limitada a `16 MiB` por default e `64 MiB` no máximo da política; isso não limita o RSS total do processo e não substitui isolamento de processo ou cgroup.
 
 ## 11. Resposta a incidentes
 

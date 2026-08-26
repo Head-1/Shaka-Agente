@@ -163,6 +163,8 @@ cargo run -p shaka-cli -- --role administrator \
 
 O token bruto é exibido somente durante a emissão. O banco persiste apenas o hash SHA-256, o `token_id` e referências operacionais redacted.
 
+Skills WASM continuam sem WASI, imports de host, rede ou filesystem por padrão e são limitadas por fuel e tempo. A política também limita a memória linear do guest a `16 MiB` por default, com teto host-side de `64 MiB`; esse limite não representa RSS total do processo nem substitui isolamento de processo, cgroup ou uma sandbox de infraestrutura.
+
 Restaure sempre primeiro em um banco separado:
 
 ```bash

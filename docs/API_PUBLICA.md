@@ -34,6 +34,16 @@ Authorization: Bearer <token>
 
 O valor bearer nunca é devolvido em respostas. Tokens IAM são armazenados apenas por hash no banco; o valor bruto retornado por emissão deve ser exibido e armazenado pelo operador uma única vez. Em operação local sem `api_key`, o loopback pode resolver o principal local configurado, mas essa exceção não deve ser usada como justificativa para bind em `0.0.0.0`.
 
+### 2.1 Emissão de token IAM
+
+A emissão administrativa exige um prazo explícito. O CLI rejeita a ausência de `--expires-in-seconds` e aceita somente valores entre `1` e `7.776.000` segundos, equivalentes a no máximo 90 dias:
+
+```bash
+shaka iam token-issue operator --expires-in-seconds 3600
+```
+
+A mesma regra é aplicada novamente no queue, portanto nenhum consumidor Rust pode emitir um token novo sem expiração, com prazo passado ou acima do teto. O campo `expires_at` da resposta de emissão é efetivamente preenchido; o segredo bruto deve ser tratado como credencial de uso único e nunca deve ser copiado para logs, tickets ou evidências.
+
 O host deve rejeitar ou converter em erro qualquer principal inválido. O cliente não pode elevar seu próprio papel enviando `tenant_id`, `operator_id` ou `role` no corpo; esses campos são comparados com o principal autenticado ou ignorados quando não fazem parte do contrato do endpoint.
 
 ## 3. Health check
@@ -105,6 +115,23 @@ O corpo aceita `objective`, `priority`, `max_attempts`, `dry_run`, `budget` e, q
 A submissão exige `Idempotency-Key` não vazio. A chave é vinculada ao tenant e à impressão digital do payload. Repetir a mesma chave com o mesmo payload devolve a tarefa existente; reutilizar a chave com payload diferente produz conflito e não cria uma segunda execução.
 
 A validação do host rejeita objetivo vazio ou maior que 32.000 caracteres, prioridade fora do limite, sessão de outro tenant e `task_id` sem referência planejada. O valor omitido de `dry_run` é `true`. O limite de tentativas padrão é `3`.
+
+Quando `budget` é informado, o host aceita somente os seguintes intervalos: `max_steps` de `1` a `256`, `max_tool_calls` de `0` a `512`, `max_elapsed_ms` de `1` a `300000` e `max_cost_microunits` de `0` a `10000000`, sempre incluindo os limites superiores. Um campo fora desses intervalos é rejeitado com `400 Bad Request` antes da admissão na fila; os valores omitidos usam `ExecutionBudget::default()`.
+
+Exemplo explícito:
+
+```json
+{
+  "objective": "Executar uma leitura limitada",
+  "dry_run": true,
+  "budget": {
+    "max_steps": 32,
+    "max_tool_calls": 16,
+    "max_elapsed_ms": 30000,
+    "max_cost_microunits": 1000000
+  }
+}
+```
 
 Uma submissão nova retorna `202 Accepted`; uma submissão idempotente que encontra o registro existente retorna `200 OK`. O objeto de resposta contém o estado persistido da tarefa, incluindo `task_id`, `status`, tentativas, lease, resultado, erro e, quando aplicável, `plan_id`, `plan_revision`, `plan_digest` e `plan_step_id`.
 
