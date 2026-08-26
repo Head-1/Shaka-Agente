@@ -37,6 +37,25 @@ class ProcessCrashProbeWrapperTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("queue probe binary is missing", result.stderr)
 
+    @unittest.skipUnless(
+        (ROOT / "target" / "debug" / "audit-process-crash-probe").is_file(),
+        "probe binary is built by the full validation contract",
+    )
+    def test_audit_probe_real_multiprocess_recovery(self) -> None:
+        binary = ROOT / "target" / "debug" / "audit-process-crash-probe"
+        result = subprocess.run(
+            [str(binary)],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("one_process_crashed=true", result.stdout)
+        self.assertIn("audit_chain_valid=true", result.stdout)
+        self.assertIn("checked_events=8", result.stdout)
+
     def test_wrapper_contract_runs_binaries_directly(self) -> None:
         text = WRAPPER.read_text(encoding="utf-8")
         self.assertIn('"$ROOT/target/debug/queue-process-crash-probe"', text)

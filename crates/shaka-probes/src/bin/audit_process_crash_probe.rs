@@ -23,6 +23,23 @@ fn wait_for_marker(path: &Path) -> bool {
     })
 }
 
+fn open_with_retry(path: &Path) -> Result<MemoryStore, Box<dyn Error>> {
+    for attempt in 0..20 {
+        match MemoryStore::open(path) {
+            Ok(store) => return Ok(store),
+            Err(error)
+                if error.to_string().contains("database is locked")
+                    || error.to_string().contains("database is busy") =>
+            {
+                let backoff_ms = 25_u64 * u64::try_from(attempt + 1)?;
+                thread::sleep(Duration::from_millis(backoff_ms));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err("database remained locked after bounded retries".into())
+}
+
 fn cleanup(database: &Path, workspace: &Path) {
     for suffix in ["", "-wal", "-shm"] {
         let candidate = if suffix.is_empty() {
@@ -53,7 +70,7 @@ fn child_mode(args: &[String]) -> Result<(), Box<dyn Error>> {
     let index = args.get(6).ok_or("missing worker index")?;
     let crash = args.get(7).is_some_and(|value| value == "crash");
 
-    let store = MemoryStore::open(database)?;
+    let store = open_with_retry(Path::new(database))?;
     std::fs::write(ready, b"ready")?;
     if !wait_for_marker(Path::new(start)) {
         return Err("child did not observe start marker".into());
@@ -90,6 +107,9 @@ fn run_parent() -> Result<(), Box<dyn Error>> {
     let mut children = Vec::with_capacity(WORKERS);
 
     let result = (|| -> Result<(), Box<dyn Error>> {
+        let store = open_with_retry(&database)?;
+        drop(store);
+
         for index in 0..WORKERS {
             let ready = workspace.join(format!("ready-{index}"));
             let mut command = Command::new(&executable);
@@ -123,7 +143,7 @@ fn run_parent() -> Result<(), Box<dyn Error>> {
             return Err(format!("expected one crashed child, got {crashed}").into());
         }
 
-        let store = MemoryStore::open(&database)?;
+        let store = open_with_retry(&database)?;
         let tenant = TenantId::new(TENANT)?;
         let verification = store.verify_audit_chain(&tenant)?;
         if !verification.valid || verification.checked_events != WORKERS as u64 {
