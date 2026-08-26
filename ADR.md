@@ -142,3 +142,18 @@ A matriz é fornecida por `CapabilitySet::for_role`; não existe wildcard implí
 **Alternativas consideradas:** Confiar somente nas capabilities globais do worker, rejeitado por permitir herança entre requests; aceitar capabilities do payload, rejeitado por permitir forgery; criar um novo registro de autorização separado nesta etapa, reservado para quando houver decisão de incluir correlação, aprovação e política de orçamento no mesmo objeto.
 
 **Evidência:** Testes de núcleo, registry, fila e API cobrem derivação least-privilege, sobrescrita na admissão, filtragem de ferramentas e bloqueio na execução, além da suíte completa do workspace.
+
+
+## ADR-018 — Fronteira da submissão de tasks na fila
+
+**Status:** Aceita localmente para a opção B; publicação pendente de autenticação GitHub.
+
+**Contexto:** `QueueStore::submit_task` aceitava chamadas de qualquer crate porque era pública, mas não recebia `Principal` nem aplicava a admissão governada de sessão, contexto de execução, quota, rate limit e plano. A API HTTP já usava a família `submit_task_governed*`, porém a superfície pública permitia que um consumidor Rust externo bypassasse essa fronteira.
+
+**Decisão:** Reduzir `QueueStore::submit_task` para `pub(crate)` sob `cfg(test)`. A primitiva fica disponível exclusivamente aos testes internos do crate `shaka-queue`; consumidores externos e builds de produção não recebem esse método. Toda entrada externa deve usar `submit_task_governed` ou `submit_task_governed_with_plan`, que recebem o principal autenticado e aplicam a política transacional completa.
+
+**Consequências:** O probe externo que compilava e executava uma submissão direta antes do patch passa a falhar com `E0599` porque `QueueStore` não possui `submit_task` no build público. Não há alteração no schema, na máquina de estados, na API HTTP, nas quotas, nos rate limits ou na matriz de capabilities. O fechamento é de superfície de API, não uma substituição das verificações governadas.
+
+**Alternativas consideradas:** Remover ou reescrever a primitiva, rejeitado por ampliar o diff e o risco sobre persistência, retry e testes; manter `pub`, rejeitado porque deixa um caminho de bypass disponível; mover toda a fila para outro módulo, reservado para uma refatoração posterior com contrato de API separado.
+
+**Evidência pré/pós:** `/home/ubuntu/full-audit/option-b-before-run.log` mostra o probe externo executando na base anterior; `/home/ubuntu/full-audit/option-b-after-2.log` mostra a falha pós-patch `E0599`, validada em `/home/ubuntu/full-audit/option-b-after-result.txt`. A suíte interna do queue e a suíte completa do workspace permaneceram verdes nos gates da branch.

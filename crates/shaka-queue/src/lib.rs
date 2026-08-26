@@ -1039,8 +1039,10 @@ impl QueueStore {
         Ok(())
     }
 
+    /// Primitiva de teste não governada; entradas externas devem usar `submit_task_governed*`.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
-    pub fn submit_task(
+    pub(crate) fn submit_task(
         &self,
         session_id: Uuid,
         tenant_id: &TenantId,
