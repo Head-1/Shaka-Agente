@@ -89,7 +89,7 @@ A execução padrão usa o provedor local e não solicita efeitos externos:
 ./shaka-linux-x86_64 run "Descreva em uma frase a política deny-by-default do Shaka"
 ```
 
-Uma execução bem-sucedida retorna JSON com `task_id`, `answer`, `tool_results` e `success: true`. O episódio é persistido no SQLite do tenant atual.
+Uma execução bem-sucedida retorna JSON com `task_id`, `answer`, `tool_results` e `success: true`. O episódio é persistido no SQLite do tenant atual, com `content` limitado a 65.536 bytes. Payloads acima desse limite são rejeitados antes da escrita para evitar uma única gravação patológica; reduza o resumo ou o escopo da operação, sem repetir cegamente.
 
 O operador não deve usar `--live`. O teste de segurança da release confirmou que uma tentativa de `run --live` por um operador comum é bloqueada por autorização. Qualquer proposta futura de execução real exige mudança de governança, aprovação explícita, revisão de permissões e novo ciclo de release.
 
@@ -182,7 +182,8 @@ Classifique a falha antes de repetir uma tarefa:
 | `capability denied` | Manter o bloqueio até demonstrar necessidade e autorização. |
 | `unknown` | Exigir resolução humana; não presumir sucesso nem repetir cegamente. |
 | `HostImportsDenied` | Preservar o artefato e revisar sandbox, threat model e imports. |
-| erro HTTP do modelo | Verificar endpoint, credencial, limite e contrato sem registrar segredo. |
+| `erro HTTP do modelo` | Verificar endpoint, credencial, limite e contrato sem registrar segredo. |
+| `payload too large` | Reduzir o resumo/escopo para até 65.536 bytes; não contornar o limite escrevendo diretamente no SQLite. |
 | inconsistência de reducer | Parar novas transições, preservar evidências e abrir incidente. |
 
 ## 7. Backup, restauração e integridade
@@ -251,7 +252,7 @@ export SHAKA_MODEL_API_KEY="nova-chave"
 ./shaka-linux-x86_64 run "teste de conectividade controlado"
 ```
 
-A memória episódica deve seguir a política do tenant:
+A memória episódica deve seguir a política do tenant. Cada episódio aceita no máximo 65.536 bytes em `content`; esse limite por registro não substitui retenção nem estabelece um limite total de crescimento do banco:
 
 ```bash
 ./shaka-linux-x86_64 memory purge --days 30

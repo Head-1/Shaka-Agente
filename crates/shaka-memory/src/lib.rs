@@ -32,6 +32,14 @@ pub enum MemoryError {
     /// Registro persistido que não pôde ser interpretado com segurança.
     #[error("registro episódico inválido: {0}")]
     InvalidRecord(String),
+    /// Campo textual excedeu o limite operacional de payload.
+    #[error("campo {field} excede o limite de {max_bytes} bytes")]
+    PayloadTooLarge {
+        /// Nome estável do campo rejeitado.
+        field: &'static str,
+        /// Tamanho máximo permitido em bytes.
+        max_bytes: usize,
+    },
 }
 
 /// Registro episódico associado a uma execução observada pelo tenant.
@@ -103,6 +111,9 @@ pub struct WorkingMemoryItem {
 pub struct MemoryStore {
     connection: parking_lot::Mutex<Connection>,
 }
+
+/// Limite de conteúdo por episódio para impedir uma única escrita patológica.
+pub const MAX_EPISODE_CONTENT_BYTES: usize = 64 * 1024;
 
 const REQUIRED_SCHEMA_TABLES: [&str; 4] = [
     "episodic_memory",
@@ -198,6 +209,12 @@ impl MemoryStore {
 
     /// Persiste um episódio pertencente ao tenant do próprio registro.
     pub fn append_episode(&self, record: &EpisodicRecord) -> Result<(), MemoryError> {
+        if record.content.len() > MAX_EPISODE_CONTENT_BYTES {
+            return Err(MemoryError::PayloadTooLarge {
+                field: "episodic_memory.content",
+                max_bytes: MAX_EPISODE_CONTENT_BYTES,
+            });
+        }
         self.connection.lock().execute(
             "INSERT INTO episodic_memory
              (id, tenant_id, task_id, kind, content, outcome, cost_microunits, elapsed_ms, created_at)
@@ -528,6 +545,56 @@ mod tests {
     };
 
     #[test]
+    fn oversized_episode_payload_is_rejected_before_sqlite_write() {
+        let store = MemoryStore::in_memory().unwrap();
+        let tenant = TenantId::new("tenant-memory-payload-limit").unwrap();
+        let record = EpisodicRecord {
+            id: Uuid::new_v4(),
+            tenant_id: tenant.clone(),
+            task_id: None,
+            kind: "stress".to_owned(),
+            content: "x".repeat(64 * 1024 + 1),
+            outcome: "success".to_owned(),
+            cost_microunits: 0,
+            elapsed_ms: 0,
+            created_at: Utc::now(),
+        };
+
+        let error = store.append_episode(&record).unwrap_err();
+        assert!(matches!(
+            error,
+            MemoryError::PayloadTooLarge {
+                field: "episodic_memory.content",
+                max_bytes: MAX_EPISODE_CONTENT_BYTES,
+            }
+        ));
+        assert!(store.recent_episodes(&tenant, 1).unwrap().is_empty());
+    }
+
+    #[test]
+    fn episode_content_limit_accepts_exact_boundary() {
+        let store = MemoryStore::in_memory().unwrap();
+        let tenant = TenantId::new("tenant-memory-payload-boundary").unwrap();
+        let record = EpisodicRecord {
+            id: Uuid::new_v4(),
+            tenant_id: tenant.clone(),
+            task_id: None,
+            kind: "boundary".to_owned(),
+            content: "x".repeat(MAX_EPISODE_CONTENT_BYTES),
+            outcome: "success".to_owned(),
+            cost_microunits: 0,
+            elapsed_ms: 0,
+            created_at: Utc::now(),
+        };
+
+        store.append_episode(&record).unwrap();
+        assert_eq!(
+            store.recent_episodes(&tenant, 1).unwrap()[0].content.len(),
+            MAX_EPISODE_CONTENT_BYTES
+        );
+    }
+
+    #[test]
     fn episode_can_be_recorded_and_read() {
         let store = MemoryStore::in_memory().unwrap();
         let tenant = TenantId::new("tenant-a").unwrap();
@@ -630,6 +697,61 @@ mod tests {
         blocker.execute_batch("COMMIT").unwrap();
         assert!(worker.join().unwrap().is_ok());
         drop(blocker);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn concurrent_bounded_episode_writes_preserve_all_records() {
+        let path = std::env::temp_dir().join(format!(
+            "shaka-memory-concurrent-bounded-{}.sqlite",
+            Uuid::new_v4()
+        ));
+        let tenant = TenantId::new("tenant-memory-stress").unwrap();
+        let workers = 8_usize;
+        let records_per_worker = 32_usize;
+        let total_records = workers * records_per_worker;
+        let barrier = Arc::new(Barrier::new(workers));
+        let handles = (0..workers)
+            .map(|worker_id| {
+                let store = Arc::new(MemoryStore::open(&path).unwrap());
+                let barrier = Arc::clone(&barrier);
+                let tenant = tenant.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    for record_id in 0..records_per_worker {
+                        store.append_episode(&EpisodicRecord {
+                            id: Uuid::new_v4(),
+                            tenant_id: tenant.clone(),
+                            task_id: None,
+                            kind: "stress".to_owned(),
+                            content: format!(
+                                "worker-{worker_id}-record-{record_id}-{}",
+                                "x".repeat(1024)
+                            ),
+                            outcome: "success".to_owned(),
+                            cost_microunits: 0,
+                            elapsed_ms: 0,
+                            created_at: Utc::now(),
+                        })?;
+                    }
+                    Ok::<(), MemoryError>(())
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for handle in handles {
+            assert!(handle.join().unwrap().is_ok());
+        }
+        let verifier = MemoryStore::open(&path).unwrap();
+        assert_eq!(
+            verifier
+                .recent_episodes(&tenant, u32::try_from(total_records).unwrap())
+                .unwrap()
+                .len(),
+            total_records
+        );
+        assert!(verifier.verify_integrity().unwrap());
+        drop(verifier);
         std::fs::remove_file(path).unwrap();
     }
 
