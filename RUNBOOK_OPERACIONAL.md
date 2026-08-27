@@ -132,7 +132,7 @@ curl --fail --silent -X POST "http://127.0.0.1:8080/v1/sessions/$SESSION/tasks" 
   -d '{"objective":"Descreva a política de execução segura","priority":5}'
 ```
 
-O mesmo `Idempotency-Key` e o mesmo payload devem retornar a tarefa já existente, sem criar uma segunda execução. Não faça bind em `0.0.0.0` em ambiente real sem autenticação, HTTPS na borda e revisão de exposição.
+O mesmo `Idempotency-Key` e o mesmo payload devem retornar a tarefa já existente, sem criar uma segunda execução ou checkpoint de admissão adicional. Não faça bind em `0.0.0.0` em ambiente real sem autenticação, HTTPS na borda e revisão de exposição.
 
 A imagem GHCR usa `shaka serve` como comando padrão, expõe a porta 8080 e possui `doctor` como healthcheck. Um host com Docker pode executar a imagem privada depois de autenticar no GHCR:
 
@@ -230,6 +230,8 @@ Não edite manualmente o catálogo para contornar uma transição. Registre hor�
 
 ## 9. Rotação de credenciais e retenção
 
+Novos tokens IAM exigem expiração futura e finita, limitada a 90 dias. Registros legados com `expires_at = NULL` são rejeitados na autenticação e não contam como tokens ativos. O sistema não executa migração ou revogação em massa automaticamente; substitua essas credenciais por tokens novos em uma operação controlada.
+
 Para rotacionar uma credencial, remova o valor antigo do ambiente, injete o novo por mecanismo seguro e execute um teste sem registrar a chave:
 
 ```bash
@@ -266,11 +268,11 @@ O MVP não fornece contenção remota automática. O responsável técnico deve 
 
 A validação da release v0.8.2 em 22 de agosto de 2026 confirmou versão, configuração, `doctor`, execução local em dry-run, sandbox, backup, restauração, auditoria, health check HTTP, criação de sessão, execução de tarefa e replay idempotente. O workflow também executou preflight de versão, auditoria de dependências, smoke test de produção, geração de SBOM, checksums e publicação no GHCR. A tentativa de `live` por operador comum foi bloqueada conforme esperado.
 
-O relatório operacional detalhado está em `ETAPA9_VALIDACAO_POS_RELEASE.md`; as evidências da publicação e dos hashes estão registradas no relatório local `V0.8.2_RELEASE_RESULT.md`. As evidências não alteram a tag `v0.8.2`. Para a referência normativa da API, consulte [`docs/API_PUBLICA.md`](docs/API_PUBLICA.md).
+O relatório operacional detalhado está em `ETAPA9_VALIDACAO_POS_RELEASE.md`; as evidências da publicação e dos hashes estão registradas no relatório local `V0.8.2_RELEASE_RESULT.md`. As evidências não alteram a tag `v0.8.2`. Para a referência normativa da API, consulte [`docs/API_PUBLICA.md`](docs/API_PUBLICA.md). O status de confiabilidade dos BR-01 a BR-06 está em [`docs/BACKLOG_STATUS.md`](docs/BACKLOG_STATUS.md).
 
 ## 13. Validação repository-first
 
-Para validar um checkout limpo diretamente do GitHub, incluindo testes, auditoria, smoke, ciclo de vida do processo e probes multiprocesso de QueueStore/auditoria, consulte [`docs/VALIDACAO_REPOSITORY_FIRST.md`](docs/VALIDACAO_REPOSITORY_FIRST.md) e execute:
+Para validar um checkout limpo diretamente do GitHub, incluindo testes, auditoria, smoke, ciclo de vida do processo e probes multiprocesso de QueueStore/auditoria, consulte [`docs/VALIDACAO_REPOSITORY_FIRST.md`](docs/VALIDACAO_REPOSITORY_FIRST.md) e o status consolidado em [`docs/BACKLOG_STATUS.md`](docs/BACKLOG_STATUS.md), e execute:
 
 ```bash
 SHAKA_EXPECTED_HEAD="$(git rev-parse HEAD)" \
@@ -278,4 +280,4 @@ SHAKA_EXPECTED_HEAD="$(git rev-parse HEAD)" \
   bash scripts/validate_postmerge.sh
 ```
 
-O executor falha fechado diante de SHA divergente, working tree sujo, dependência obrigatória ausente, falha de teste, erro de smoke, falha de crash/recovery ou listener residual. Ele não instala dependências, não altera branches e não publica alterações.
+O executor falha fechado diante de SHA divergente, working tree sujo, dependência obrigatória ausente, falha de teste, erro de smoke, falha de crash/recovery ou listener residual. Ele não instala dependências, não altera branches e não publica alterações. A cadeia de auditoria usa ordem estrutural de commit, não `occurred_at`; esse campo é metadado temporal e pode sofrer ajuste de relógio sem reordenar os eventos.

@@ -146,7 +146,7 @@ A matriz é fornecida por `CapabilitySet::for_role`; não existe wildcard implí
 
 ## ADR-018 — Fronteira da submissão de tasks na fila
 
-**Status:** Aceita localmente para a opção B; publicação pendente de autenticação GitHub.
+**Status:** Integrada em `main` e validada no CI, sandbox e VM.
 
 **Contexto:** `QueueStore::submit_task` aceitava chamadas de qualquer crate porque era pública, mas não recebia `Principal` nem aplicava a admissão governada de sessão, contexto de execução, quota, rate limit e plano. A API HTTP já usava a família `submit_task_governed*`, porém a superfície pública permitia que um consumidor Rust externo bypassasse essa fronteira.
 
@@ -161,7 +161,7 @@ A matriz é fornecida por `CapabilitySet::for_role`; não existe wildcard implí
 
 ## ADR-019 — Proveniência de request e aprovação na task
 
-**Status:** Implementada localmente; commit e publicação pendentes por decisão operacional.
+**Status:** Integrada em `main` e validada no CI, sandbox e VM.
 
 **Contexto:** A API já validava ou gerava `x-request-id` e o incluía nos eventos de auditoria do handler, mas o identificador não era persistido no `TaskEnvelope`. Ao processar a task em background, o worker não conseguia reconstruir de forma determinística a requisição que originou o trabalho. Além disso, o Plan Engine validava aprovações persistidas, mas a task não registrava qual aprovação global sustentou sua admissão.
 
@@ -178,7 +178,7 @@ O worker reconstrói o `CorrelationContext` a partir do request ID persistido an
 
 ## ADR-020 — Autoridade request-scoped na pós-etapa planejada
 
-**Status:** Implementada localmente; commit e publicação pendentes por decisão operacional.
+**Status:** Integrada em `main` e validada no CI, sandbox e VM.
 
 **Contexto:** O claim de uma etapa planejada já substituía as capabilities globais do worker pelas capabilities persistidas em `TaskEnvelope.execution_context`. Entretanto, a finalização da etapa reutilizava `PlanClaimContext.granted_capabilities`, que na API era montado a partir do runtime global. O `PlanVerifier` avalia pós-condições nessa fronteira, incluindo `PlanCondition::CapabilityGranted`; portanto, uma task de operador poderia ter uma pós-condição satisfeita pela capacidade administrativa do processo, apesar de o envelope não concedê-la.
 
@@ -193,7 +193,7 @@ O worker reconstrói o `CorrelationContext` a partir do request ID persistido an
 
 ## ADR-021 — Atestação da autoridade declarativa de skills
 
-**Status:** Implementada localmente; commit e publicação pendentes por decisão operacional.
+**Status:** Integrada em `main` e validada no CI, sandbox e VM.
 
 **Contexto:** A atestação Ed25519 anterior protegia nome, versão, operador, hash do artefato e justificativa, mas não protegia `permissions`, `input_schema` nem `output_schema` do `SkillManifest`. O registry materializa esses campos no artefato executável; portanto, uma mutação posterior do manifesto podia alterar a autoridade da ferramenta sem invalidar a assinatura do Wasm.
 
@@ -207,20 +207,20 @@ Atestações V1, mesmo assinadas por chave confiável, não são executáveis. R
 
 **Evidência pré/pós:** `/home/ubuntu/full-audit/skill-authority-before.log` mostra o teste falhando antes do patch porque a permissão adulterada ainda era aceita. `/home/ubuntu/full-audit/skill-attestation-regression.log` mostra as regressões de permissões, schema e V1 rejeitada passando depois. `/home/ubuntu/full-audit/skill-attestation-gates-final3/summary.log` registra todos os gates oficiais com código 0, incluindo smoke em porta 29126.
 
-**Limites:** A validação do alvo de fuzzing foi impedida por um `Cargo.lock` próprio já defasado e dependências não disponíveis offline; o lock foi restaurado sem alteração. A portabilidade no segundo ambiente, commit assinado, publicação GitHub e revisão/merge continuam pendentes.
+**Limites:** A validação do alvo de fuzzing continua condicionada ao `Cargo.lock` próprio e às dependências disponíveis. A portabilidade no segundo ambiente, commits assinados, publicação GitHub e revisão/merge desta decisão já foram concluídas; o fuzzing permanece uma frente separada.
 
 ## ADR-022 — Revogação efetiva de skills residentes
-**Status:** Implementada localmente; commit e publicação pendentes por decisão operacional.
+**Status:** Integrada em `main` e validada no CI, sandbox e VM.
 **Contexto:** O processo carregava uma `WasmSkillTool` validada no startup. A revogação posterior da skill ou da chave no registry/trust store persistido não era consultada pelo executor residente, portanto uma chamada nova continuava executando após a revogação.
 **Decisão:** A CLI passa a construir skills com uma fonte de revalidação persistida. Antes de cada nova execução, o `WasmSkillTool` recarrega o `SkillRegistry` e o `TrustStore`, exige que a skill permaneça ativa, compara o artefato aprovado com o objeto residente e repete as verificações de hash, autoridade e assinatura V2. Qualquer falha de leitura, revogação, mudança ou ausência de registro falha fechado.
 **Semântica operacional:** A revogação impede novas execuções depois do gate de autorização. Uma chamada que já passou pelo gate não é interrompida por esta fatia, evitando uma operação parcialmente executada e mantendo a decisão de execução determinística.
 **Consequências:** Revogar uma skill ou chave passa a ter efeito dentro de um processo já iniciado. Há custo de I/O e desserialização antes de cada chamada de skill; esse custo foi escolhido em favor da segurança e pode ser otimizado futuramente apenas com uma prova equivalente de invalidação. A definição da ferramenta pode continuar aparecendo até uma nova chamada, mas a execução não atravessa o gate revogado.
 **Alternativas consideradas:** Confiar em restart operacional, rejeitado porque deixa uma janela dependente de disciplina externa; interromper chamadas em andamento, rejeitado por risco de estado parcial; manter somente a validação de startup, rejeitado pela prova pré-patch; usar cache de epoch sem fonte transacional equivalente, adiado até haver necessidade de otimização mensurada.
 **Evidência pré/pós:** `/home/ubuntu/full-audit/skill-revocation-before-rerun.log` mostra a segunda execução aceitando a revogação no código anterior, com `assertion failed: result.is_err()`. As regressões `revoked_skill_blocks_future_execution_of_resident_tool` e `revoked_key_blocks_future_execution_of_resident_tool` passam após o patch. Os gates completos estão em `/home/ubuntu/full-audit/skill-revocation-gates-final/summary.log`, com código 0.
-**Limites:** O patch não adiciona endpoint administrativo, não interrompe chamadas em andamento, não conecta efeitos externos reais, não altera a matriz de capabilities e não resolve a inconsistência preexistente do lockfile do fuzz. A portabilidade no segundo ambiente e a publicação continuam pendentes.
+**Limites:** O patch não adiciona endpoint administrativo, não interrompe chamadas em andamento, não conecta efeitos externos reais, não altera a matriz de capabilities e não resolve a inconsistência preexistente do lockfile do fuzz. A portabilidade e a publicação desta decisão já foram concluídas; os limites técnicos permanecem.
 
 ## ADR-023 — Bind não local sem efeitos persistentes em falha de inicialização
-**Status:** Implementada localmente; commit e publicação pendentes por decisão operacional.
+**Status:** Integrada em `main` e validada no CI, sandbox e VM.
 **Contexto:** `ApiState::new` verificava a exigência de autenticação para bind não local somente depois de `QueueStore::bootstrap_principal`. Assim, uma inicialização sem `api_key` e sem token IAM ativo era rejeitada, mas podia deixar tenant, usuário e limites persistidos no SQLite.
 **Decisão:** Validar a exigência de autenticação do bind não local imediatamente após `ApiConfig::validate` e antes de qualquer chamada que altere o `QueueStore`. Somente depois dessa validação o bootstrap do principal e a criação do circuit breaker podem ocorrer.
 **Consequências:** Uma configuração de rede inválida falha sem efeitos persistentes. Bind loopback sem API key, bind não local com API key não vazia e bind não local com token IAM ativo preservam o comportamento permitido. Não há rollback compensatório nem limpeza posterior: a operação inválida deixa de iniciar qualquer mutação.
@@ -228,7 +228,7 @@ Atestações V1, mesmo assinadas por chave confiável, não são executáveis. R
 **Fora do escopo:** Não foram alterados autenticação por request, fallback loopback, tokens, schema SQLite, listener, capabilities, commits, publicação, portabilidade ou fuzzing.
 
 ## ADR-024 — Fencing transacional de leases de worker
-**Status:** Implementada localmente; commit e publicação pendentes por decisão operacional.
+**Status:** Integrada em `main` e validada no CI, sandbox e VM.
 **Contexto:** A fila permitia que um worker atrasado finalizasse uma tarefa depois de a lease expirar, inclusive após recovery e novo claim por outro worker. O schema não persistia identidade de lease, e a finalização consultava apenas `task_id`, tenant e estado.
 **Decisão:** Cada claim emite um `LeaseToken` opaco, persistido somente durante a lease ativa. As APIs de produção de finalização exigem esse token; antes de qualquer escrita, a transação confirma token correspondente e `lease_until` ainda futuro. Recovery no instante de expiração limpa o token, e toda transição que libera ou reencaminha a tarefa também o limpa. Registros legados recebem a coluna via migração automática, mas não recebem token até novo claim.
 **Semântica operacional:** Uma chamada que já começou não é cancelada por esta fatia. Se ela terminar depois da expiração, sua escrita de sucesso, falha, cancelamento ou retry é rejeitada com `LeaseLost`; o worker seguinte permanece dono do estado. Replay de tarefa já terminal continua idempotente e não reabre nem sobrescreve o resultado.
@@ -239,7 +239,7 @@ Atestações V1, mesmo assinadas por chave confiável, não são executáveis. R
 
 
 ## ADR-025 — Shutdown graceful com cancelamento cooperativo de tasks
-**Status:** Implementada localmente; commit e publicação pendentes por decisão operacional.
+**Status:** Integrada em `main` e validada no CI, sandbox e VM.
 
 **Contexto:** O container declara `SIGTERM` como sinal de parada, mas o servidor aguardava somente `Ctrl-C` e não coordenava workers em voo. A prova pré-patch mostrou que o processo terminava com `SIGTERM`, enquanto uma task em execução permanecia `running` após restart no mesmo SQLite.
 
@@ -250,7 +250,7 @@ Atestações V1, mesmo assinadas por chave confiável, não são executáveis. R
 **Evidência pré/pós:** `/home/ubuntu/full-audit/shutdown-prepatch-run-final.log` registra `persisted_status_after_restart=running`. `/home/ubuntu/full-audit/shutdown-postpatch-worker-blocking.log` registra `persisted_status_after_restart=cancelled` com o mesmo cenário controlado.
 
 ## ADR-026 — Operações bloqueantes fora das futures Tokio
-**Status:** Implementada localmente para o caminho do worker; commit e publicação pendentes por decisão operacional.
+**Status:** Integrada em `main` e validada no CI, sandbox e VM; o escopo continua limitado ao caminho do worker.
 
 **Contexto:** `WasmExecutor::execute` é síncrono por natureza e a fila usa `rusqlite` síncrono. Chamá-los diretamente dentro de uma future do worker pode bloquear uma thread Tokio e atrasar outras tasks, sinais de cancelamento e health checks.
 
@@ -262,7 +262,7 @@ Atestações V1, mesmo assinadas por chave confiável, não são executáveis. R
 
 
 ## ADR-027 — Budgets bounded em todas as fronteiras de execução
-**Status:** Implementada localmente; commit e publicação pendentes por decisão operacional.
+**Status:** Integrada em `main` e validada no CI, sandbox e VM.
 
 **Contexto:** A representação anterior aceitava valores máximos do tipo (`u32::MAX`/`u64::MAX`) quando a quota do tenant permitia, permitindo que uma tarefa chegasse à fila com passos, chamadas de ferramenta, duração ou custo patológicos. Uma suíte verde não cobria esse caminho de admissão.
 
@@ -275,13 +275,13 @@ Atestações V1, mesmo assinadas por chave confiável, não são executáveis. R
 **Fora do escopo:** Não foi criado um sistema de preços, cobrança ou quota distribuída; não há alteração de política para `0` além da semântica já implementada; limites adaptativos por modelo e orçamento de rede permanecem decisões futuras.
 
 ## ADR-028 — Emissão IAM com expiração finita obrigatória
-**Status:** Implementada localmente; commit e publicação pendentes por decisão operacional.
+**Status:** Integrada em `main` e validada no CI, sandbox e VM.
 
 **Contexto:** A API de emissão de token aceitava `expires_at=None` e persistia um bearer sem expiração, criando credencial potencialmente eterna. O fato de a autenticação funcionar não era evidência suficiente de uma política segura; a falha foi reproduzida diretamente contra a base anterior.
 
 **Decisão:** `QueueStore::issue_token` exige expiração explícita, futura e não superior a `7776000` segundos (90 dias). A emissão retorna `TokenIssue.expires_at` preenchido, embora o tipo `Option<DateTime<Utc>>` seja preservado nesta versão para compatibilidade de serialização; nenhum novo token pode ser emitido com `None`. O CLI torna `--expires-in-seconds` obrigatório e valida `1..=7776000` antes da emissão. O segredo bruto continua sendo devolvido somente no comando de emissão e não é retido nos logs de prova.
 
-**Consequências:** Tokens existentes sem expiração, se houverem em um banco legado, não são migrados nem revogados automaticamente por esta fatia; a autenticação de registros legados mantém a semântica de schema existente. Toda nova emissão é finita. A mudança de `Option` para tipo não opcional foi deliberadamente adiada para evitar quebra pública e deverá ser uma decisão separada se a compatibilidade puder ser removida.
+**Consequências:** Tokens existentes sem expiração, se houverem em um banco legado, não são migrados nem revogados automaticamente; a autenticação rejeita registros com `expires_at = NULL` e eles não contam como tokens ativos. Toda nova emissão é finita. A mudança de `Option` para tipo não opcional foi deliberadamente adiada para evitar quebra pública e deverá ser uma decisão separada se a compatibilidade puder ser removida.
 
 **Evidência pré/pós:** `/home/ubuntu/full-audit/iam-token-prepatch.log` registra a base anterior emitindo `TokenIssue` com `expires_at: None` e `regression_status=FAIL_EXPECTED_ETERNAL_TOKEN_ACCEPTED`. `/home/ubuntu/full-audit/iam-token-postpatch.log` registra `none_status=REJECTED_EXPLICIT_EXPIRY_REQUIRED` e emissão válida autenticada com `expires_present=true`, omitindo o segredo bruto. `/home/ubuntu/full-audit/iam-cli-postpatch.log` registra ausência do argumento rejeitada e emissão com `3600` segundos aceita. O teste permanente `iam_token_issue_requires_finite_future_expiry` passou no gate `/home/ubuntu/full-audit/phase6-targeted3.log`.
 
@@ -289,7 +289,7 @@ Atestações V1, mesmo assinadas por chave confiável, não são executáveis. R
 
 
 ## ADR-029 — Retenção não-negativa e verificação íntegra da auditoria persistida
-**Status:** Implementada localmente; commit e publicação pendentes por decisão operacional.
+**Status:** Integrada em `main` e validada no CI, sandbox e VM.
 
 **Contexto:** `purge_older_than` aceitava duração negativa. Como o cutoff era calculado por subtração, `--days=-1` apontava para o futuro e apagava um episódio recém-criado. Em auditoria, a verificação comparava o `event_hash` recalculado com o hash dentro do JSON, mas não comparava a coluna `event_hash` redundante persistida no SQLite; uma adulteração isolada dessa coluna era reportada como cadeia válida.
 
@@ -302,7 +302,7 @@ Atestações V1, mesmo assinadas por chave confiável, não são executáveis. R
 **Fora do escopo:** A cadeia continua local ao SQLite. Ancoragem WORM, assinatura externa, exportação remota e retenção regulatória precisam de decisão de infraestrutura, política de dados e operação de chaves; não foram inventadas nesta fase.
 
 ## ADR-030 — Limite de memória linear por execução WASM
-**Status:** Implementada localmente; commit e publicação pendentes por decisão operacional.
+**Status:** Integrada em `main` e validada no CI, sandbox e VM.
 
 **Contexto:** Fuel e interrupção por época limitavam CPU/tempo, mas `Store::new` não impunha limite explícito à memória linear do guest. Um módulo mínimo com uma página conseguia executar `memory.grow` para uma segunda página sob a política default.
 
@@ -316,7 +316,7 @@ Atestações V1, mesmo assinadas por chave confiável, não são executáveis. R
 
 
 ## ADR-031 — Smoke determinístico, gates alinhados e remoção de artefatos legados
-**Status:** Implementada localmente; commit e publicação pendentes por decisão operacional.
+**Status:** Integrada em `main` e validada no CI, sandbox e VM.
 
 **Contexto:** O smoke lançava `serve` através da função shell `run` em background. Nesse formato, `$!` identificava um subshell wrapper, não o binário Shaka que possuía o listener. A prova mínima mostrou que matar somente o PID capturado deixava o binário filho e a porta ativos. O workspace atual também continha quatro artefatos históricos rastreados, mas fora do caminho ativo: `main.rs` e `lib.rs` na raiz, `ci.yml` na raiz e `.github/release.yml` fora de `.github/workflows/`. O metadata do Cargo listava dez pacotes `crates/*` e nenhum pacote raiz.
 
@@ -326,10 +326,10 @@ Atestações V1, mesmo assinadas por chave confiável, não são executáveis. R
 
 **Evidência pré/pós:** `/home/ubuntu/full-audit/smoke-pid-harness-prepatch.log` registra `captured_parent_pid=333404`, filho Shaka distinto e `after_parent_kill parent_alive=false child_alive=true listener_alive=true`. `/home/ubuntu/full-audit/smoke-cleanup-postpatch.log` registra `smoke_exit=0`, execução funcional completa; `/home/ubuntu/full-audit/smoke-cleanup-postpatch-listener.log` registra `listener_after_cleanup=false`. `/home/ubuntu/full-audit/phase8-preproof-inventory.log` registra os dez pacotes do workspace e nenhuma referência operacional aos arquivos legados. `/home/ubuntu/full-audit/phase8-ci-final-validation.log` registra policy, preflight, secret scan, fmt, metadata e diff check aprovados.
 
-**Fora do escopo:** Não foram alterados gatilhos, permissões de release, publicação, branch remota ou mecanismo de daemonização do servidor. A eliminação dos artefatos é local e permanece sem commit até autorização explícita.
+**Fora do escopo:** Não foram alterados gatilhos, permissões de release ou mecanismo de daemonização do servidor. A eliminação dos artefatos legados foi integrada à `main` e validada no ciclo de hardening; branch remota e política de publicação seguem governadas pelo fluxo repository-first.
 
 ## ADR-032 — Transações SQLite de escrita iniciam imediatamente sob concorrência
-**Status:** Implementada localmente; commit e publicação pendentes por decisão operacional.
+**Status:** Integrada em `main` e validada no CI, sandbox e VM.
 **Contexto:** A validação integrada reproduziu erro intermitente `SQLITE_BUSY`/`database is locked` em 5 de 10 E2E, alternando entre criação e aprovação de plano. O worker escrevia memória/auditoria enquanto a fila iniciava uma transação `DEFERRED`, lia o snapshot e depois tentava promovê-lo a escritor. O comportamento era particularmente perigoso porque a API convertia a falha persistente em erro HTTP 500.
 **Decisão:** Conexões de `QueueStore` e `MemoryStore` recebem `busy_timeout` de 5 segundos explicitamente. As transações de escrita da fila e do Plan Store usam `TransactionBehavior::Immediate`, reservando a escrita antes da leitura que faz parte da mesma operação. A transação puramente de leitura de `validate_plan` permanece deferred.
 **Consequências:** A disputa normal por writer aguarda dentro de uma janela bounded; uma promoção de snapshot que poderia falhar no meio da transação é evitada. O timeout não transforma lock persistente em sucesso: após a janela, SQLite continua retornando erro e o host permanece fail-closed. O padrão deve ser reavaliado se a aplicação migrar para múltiplos processos ou um backend transacional diferente.

@@ -24,14 +24,19 @@ const fn default_max_memory_bytes() -> u64 {
     16 * 1024 * 1024
 }
 
+/// Política host-side que limita uma execução WASM e suas capacidades.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SandboxPolicy {
+    /// Quantidade máxima de fuel que o guest pode consumir.
     pub max_fuel: u64,
+    /// Tempo máximo de execução síncrona, em milissegundos.
     pub max_elapsed_ms: u64,
     /// Limite de memória linear do guest em bytes.
     #[serde(default = "default_max_memory_bytes")]
     pub max_memory_bytes: u64,
+    /// Indica se o sandbox pode aceitar a capacidade de rede solicitada.
     pub allow_network: bool,
+    /// Indica se o sandbox pode aceitar capacidades de leitura ou escrita de filesystem.
     pub allow_filesystem: bool,
 }
 
@@ -48,6 +53,7 @@ impl Default for SandboxPolicy {
 }
 
 impl SandboxPolicy {
+    /// Valida capacidades solicitadas e o limite de memória contra a política host-side.
     pub fn validate(&self, required: &[Capability]) -> Result<(), SandboxError> {
         if required.contains(&Capability::Network) && !self.allow_network {
             return Err(SandboxError::CapabilityDenied(Capability::Network));
@@ -67,24 +73,34 @@ impl SandboxPolicy {
     }
 }
 
+/// Resultado observável de uma execução WASM concluída.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SandboxResult {
+    /// Código inteiro retornado pela função guest `run`.
     pub exit_code: i32,
+    /// Fuel efetivamente consumido durante a execução.
     pub fuel_consumed: u64,
 }
 
+/// Falhas possíveis ao validar, instanciar ou executar um módulo WASM.
 #[derive(Debug, Error)]
 pub enum SandboxError {
+    /// A política fornecida não respeita os limites host-side.
     #[error("configuração inválida do sandbox: {0}")]
     InvalidPolicy(String),
+    /// O módulo solicitou uma capacidade não permitida pela política.
     #[error("capacidade negada pelo sandbox: {0:?}")]
     CapabilityDenied(Capability),
+    /// O bytecode WASM não pôde ser compilado ou carregado.
     #[error("módulo WASM inválido: {0}")]
     InvalidModule(String),
+    /// O módulo solicitou imports do host, proibidos pelo contrato atual.
     #[error("o módulo solicita imports do host, proibidos no MVP")]
     HostImportsDenied,
+    /// A exportação obrigatória `run() -> i32` não foi encontrada.
     #[error("o módulo não exporta run() -> i32: {0}")]
     MissingEntryPoint(String),
+    /// A execução terminou com trap, timeout ou outra falha do runtime WASM.
     #[error("execução WASM falhou: {0}")]
     Execution(String),
 }
@@ -93,6 +109,7 @@ struct SandboxStoreState {
     limits: StoreLimits,
 }
 
+/// Executor WASM configurado com fuel e interrupção por epoch.
 #[derive(Clone)]
 pub struct WasmExecutor {
     engine: Engine,
@@ -107,6 +124,7 @@ impl std::fmt::Debug for WasmExecutor {
 }
 
 impl WasmExecutor {
+    /// Cria um executor com a configuração de isolamento padrão do sandbox.
     pub fn new() -> Result<Self, SandboxError> {
         let mut config = Config::new();
         config.consume_fuel(true);
@@ -131,6 +149,11 @@ impl WasmExecutor {
         .map_err(|error| SandboxError::Execution(format!("thread do sandbox terminou: {error}")))?
     }
 
+    /// Executa um módulo WASM de forma síncrona sob a política fornecida.
+    ///
+    /// O módulo precisa ser autocontido, sem imports do host, e exportar
+    /// `run() -> i32`; fuel, tempo, memória e capacidades são verificados
+    /// antes ou durante a execução.
     pub fn execute(
         &self,
         wasm: &[u8],
