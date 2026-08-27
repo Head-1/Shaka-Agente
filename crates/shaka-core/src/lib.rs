@@ -1,5 +1,6 @@
 //! Contratos centrais e tipos compartilhados do agente Shaka.
 
+/// Verificação determinística da estrutura e das políticas de um plano.
 pub mod plan_verifier;
 
 pub use plan_verifier::{
@@ -294,20 +295,30 @@ impl Default for ExecutionBudget {
     }
 }
 
+/// Envelope persistente que vincula uma tarefa à identidade, tenant e budget efetivos.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TaskEnvelope {
+    /// Identificador estável da tarefa admitida.
     pub task_id: TaskId,
+    /// Tenant proprietário da tarefa.
     pub tenant_id: TenantId,
+    /// Operador responsável pela admissão da tarefa.
     pub operator_id: OperatorId,
+    /// Objetivo textual que será processado pelo agente.
     pub objective: String,
+    /// Limites de passos, chamadas, tempo e custo da tarefa.
     pub budget: ExecutionBudget,
+    /// Indica que a execução deve permanecer sem efeitos externos.
     pub dry_run: bool,
+    /// Contexto efetivo por request usado nas decisões do host.
     #[serde(default)]
     pub execution_context: ExecutionContext,
+    /// Instante de admissão da tarefa em UTC.
     pub created_at: DateTime<Utc>,
 }
 
 impl TaskEnvelope {
+    /// Cria uma tarefa em `dry_run` com budget e contexto padrão.
     pub fn new(
         tenant_id: TenantId,
         operator_id: OperatorId,
@@ -965,6 +976,7 @@ impl PlanSpec {
         ensure_acyclic(&self.steps)
     }
 
+    /// Calcula o SHA-256 canônico da revisão sem incluir estado ou timestamp voláteis.
     pub fn calculate_digest(&self) -> Result<String, CoreError> {
         let mut material = self.clone();
         material.digest.clear();
@@ -978,6 +990,7 @@ impl PlanSpec {
         Ok(hex::encode(Sha256::digest(canonical)))
     }
 
+    /// Verifica se o digest persistido corresponde ao conteúdo canônico da revisão.
     pub fn verify_digest(&self) -> Result<(), CoreError> {
         let expected = self.calculate_digest()?;
         if self.digest == expected {
@@ -990,6 +1003,7 @@ impl PlanSpec {
     }
 
     #[must_use]
+    /// Retorna o maior nível de aprovação exigido pelo plano e suas etapas.
     pub fn required_approval(&self) -> PlanApprovalRequirement {
         self.steps
             .iter()
@@ -1005,28 +1019,43 @@ impl PlanSpec {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanApprovalDecision {
+    /// Decisão humana que autoriza o escopo correspondente.
     Approved,
+    /// Decisão humana que impede a execução do escopo correspondente.
     Rejected,
 }
 
 /// Aprovação vinculada a tenant, revisão, etapa e digest imutável.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PlanApproval {
+    /// Identificador único da decisão de aprovação.
     pub approval_id: Uuid,
+    /// Plano ao qual a aprovação está vinculada.
     pub plan_id: PlanId,
+    /// Digest canônico do plano aprovado.
     pub plan_digest: String,
+    /// Revisão exata do plano aprovada.
     pub revision: u32,
+    /// Tenant no qual a aprovação é válida.
     pub tenant_id: TenantId,
+    /// Operador que tomou a decisão.
     pub approver: OperatorId,
+    /// Papel RBAC usado na decisão.
     pub approver_role: Role,
+    /// Etapa aprovada; `None` representa aprovação global.
     pub step_id: Option<PlanStepId>,
+    /// Nível de aprovação concedido.
     pub required: PlanApprovalRequirement,
+    /// Decisão registrada pelo aprovador.
     pub decision: PlanApprovalDecision,
+    /// Instante UTC após o qual a aprovação deixa de valer.
     pub expires_at: DateTime<Utc>,
+    /// Indica que a aprovação foi revogada antes da expiração.
     pub revoked: bool,
 }
 
 impl PlanApproval {
+    /// Valida a aprovação contra o plano, revisão, tenant, etapa e instante atuais.
     pub fn validate_for(
         &self,
         plan: &PlanSpec,
@@ -1141,15 +1170,22 @@ fn ensure_acyclic(steps: &[PlanStep]) -> Result<(), CoreError> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Definição host-side de uma ferramenta e das autorizações que ela exige.
 pub struct ToolDefinition {
+    /// Nome estável usado para selecionar a ferramenta.
     pub name: String,
+    /// Descrição apresentada ao componente que propõe a chamada.
     pub description: String,
+    /// Schema JSON validado para os argumentos de entrada.
     pub input_schema: JsonValue,
+    /// Capabilities que o contexto efetivo precisa conceder.
     pub required_capabilities: Vec<Capability>,
+    /// Classificação do efeito produzido pela ferramenta.
     pub side_effect: SideEffect,
 }
 
 impl ToolDefinition {
+    /// Valida a entrada contra o schema JSON declarado pela ferramenta.
     pub fn validate_input(&self, input: &JsonValue) -> Result<(), CoreError> {
         let validator = jsonschema::validator_for(&self.input_schema).map_err(|error| {
             CoreError::SchemaViolation {
@@ -1167,24 +1203,36 @@ impl ToolDefinition {
     }
 }
 
+/// Capability que pode ser concedida explicitamente pelo host.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum Capability {
+    /// Permite acesso à rede quando concedido pelo host.
     Network,
+    /// Permite leitura de filesystem quando concedida pelo host.
     FilesystemRead,
+    /// Permite escrita de filesystem quando concedida pelo host.
     FilesystemWrite,
+    /// Permite execução de código isolado quando concedida pelo host.
     CodeExecution,
+    /// Permite envio a destinatários externos quando concedida pelo host.
     ExternalMessaging,
+    /// Permite mutações na memória persistente quando concedida pelo host.
     MemoryWrite,
 }
 
+/// Classificação do efeito produzido por uma ferramenta ou ação.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SideEffect {
+    /// Operação sem mutação persistente ou efeito externo.
     ReadOnly,
+    /// Operação que interage com um sistema ou destinatário externo.
     ExternalEffect,
+    /// Operação que altera estado persistente local.
     Mutation,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+/// Conjunto de capabilities efetivas concedidas a uma execução.
 pub struct CapabilitySet(pub Vec<Capability>);
 
 impl CapabilitySet {
@@ -1205,61 +1253,100 @@ impl CapabilitySet {
     }
 
     #[must_use]
+    /// Informa se todas as capabilities exigidas estão presentes no conjunto.
     pub fn allows(&self, required: &[Capability]) -> bool {
         required.iter().all(|cap| self.0.contains(cap))
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Pedido de execução de uma ferramenta associado à tarefa originadora.
 pub struct ToolCall {
+    /// Tarefa que originou a chamada.
     pub task_id: TaskId,
+    /// Nome exato da ferramenta solicitada.
     pub tool_name: String,
+    /// Argumentos da chamada em JSON.
     pub input: JsonValue,
+    /// Instante UTC em que a chamada foi solicitada.
     pub requested_at: DateTime<Utc>,
 }
 
+/// Resultado serializável devolvido por uma ferramenta ao runtime.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolResult {
+    /// Nome da ferramenta que produziu o resultado.
     pub tool_name: String,
+    /// Saída estruturada ou erro sanitizado da ferramenta.
     pub output: JsonValue,
+    /// Indica se a execução terminou com sucesso.
     pub success: bool,
+    /// Código estável de erro, quando a execução falhou.
     pub error_code: Option<String>,
 }
 
+/// Manifesto declarativo de identidade, permissões, schemas e estado de uma skill.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SkillManifest {
+    /// Nome estável da skill no registry.
     pub name: String,
+    /// Versão do manifesto declarado.
     pub version: String,
+    /// Descrição da finalidade da skill.
     pub description: String,
+    /// Capabilities que o artefato declara precisar.
     pub permissions: Vec<Capability>,
+    /// Schema JSON aceito pela skill.
     pub input_schema: JsonValue,
+    /// Schema JSON produzido pela skill.
     pub output_schema: JsonValue,
+    /// Estado atual no ciclo de vida governado.
     pub status: SkillStatus,
+    /// Hash SHA-256 do artefato aprovado, quando houver.
     pub artifact_sha256: Option<String>,
 }
 
+/// Estados possíveis no ciclo de vida governado de uma skill.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SkillStatus {
+    /// Skill apenas especificada, sem artefato testado.
     Specified,
+    /// Artefato gerado, ainda sem candidatura aprovada.
     Generated,
+    /// Artefato testado, ainda não elegível para execução.
     Tested,
+    /// Skill registrada para revisão e aprovação.
     Candidate,
+    /// Skill aprovada e elegível após revalidação do runtime.
     Active,
+    /// Skill substituída e não recomendada para novas ativações.
     Deprecated,
+    /// Skill revogada e impedida de execução.
     Revoked,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Evento auditável encadeado por hash e associado a um tenant.
 pub struct AuditEvent {
+    /// Identificador único do evento.
     pub event_id: Uuid,
+    /// Tarefa relacionada, quando o evento pertence a uma execução.
     pub task_id: Option<TaskId>,
+    /// Tenant ao qual o evento pertence.
     pub tenant_id: TenantId,
+    /// Ator que originou a transição ou observação.
     pub actor: String,
+    /// Ação registrada no evento.
     pub action: String,
+    /// Resultado observado da ação.
     pub outcome: String,
+    /// Instante UTC da ocorrência.
     pub occurred_at: DateTime<Utc>,
+    /// Metadados sanitizados e determinísticos do evento.
     pub metadata: BTreeMap<String, String>,
+    /// Hash do evento anterior na cadeia, quando houver.
     pub previous_hash: Option<String>,
+    /// Hash calculado para este evento.
     pub event_hash: String,
 }
 
@@ -1294,6 +1381,7 @@ impl AuditEvent {
     }
 
     #[must_use]
+    /// Cria um evento com identificador, timestamp e hash inicial da cadeia.
     pub fn new(
         task_id: Option<TaskId>,
         tenant_id: TenantId,
@@ -1330,23 +1418,38 @@ impl AuditEvent {
 }
 
 #[derive(Debug, Error)]
+/// Erros de validação de identidade, schema, autorização, budget e governança.
 pub enum CoreError {
+    /// Identificador fora do formato ou limite aceito.
     #[error("identificador inválido: {0}")]
     InvalidIdentifier(String),
+    /// Entrada que viola um limite ou pré-condição do núcleo.
     #[error("entrada inválida: {0}")]
     InvalidInput(String),
+    /// Entrada de ferramenta que não satisfaz seu schema declarado.
     #[error("violação de schema na ferramenta {tool}: {message}")]
-    SchemaViolation { tool: String, message: String },
+    SchemaViolation {
+        /// Nome da ferramenta cujo schema foi violado.
+        tool: String,
+        /// Descrição sanitizada da violação encontrada.
+        message: String,
+    },
+    /// Capability exigida sem concessão no contexto efetivo.
     #[error("capacidade não autorizada: {0:?}")]
     CapabilityDenied(Capability),
+    /// Operação que depende de uma aprovação humana explícita.
     #[error("operação requer aprovação explícita do operador")]
     ApprovalRequired,
+    /// Limite de execução ou custo ultrapassado.
     #[error("orçamento excedido: {0}")]
     BudgetExceeded(String),
+    /// Principal sem autorização para a ação solicitada.
     #[error("principal não autorizado para a ação: {0:?}")]
     Unauthorized(Action),
+    /// Plano que viola sua estrutura, riscos, dependências ou digest.
     #[error("plano inválido: {0}")]
     PlanInvalid(String),
+    /// Aprovação incompatível, expirada, revogada ou insuficiente para o plano.
     #[error("aprovação de plano inválida: {0}")]
     PlanApprovalInvalid(String),
 }
