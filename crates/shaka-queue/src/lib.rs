@@ -80,15 +80,22 @@ pub enum QueueError {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
+    /// Tarefa aguardando seleção por um worker.
     Queued,
+    /// Tarefa atualmente sob lease de um worker.
     Running,
+    /// Tarefa concluída sem erro.
     Succeeded,
+    /// Tarefa encerrada com erro não recuperável.
     Failed,
+    /// Cancelamento solicitado enquanto a tarefa ainda pode estar executando.
     CancelRequested,
+    /// Tarefa encerrada por cancelamento.
     Cancelled,
 }
 
 impl TaskStatus {
+    /// Retorna a representação estável usada no armazenamento e na API.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -221,14 +228,19 @@ pub enum FinishOutcome {
     Succeeded,
     /// A etapa planejada terminou e a task será reencaminhada para a próxima etapa.
     PlanStepSucceeded {
+        /// Próximo instante em que a etapa seguinte pode ser selecionada.
         next_attempt_at: DateTime<Utc>,
     },
     /// A compensação declarada terminou; a operação original não é reportada como sucesso.
     Compensated,
+    /// A tarefa foi reencaminhada para uma nova tentativa.
     Requeued {
+        /// Próximo instante em que a tarefa pode ser tentada novamente.
         next_attempt_at: DateTime<Utc>,
     },
+    /// A tarefa terminou com erro após esgotar a política de retry.
     Failed,
+    /// A tarefa terminou sem execução útil por solicitação de cancelamento.
     Cancelled,
 }
 
@@ -236,7 +248,9 @@ pub enum FinishOutcome {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthSource {
+    /// Autenticação resolvida a partir de um token persistido.
     Token,
+    /// Autenticação resolvida a partir da chave estática configurada.
     StaticApiKey,
 }
 
@@ -325,12 +339,16 @@ pub struct UserRecord {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CircuitState {
+    /// Permite chamadas normalmente.
     Closed,
+    /// Bloqueia chamadas até a próxima sonda permitida.
     Open,
+    /// Permite uma sonda; chamadas concorrentes permanecem bloqueadas.
     HalfOpen,
 }
 
 impl CircuitState {
+    /// Retorna a representação estável usada no armazenamento e na API.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -1000,6 +1018,7 @@ impl QueueStore {
         })
     }
 
+    /// Persiste uma sessão vinculada ao principal e ao tenant fornecidos.
     pub fn create_session(
         &self,
         principal: Principal,
@@ -1032,6 +1051,7 @@ impl QueueStore {
         Ok(session)
     }
 
+    /// Carrega uma sessão somente quando ela pertence ao tenant informado.
     pub fn get_session(
         &self,
         session_id: Uuid,
@@ -1070,6 +1090,7 @@ impl QueueStore {
         })
     }
 
+    /// Atualiza o último acesso de uma sessão dentro do tenant informado.
     pub fn touch_session(&self, session_id: Uuid, tenant_id: &TenantId) -> Result<(), QueueError> {
         let changed = self.connection.lock().execute(
             "UPDATE api_sessions SET last_seen_at = ?1
@@ -1403,6 +1424,7 @@ impl QueueStore {
         Ok((SubmitOutcome::Created, record))
     }
 
+    /// Carrega uma tarefa somente quando ela pertence ao tenant informado.
     pub fn get_task(
         &self,
         task_id: &TaskId,
@@ -1412,6 +1434,10 @@ impl QueueStore {
         load_task(&connection, &task_id.0.to_string(), tenant_id)
     }
 
+    /// Seleciona atomicamente a próxima tarefa elegível e atribui uma lease.
+    ///
+    /// Usa o contexto padrão para tarefas planejadas; consumidores que possuem
+    /// facts host-side adicionais devem usar [`Self::claim_next_with_plan_context`].
     pub fn claim_next(
         &self,
         now: DateTime<Utc>,
@@ -1496,6 +1522,10 @@ impl QueueStore {
         Ok(None)
     }
 
+    /// Solicita cancelamento de forma idempotente dentro do tenant informado.
+    ///
+    /// Tarefas em execução entram em `CancelRequested`; tarefas ainda enfileiradas
+    /// podem ser encerradas imediatamente como `Cancelled`.
     pub fn request_cancel(
         &self,
         task_id: &TaskId,
@@ -1538,6 +1568,10 @@ impl QueueStore {
         Ok(updated)
     }
 
+    /// Finaliza uma tarefa usando o token de fencing da lease atual.
+    ///
+    /// Uma falha retryable pode reencaminhar a tarefa; caso contrário, o
+    /// resultado torna-se terminal. Um token expirado ou substituído é rejeitado.
     #[cfg(not(test))]
     #[allow(clippy::too_many_arguments)]
     pub fn finish_task(
@@ -1768,6 +1802,9 @@ impl QueueStore {
         Ok(outcome)
     }
 
+    /// Recupera leases expiradas e retorna a quantidade de tarefas recuperadas.
+    ///
+    /// Tarefas canceladas são encerradas; as demais retornam ao estado enfileirado.
     pub fn recover_expired_leases(&self, now: DateTime<Utc>) -> Result<u64, QueueError> {
         let mut connection = self.connection.lock();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1804,6 +1841,7 @@ impl QueueStore {
         Ok(recovered)
     }
 
+    /// Conta globalmente as tarefas ativas neste store SQLite.
     pub fn queued_count(&self) -> Result<u64, QueueError> {
         let count = self.connection.lock().query_row(
             "SELECT COUNT(*) FROM api_tasks WHERE status IN ('queued', 'running', 'cancel_requested')",
@@ -1813,6 +1851,7 @@ impl QueueStore {
         Ok(u64::try_from(count).unwrap_or(0))
     }
 
+    /// Carrega o circuito nomeado, criando um snapshot fechado se necessário.
     pub fn load_circuit(&self, name: &str) -> Result<CircuitSnapshot, QueueError> {
         validate_key(name, "circuit name", 128)?;
         let connection = self.connection.lock();
@@ -1876,6 +1915,7 @@ impl QueueStore {
         Ok(())
     }
 
+    /// Cria um controlador de circuit breaker ligado a este store persistente.
     pub fn circuit_breaker(
         self: &Arc<Self>,
         name: impl Into<String>,
@@ -1891,6 +1931,7 @@ impl QueueStore {
     }
 }
 
+/// Controlador concorrente de um circuit breaker persistido.
 #[derive(Debug)]
 pub struct CircuitBreaker {
     store: Arc<QueueStore>,
@@ -1899,6 +1940,10 @@ pub struct CircuitBreaker {
 }
 
 impl CircuitBreaker {
+    /// Informa se uma chamada pode começar no instante informado.
+    ///
+    /// Em estado aberto, somente a sonda após `next_probe_at` é permitida;
+    /// em estado semiaberto, uma chamada concorrente adicional é bloqueada.
     pub fn allow(&self, now: DateTime<Utc>) -> Result<bool, QueueError> {
         let mut snapshot = self.snapshot.lock();
         match snapshot.state {
@@ -1917,6 +1962,7 @@ impl CircuitBreaker {
         }
     }
 
+    /// Registra sucesso e fecha o circuito, zerando seu contador de falhas.
     pub fn record_success(&self) -> Result<(), QueueError> {
         let mut snapshot = self.snapshot.lock();
         snapshot.state = CircuitState::Closed;
@@ -1926,6 +1972,7 @@ impl CircuitBreaker {
         self.store.save_circuit(&snapshot)
     }
 
+    /// Registra falha e abre o circuito quando o threshold é atingido.
     pub fn record_failure(&self, now: DateTime<Utc>) -> Result<(), QueueError> {
         let mut snapshot = self.snapshot.lock();
         snapshot.failure_count = snapshot.failure_count.saturating_add(1);
@@ -1939,6 +1986,7 @@ impl CircuitBreaker {
         self.store.save_circuit(&snapshot)
     }
 
+    /// Retorna uma cópia consistente do estado persistido em memória.
     #[must_use]
     pub fn snapshot(&self) -> CircuitSnapshot {
         self.snapshot.lock().clone()
