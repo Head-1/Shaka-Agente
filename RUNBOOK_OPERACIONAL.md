@@ -194,7 +194,7 @@ Backup e restauração exigem papel `administrator`. Faça backup antes de mudan
   backup --output "backups/shaka-$(date -u +%Y%m%dT%H%M%SZ).db"
 ```
 
-Restaure primeiro em uma cópia de trabalho, nunca diretamente sobre o único banco operacional:
+Restaure primeiro em uma cópia de trabalho, nunca diretamente sobre o único banco operacional. O comando verifica a integridade SQLite e o schema obrigatório do Shaka (`episodic_memory`, `semantic_memory`, `working_memory` e `audit_events`) antes de iniciar a cópia. Um snapshot SQLite válido, mas incompatível, é rejeitado sem modificar o destino:
 
 ```bash
 ./shaka-linux-x86_64 --role administrator \
@@ -210,7 +210,7 @@ Restaure primeiro em uma cópia de trabalho, nunca diretamente sobre o único ba
   verify-audit
 ```
 
-O backup deve ser transferido para armazenamento externo criptografado. Defina RPO/RTO, retenção, criptografia, rotação e teste periódico de restauração antes de uma implantação pública.
+Se o restore falhar por integridade ou incompatibilidade de schema, preserve o banco de destino, o snapshot de origem e a mensagem de erro; não tente substituir tabelas manualmente. O backup deve ser transferido para armazenamento externo criptografado. Defina RPO/RTO, retenção, criptografia, rotação e teste periódico de restauração antes de uma implantação pública.
 
 ## 8. Skills e aprovações humanas
 
