@@ -1,7 +1,7 @@
 # Status consolidado do backlog de confiabilidade
 
 **Data de atualização:** 27 de agosto de 2026
-**Fonte de código:** `main` no merge commit [`445bc65`](https://github.com/Head-1/Shaka-Agente/commit/445bc65553e8bdce305a24b4822bc36d16187ce9)
+**Fonte de código:** `main` no merge commit [`f1a8fdd`](https://github.com/Head-1/Shaka-Agente/commit/f1a8fdd1040308df682e98ada7f126703500895a), após as PRs #32, #33 e #34
 **Estado de validação:** CI, sandbox e VM aprovados
 
 ## Visão executiva
@@ -25,7 +25,7 @@ Os itens BR-01 a BR-06 foram analisados com o protocolo de engenharia do projeto
 
 A correção de BR-01 foi integrada pela [PR #30](https://github.com/Head-1/Shaka-Agente/pull/30). As correções anteriores de transação, idempotência, leitura fail-closed e ordenação estrutural foram integradas na série de hardening da [PR #26](https://github.com/Head-1/Shaka-Agente/pull/26). Os probes operacionais multiprocesso estão na [PR #29](https://github.com/Head-1/Shaka-Agente/pull/29).
 
-A `main` foi validada no merge commit `445bc65` com testes do workspace, smoke de produção, lifecycle do processo, crash/recovery do QueueStore, cadeia de auditoria multiprocesso e validação equivalente na VM. O working tree permaneceu limpo e as portas operacionais foram liberadas.
+A evidência de validação inicial deste consolidado foi coletada no merge commit `445bc65`, com testes do workspace, smoke de produção, lifecycle do processo, crash/recovery do QueueStore, cadeia de auditoria multiprocesso e validação equivalente na VM. O estado corrente da `main` está no merge commit `f1a8fdd`, que também foi validado em CI, sandbox e VM; o working tree permaneceu limpo e as portas operacionais foram liberadas.
 
 ## Limites e decisões residuais
 

@@ -2,7 +2,7 @@
 
 O Shaka é um agente de IA **extensível, auditável e governado pelo operador**, implementado em Rust. A arquitetura prioriza contratos tipados, execução mediada pelo host, memória persistente, rastreabilidade e uma fronteira segura para capacidades dinâmicas.
 
-> **Estado atual:** a release estável mais recente é a [**v0.8.2**](https://github.com/Head-1/Shaka-Agente/releases/tag/v0.8.2), validada para operação local controlada em `dry-run`. A `main` corrente está no merge commit [`445bc65`](https://github.com/Head-1/Shaka-Agente/commit/445bc65553e8bdce305a24b4822bc36d16187ce9), com BR-01 a BR-06 corrigidos, cobertos e validados em CI, sandbox e VM. A API HTTP usa loopback por padrão; planos `live`, mensageria externa, pesquisa autônoma na web, autopromoção de skills e controle irrestrito de subagentes permanecem fora dos limites desta versão.
+> **Estado atual:** a release estável mais recente é a [**v0.8.2**](https://github.com/Head-1/Shaka-Agente/releases/tag/v0.8.2), validada para operação local controlada em `dry-run`. A `main` corrente está no merge commit [`f1a8fdd`](https://github.com/Head-1/Shaka-Agente/commit/f1a8fdd1040308df682e98ada7f126703500895a), após as PRs #32, #33 e #34, com BR-01 a BR-06 corrigidos, cobertos e validados em CI, sandbox e VM. A API HTTP usa loopback por padrão; planos `live`, mensageria externa, pesquisa autônoma na web, autopromoção de skills e controle irrestrito de subagentes permanecem fora dos limites desta versão.
 
 ## O que a v0.8.2 entrega
 
