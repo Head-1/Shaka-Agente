@@ -104,6 +104,13 @@ pub struct MemoryStore {
     connection: parking_lot::Mutex<Connection>,
 }
 
+const REQUIRED_SCHEMA_TABLES: [&str; 4] = [
+    "episodic_memory",
+    "semantic_memory",
+    "working_memory",
+    "audit_events",
+];
+
 fn restrict_file_permissions(path: impl AsRef<Path>) -> Result<(), MemoryError> {
     #[cfg(unix)]
     {
@@ -472,11 +479,34 @@ impl MemoryStore {
         Ok(result.eq_ignore_ascii_case("ok"))
     }
 
-    /// Restaura o store a partir de um snapshot cuja integridade foi confirmada.
+    fn verify_required_schema_at(path: impl AsRef<Path>) -> Result<bool, MemoryError> {
+        let connection = Connection::open(path)?;
+        for table in REQUIRED_SCHEMA_TABLES {
+            let exists: Option<String> = connection
+                .query_row(
+                    "SELECT name FROM sqlite_master
+                     WHERE type = 'table' AND name = ?1",
+                    params![table],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if exists.is_none() {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Restaura o store a partir de um snapshot cuja integridade e schema foram confirmados.
     pub fn restore_from(&self, source_path: impl AsRef<Path>) -> Result<(), MemoryError> {
         if !Self::verify_integrity_at(&source_path)? {
             return Err(MemoryError::Io(
                 "integridade do backup de origem falhou".to_owned(),
+            ));
+        }
+        if !Self::verify_required_schema_at(&source_path)? {
+            return Err(MemoryError::Io(
+                "schema do backup de origem é incompatível".to_owned(),
             ));
         }
         let source = Connection::open(source_path)?;
@@ -743,6 +773,55 @@ mod tests {
         assert_eq!(verification.checked_events, workers as u64);
         drop(verifier);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn restore_rejects_valid_but_incompatible_schema_without_mutating_target() {
+        let source =
+            std::env::temp_dir().join(format!("shaka-incompatible-source-{}.db", Uuid::new_v4()));
+        let target =
+            std::env::temp_dir().join(format!("shaka-incompatible-target-{}.db", Uuid::new_v4()));
+        let tenant = TenantId::new("tenant-restore-schema").unwrap();
+        let target_store = MemoryStore::open(&target).unwrap();
+        target_store
+            .append_episode(&EpisodicRecord {
+                id: Uuid::new_v4(),
+                tenant_id: tenant.clone(),
+                task_id: None,
+                kind: "restore-target".to_owned(),
+                content: "preserve".to_owned(),
+                outcome: "success".to_owned(),
+                cost_microunits: 0,
+                elapsed_ms: 0,
+                created_at: Utc::now(),
+            })
+            .unwrap();
+        let source_connection = Connection::open(&source).unwrap();
+        source_connection
+            .execute("CREATE TABLE unrelated (value TEXT NOT NULL)", [])
+            .unwrap();
+        source_connection
+            .execute(
+                "INSERT INTO unrelated VALUES ('valid sqlite, wrong schema')",
+                [],
+            )
+            .unwrap();
+        source_connection.close().unwrap();
+
+        assert!(MemoryStore::verify_integrity_at(&source).unwrap());
+        let error = target_store.restore_from(&source).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("schema do backup de origem é incompatível")
+        );
+        assert_eq!(
+            target_store.recent_episodes(&tenant, 10).unwrap()[0].content,
+            "preserve"
+        );
+        assert!(target_store.verify_integrity().unwrap());
+        std::fs::remove_file(source).unwrap();
+        std::fs::remove_file(target).unwrap();
     }
 
     #[test]

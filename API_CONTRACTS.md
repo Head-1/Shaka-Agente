@@ -173,7 +173,7 @@ Os papéis são `operator`, `reviewer` e `administrator`. A autorização é dec
 
 `AuditEvent` inclui `tenant_id`, ator, ação, outcome, metadados, `previous_hash` e `event_hash`. Cada execução de ferramenta gera um evento `tool.execute`; falhas de modelo, orçamento e deadline geram um episódio e um evento `agent.run` com outcome `failure`. O `MemoryStore` reencadeia o evento por tenant e `verify_audit_chain` valida elo anterior, tenant e hash do conteúdo.
 
-A CLI oferece `doctor`, `backup`, `restore`, `verify-audit` e `config`. Backup usa a API online do SQLite; restore deve ser executado por administrador e seguido de integrity check.
+A CLI oferece `doctor`, `backup`, `restore`, `verify-audit` e `config`. Backup usa a API online do SQLite. Restore deve ser executado por administrador e só inicia a cópia após confirmar a integridade e a presença do schema persistente obrigatório do Shaka; um snapshot SQLite válido, mas incompatível, é rejeitado sem mutar o destino e deve ser seguido por `doctor` e `verify-audit` em uma cópia de trabalho.
 
 ## 12. Erros e semântica
 

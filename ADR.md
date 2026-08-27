@@ -108,7 +108,7 @@ O `MemoryStore` calcula o elo anterior por tenant e reprocessa o hash do evento 
 
 **Status:** Aceita.
 
-SQLite é copiado pela API de backup online do rusqlite, evitando cópia ingênua do arquivo enquanto o processo está ativo. Restore é ação administrativa, exige arquivo existente e termina com integrity check. Backups externos criptografados e testes RPO/RTO permanecem responsabilidade da infraestrutura.
+SQLite é copiado pela API de backup online do rusqlite, evitando cópia ingênua do arquivo enquanto o processo está ativo. Restore é ação administrativa, exige arquivo existente, integrity check e schema compatível com as tabelas persistentes conhecidas do Shaka antes de substituir o destino. Um snapshot SQLite válido, mas incompatível, é rejeitado sem mutação do banco de destino. Backups externos criptografados e testes RPO/RTO permanecem responsabilidade da infraestrutura.
 
 ## ADR-016 — Catálogo de skills com escrita atômica
 
