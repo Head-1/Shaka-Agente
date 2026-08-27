@@ -2,7 +2,7 @@
 
 O Shaka é um agente de IA **extensível, auditável e governado pelo operador**, implementado em Rust. A arquitetura prioriza contratos tipados, execução mediada pelo host, memória persistente, rastreabilidade e uma fronteira segura para capacidades dinâmicas.
 
-> **Estado atual:** a release estável mais recente é a [**v0.8.2**](https://github.com/Head-1/Shaka-Agente/releases/tag/v0.8.2), validada para operação local controlada em `dry-run`. A `main` corrente está no merge commit [`f1a8fdd`](https://github.com/Head-1/Shaka-Agente/commit/f1a8fdd1040308df682e98ada7f126703500895a), após as PRs #32, #33 e #34, com BR-01 a BR-06 corrigidos, cobertos e validados em CI, sandbox e VM. A API HTTP usa loopback por padrão; planos `live`, mensageria externa, pesquisa autônoma na web, autopromoção de skills e controle irrestrito de subagentes permanecem fora dos limites desta versão.
+> **Estado atual:** a release estável mais recente é a [**v0.8.2**](https://github.com/Head-1/Shaka-Agente/releases/tag/v0.8.2), validada para operação local controlada em `dry-run`. A `main` corrente está no merge commit [`48eeed2`](https://github.com/Head-1/Shaka-Agente/commit/48eeed2d2ba9a9caa975d0e376d24efc467ea380), após a série de PRs #31–#38. BR-01 a BR-06 permanecem documentados como corrigidos, cobertos e validados; a série também consolidou a documentação pública dos contratos de probes, sandbox, fila, memória, configuração, runtime, skills, identidade e governança de planos. Os ciclos repository-first tiveram CI, sandbox e VM aprovados, com branches de feature preservadas. A API HTTP usa loopback por padrão; planos `live`, mensageria externa, pesquisa autônoma na web, autopromoção de skills e controle irrestrito de subagentes permanecem fora dos limites desta versão.
 
 ## O que a v0.8.2 entrega
 
@@ -31,6 +31,25 @@ A v0.8.2 mantém a base do **Plan Engine governado** e adiciona uma cadeia de pu
 | Subagentes irrestritos | Fora do escopo |
 
 O histórico detalhado está em [`CHANGELOG.md`](CHANGELOG.md). O status corrente de confiabilidade está em [`docs/BACKLOG_STATUS.md`](docs/BACKLOG_STATUS.md). O procedimento de operação sem conhecimento interno de Rust está em [`RUNBOOK_OPERACIONAL.md`](RUNBOOK_OPERACIONAL.md), a validação reproduzível do repositório está em [`docs/VALIDACAO_REPOSITORY_FIRST.md`](docs/VALIDACAO_REPOSITORY_FIRST.md), o contrato HTTP e Rust público está em [`docs/API_PUBLICA.md`](docs/API_PUBLICA.md), e as evidências da validação pós-release estão em [`ETAPA9_VALIDACAO_POS_RELEASE.md`](ETAPA9_VALIDACAO_POS_RELEASE.md).
+
+## Estado repository-first e closeout documental
+
+O estado corrente verificável do repositório é o merge commit [`48eeed2`](https://github.com/Head-1/Shaka-Agente/commit/48eeed2d2ba9a9caa975d0e376d24efc467ea380). A cadeia integrada de PRs #31–#38 é:
+
+| PR | Escopo integrado | Merge commit |
+|---|---|---|
+| [#31](https://github.com/Head-1/Shaka-Agente/pull/31) | Consolidação documental do backlog de confiabilidade | `eb5a6a5` |
+| [#32](https://github.com/Head-1/Shaka-Agente/pull/32) | Correção de replay idempotente sob rate limit | `8c92dca` |
+| [#33](https://github.com/Head-1/Shaka-Agente/pull/33) | Documentação dos probes de crash/recovery | `2e546fe` |
+| [#34](https://github.com/Head-1/Shaka-Agente/pull/34) | Documentação de sandbox e fila | `f1a8fdd` |
+| [#35](https://github.com/Head-1/Shaka-Agente/pull/35) | Documentação de memória e configuração | `d46b058` |
+| [#36](https://github.com/Head-1/Shaka-Agente/pull/36) | Documentação de orchestrator e skills | `38b7a8c` |
+| [#37](https://github.com/Head-1/Shaka-Agente/pull/37) | Documentação de estados e identidade em `shaka-core` | `d78a32a` |
+| [#38](https://github.com/Head-1/Shaka-Agente/pull/38) | Documentação de governança de planos em `shaka-core` | `48eeed2` |
+
+Os ciclos das PRs #31–#38 foram conduzidos com branch baseada no repositório, commit de trabalho assinado quando aplicável, CI remoto, validação em sandbox e confirmação independente na VM. As branches de feature permanecem disponíveis para auditoria; nenhum efeito externo novo foi habilitado pelo closeout.
+
+No `main` final, `cargo check --workspace --locked` concluiu com sucesso. A medição documental registrou 100 avisos `missing_docs`, todos em `shaka-core`: 1 módulo, 7 structs, 53 campos de struct, 2 itens associados, 6 métodos, 4 enums e 27 variantes. Esses avisos são dívida documental conhecida e não representam falha de compilação ou de operação; qualquer redução futura deve ocorrer em lotes isolados, com escopo e validação próprios.
 
 ## Modelo de segurança
 
