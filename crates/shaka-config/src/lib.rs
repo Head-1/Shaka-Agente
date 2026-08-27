@@ -91,6 +91,9 @@ impl AppConfig {
                 "audit_required deve permanecer habilitado".to_owned(),
             ));
         }
+        if self.live_requested && !self.live_confirmation {
+            return Err(ConfigError::LiveModeRequiresExplicitDeployment);
+        }
         match self.environment {
             Environment::Production => {
                 if self.model_provider == ModelProvider::Local {
@@ -107,9 +110,6 @@ impl AppConfig {
                 }
                 if self.model_endpoint.scheme() != "https" {
                     return Err(ConfigError::ProductionRequiresHttps);
-                }
-                if self.live_requested && !self.live_confirmation {
-                    return Err(ConfigError::LiveModeRequiresExplicitDeployment);
                 }
             }
             Environment::Staging => {
@@ -310,6 +310,29 @@ mod tests {
                 true,
             ),
             Err(ConfigError::ProductionRequiresExternalModel)
+        ));
+    }
+
+    #[test]
+    fn live_mode_requires_confirmation_in_development() {
+        let result = AppConfig::from_values(
+            "development",
+            PathBuf::from("data.db"),
+            PathBuf::from("skills.json"),
+            "tenant",
+            "operator",
+            "administrator",
+            "local",
+            "http://localhost:1",
+            "local",
+            None,
+            true,
+            false,
+            true,
+        );
+        assert!(matches!(
+            result,
+            Err(ConfigError::LiveModeRequiresExplicitDeployment)
         ));
     }
 
