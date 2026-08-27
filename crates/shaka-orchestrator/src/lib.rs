@@ -34,24 +34,34 @@ use tracing::{info, warn};
 use url::Url;
 use uuid::Uuid;
 
+/// Falhas observáveis durante a orquestração de uma tarefa.
 #[derive(Debug, Error)]
 pub enum OrchestratorError {
+    /// Violação de um contrato definido no núcleo do Shaka.
     #[error("erro de núcleo: {0}")]
     Core(#[from] CoreError),
+    /// Falha ao persistir memória ou auditoria da execução.
     #[error("erro de memória: {0}")]
     Memory(#[from] shaka_memory::MemoryError),
+    /// Falha de transporte ou resposta HTTP do modelo.
     #[error("erro HTTP do modelo: {0}")]
     Http(#[from] reqwest::Error),
+    /// Resposta do modelo que não respeita o formato esperado.
     #[error("resposta do modelo inválida: {0}")]
     InvalidModelResponse(String),
+    /// Nome de ferramenta que não está registrado no host.
     #[error("ferramenta não encontrada: {0}")]
     ToolNotFound(String),
+    /// Ferramenta que não pertence ao escopo da etapa de plano aprovada.
     #[error("ferramenta fora do escopo da etapa: {0}")]
     PlanActionDenied(String),
+    /// Falha reportada pela execução de uma ferramenta.
     #[error("execução da ferramenta falhou: {0}")]
     ToolExecution(String),
+    /// Orçamento temporal da tarefa foi esgotado.
     #[error("limite de tempo da tarefa excedido")]
     DeadlineExceeded,
+    /// Cancelamento cooperativo foi solicitado pelo operador.
     #[error("execução cancelada pelo operador")]
     Cancelled,
 }
@@ -87,33 +97,49 @@ impl CancellationToken {
     }
 }
 
+/// Solicitação enviada pelo host a um modelo de agente.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelRequest {
+    /// Instruções de sistema controladas pelo host.
     pub system: String,
+    /// Objetivo do usuário após a redação de dados sensíveis.
     pub user: String,
+    /// Ferramentas que o host autorizou para este contexto.
     pub tools: Vec<ToolDefinition>,
+    /// Resultados de ferramentas já executadas nesta tarefa.
     pub prior_tool_results: Vec<ToolResult>,
+    /// Limite de tokens de saída solicitado ao provedor.
     pub max_output_tokens: u32,
 }
 
+/// Chamada de ferramenta proposta pelo modelo.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelToolCall {
+    /// Nome registrado da ferramenta proposta.
     pub tool_name: String,
+    /// Argumentos estruturados da chamada.
     pub arguments: Value,
 }
 
+/// Resposta normalizada retornada por um modelo de agente.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelResponse {
+    /// Conteúdo textual final ou intermediário do modelo.
     pub content: String,
+    /// Chamadas de ferramenta propostas pelo modelo.
     pub tool_calls: Vec<ModelToolCall>,
+    /// Custo estimado acumulado da resposta em microunidades.
     pub estimated_cost_microunits: u64,
 }
 
+/// Abstração assíncrona para provedores de modelo usados pelo runtime.
 #[async_trait]
 pub trait AgentModel: Send + Sync {
+    /// Completa uma solicitação sob os limites e políticas do host.
     async fn complete(&self, request: ModelRequest) -> Result<ModelResponse, OrchestratorError>;
 }
 
+/// Modelo local determinístico usado no modo MVP e em testes.
 #[derive(Debug, Default)]
 pub struct LocalModel;
 
@@ -136,6 +162,7 @@ impl AgentModel for LocalModel {
     }
 }
 
+/// Cliente de modelo remoto compatível com a API `OpenAI`.
 #[derive(Debug, Clone)]
 pub struct OpenAiCompatibleModel {
     client: Client,
@@ -145,6 +172,7 @@ pub struct OpenAiCompatibleModel {
 }
 
 impl OpenAiCompatibleModel {
+    /// Cria um cliente para um endpoint compatível com `OpenAI`.
     pub fn new(endpoint: Url, api_key: String, model: String) -> Result<Self, OrchestratorError> {
         if api_key.trim().is_empty() || model.trim().is_empty() {
             return Err(OrchestratorError::InvalidModelResponse(
@@ -260,13 +288,17 @@ impl AgentModel for OpenAiCompatibleModel {
     }
 }
 
+/// Ferramenta executável sob autorização e validação do host.
 #[async_trait]
 pub trait Tool: Send + Sync {
+    /// Retorna a declaração de capacidades, schema e efeitos da ferramenta.
     fn definition(&self) -> ToolDefinition;
 
+    /// Executa uma chamada já validada pelo registry.
     async fn execute(&self, call: ToolCall) -> Result<Value, OrchestratorError>;
 }
 
+/// Registro de ferramentas e capabilities disponíveis ao runtime.
 #[derive(Default)]
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
@@ -284,6 +316,7 @@ impl std::fmt::Debug for ToolRegistry {
 }
 
 impl ToolRegistry {
+    /// Cria um registry com o conjunto de capabilities permitido pelo host.
     #[must_use]
     pub fn with_capabilities(capabilities: CapabilitySet) -> Self {
         Self {
@@ -292,6 +325,7 @@ impl ToolRegistry {
         }
     }
 
+    /// Registra uma ferramenta somente se suas capabilities forem permitidas.
     pub fn register(&mut self, tool: Arc<dyn Tool>) -> Result<(), OrchestratorError> {
         let definition = tool.definition();
         if !self.capabilities.allows(&definition.required_capabilities) {
@@ -309,6 +343,7 @@ impl ToolRegistry {
         Ok(())
     }
 
+    /// Lista ferramentas compatíveis com as capabilities efetivas do contexto.
     #[must_use]
     pub fn definitions_for(
         &self,
@@ -317,6 +352,7 @@ impl ToolRegistry {
         self.definitions_for_scoped(effective_capabilities, None)
     }
 
+    /// Lista ferramentas filtradas por capabilities e escopo de plano opcional.
     #[must_use]
     pub fn definitions_for_scoped(
         &self,
@@ -334,6 +370,7 @@ impl ToolRegistry {
         definitions
     }
 
+    /// Valida e executa uma ferramenta sem escopo adicional de plano.
     pub async fn execute(
         &self,
         envelope: &TaskEnvelope,
@@ -345,6 +382,7 @@ impl ToolRegistry {
             .await
     }
 
+    /// Valida e executa uma ferramenta respeitando capabilities e escopo aprovado.
     pub async fn execute_with_scope(
         &self,
         envelope: &TaskEnvelope,
@@ -407,14 +445,20 @@ impl ToolRegistry {
     }
 }
 
+/// Resultado sanitizado e persistido de uma execução do agente.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentRunResult {
+    /// Identificador da tarefa executada.
     pub task_id: shaka_core::TaskId,
+    /// Resposta textual limitada e redigida pelo host.
     pub answer: String,
+    /// Resultados sanitizados das ferramentas chamadas.
     pub tool_results: Vec<ToolResult>,
+    /// Indica que a execução terminou sem falha de ferramenta.
     pub success: bool,
 }
 
+/// Runtime que coordena modelo, memória, auditoria e ferramentas.
 pub struct AgentRuntime {
     model: Arc<dyn AgentModel>,
     memory: Arc<MemoryStore>,
@@ -433,6 +477,7 @@ impl std::fmt::Debug for AgentRuntime {
 }
 
 impl AgentRuntime {
+    /// Monta um runtime com dependências já validadas pelo host.
     #[must_use]
     pub fn new(model: Arc<dyn AgentModel>, memory: Arc<MemoryStore>, tools: ToolRegistry) -> Self {
         Self {
@@ -538,6 +583,7 @@ impl AgentRuntime {
         }
     }
 
+    /// Executa uma tarefa sem token de cancelamento externo.
     #[allow(clippy::too_many_lines)]
     pub async fn run(&self, envelope: TaskEnvelope) -> Result<AgentRunResult, OrchestratorError> {
         self.run_with_cancellation(envelope, CancellationToken::new())
@@ -795,6 +841,7 @@ impl AgentRuntime {
     }
 }
 
+/// Ferramenta somente leitura que devolve uma mensagem validada.
 #[derive(Debug)]
 pub struct EchoTool;
 
@@ -855,6 +902,7 @@ impl SkillRevalidationSource {
     }
 }
 
+/// Adaptador de uma skill `WASM` aprovada e verificada.
 #[derive(Debug)]
 pub struct WasmSkillTool {
     artifact: ActiveSkillArtifact,
@@ -914,6 +962,7 @@ impl WasmSkillTool {
         })
     }
 
+    /// Cria uma ferramenta aprovada e revalida registry e trust store a cada execução.
     pub fn from_approved_artifact_with_revalidation(
         artifact: ActiveSkillArtifact,
         trust_store: &TrustStore,
@@ -984,6 +1033,7 @@ impl Tool for WasmSkillTool {
     }
 }
 
+/// Ferramenta de mensagem externa sujeita às capabilities do contexto.
 #[derive(Debug)]
 pub struct OutboundMessageTool;
 

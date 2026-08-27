@@ -18,70 +18,108 @@ pub const APPROVAL_PROTOCOL_V1: &str = "shaka-skill-approval-v1";
 /// Versão do protocolo que vincula a autoridade declarativa do manifesto.
 pub const APPROVAL_PROTOCOL_V2: &str = "shaka-skill-approval-v2";
 
+/// Falhas de registro, aprovação, assinatura e persistência de skills.
 #[derive(Debug, Error)]
 pub enum SkillError {
+    /// Uma skill com o mesmo nome já está registrada.
     #[error("skill já existe: {0}")]
     AlreadyExists(String),
+    /// A skill solicitada não está registrada.
     #[error("skill não encontrada: {0}")]
     NotFound(String),
+    /// A mudança de estado solicitada não é permitida.
     #[error("transição não permitida: {from:?} -> {to:?}")]
-    InvalidTransition { from: SkillStatus, to: SkillStatus },
+    InvalidTransition {
+        /// Estado observado antes da transição.
+        from: SkillStatus,
+        /// Estado solicitado pela operação.
+        to: SkillStatus,
+    },
+    /// Dados de aprovação ausentes ou fora do formato aceito.
     #[error("aprovação inválida: {0}")]
     InvalidApproval(String),
+    /// A execução exige uma aprovação assinada.
     #[error("aprovação assinada é obrigatória para execução da skill")]
     UnsignedApproval,
+    /// A assinatura criptográfica não pôde ser verificada.
     #[error("assinatura da aprovação é inválida")]
     InvalidSignature,
+    /// O protocolo da aprovação não pode ser executado.
     #[error("protocolo de aprovação legado ou não suportado")]
     UnsupportedApprovalProtocol,
+    /// O manifesto atual não corresponde ao snapshot aprovado.
     #[error("autoridade declarativa da skill não corresponde à aprovação")]
     ManifestAuthorityMismatch,
+    /// A chave fornecida é inválida.
     #[error("chave de assinatura inválida: {0}")]
     InvalidKey(String),
+    /// A chave não pertence ao trust store.
     #[error("chave não confiável: {0}")]
     UntrustedKey(String),
+    /// A chave confiável foi revogada.
     #[error("chave revogada: {0}")]
     RevokedKey(String),
+    /// O conteúdo do artefato mudou após a aprovação.
     #[error("hash do artefato não corresponde à aprovação")]
     ArtifactHashMismatch,
+    /// A aprovação não informa um caminho verificável para o artefato.
     #[error("artefato aprovado não possui caminho verificável")]
     MissingArtifactPath,
+    /// O arquivo da chave possui permissões mais abertas que o permitido.
     #[error("permissões inseguras no arquivo de chave: {0}")]
     InsecureKeyFile(PathBuf),
+    /// A combinação de capabilities excede a política declarativa.
     #[error("permissão excessiva para skill: {0:?}")]
     ExcessivePermission(Capability),
+    /// O arquivo de chave já existe e não será sobrescrito.
     #[error("arquivo de chave já existe: {0}")]
     KeyFileAlreadyExists(PathBuf),
+    /// Uma chave com o mesmo identificador já está confiável.
     #[error("chave confiável já existe: {0}")]
     KeyAlreadyExists(String),
+    /// O identificador da chave não está no trust store.
     #[error("chave confiável não encontrada: {0}")]
     KeyNotFound(String),
+    /// Falha de leitura ou escrita de arquivo.
     #[error("erro de arquivo: {0}")]
     Io(#[from] std::io::Error),
+    /// Falha de serialização do registry ou trust store.
     #[error("erro de serialização: {0}")]
     Serialization(#[from] serde_json::Error),
 }
 
+/// Atestação criptográfica de uma decisão de aprovação.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ApprovalAttestation {
+    /// Identificador do protocolo de assinatura usado.
     pub protocol: String,
+    /// Identificador da chave confiável usada para assinar.
     pub key_id: String,
+    /// Chave pública Ed25519 em hexadecimal.
     pub public_key_hex: String,
+    /// Assinatura do binding canônico em hexadecimal.
     pub signature_hex: String,
 }
 
 /// Campos imutáveis que identificam a decisão de aprovação V2.
 #[derive(Debug, Clone, Copy)]
 pub struct ApprovalBinding<'a> {
+    /// Nome estável da skill aprovada.
     pub name: &'a str,
+    /// Versão do manifesto aprovada.
     pub version: &'a str,
+    /// Operador que tomou a decisão.
     pub operator_id: &'a OperatorId,
+    /// Hash SHA-256 do artefato aprovado.
     pub artifact_sha256: &'a str,
+    /// Justificativa registrada para a aprovação.
     pub reason: &'a str,
+    /// Digest dos campos do manifesto que conferem autoridade.
     pub manifest_authority_sha256: &'a str,
 }
 
 impl<'a> ApprovalBinding<'a> {
+    /// Constrói o payload imutável que será assinado ou verificado.
     #[must_use]
     pub const fn new(
         name: &'a str,
@@ -102,41 +140,60 @@ impl<'a> ApprovalBinding<'a> {
     }
 }
 
+/// Registro persistente de uma decisão de aprovação.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ApprovalRecord {
+    /// Operador que aprovou o artefato.
     pub operator_id: OperatorId,
+    /// Instante da aprovação em UTC.
     pub approved_at: DateTime<Utc>,
+    /// Hash SHA-256 do artefato aprovado.
     pub artifact_sha256: String,
     /// Digest V2 de permissões e schemas aprovados; ausente em registros legados.
     #[serde(default)]
     pub manifest_authority_sha256: Option<String>,
+    /// Caminho canônico do artefato, quando disponível.
     #[serde(default)]
     pub artifact_path: Option<PathBuf>,
+    /// Justificativa da aprovação.
     pub reason: String,
     /// Atestação Ed25519; ausente somente em registros legados não executáveis.
     #[serde(default)]
     pub attestation: Option<ApprovalAttestation>,
 }
 
+/// Estado persistente de uma skill e sua aprovação opcional.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SkillRecord {
+    /// Manifesto declarado da skill.
     pub manifest: SkillManifest,
+    /// Aprovação associada ao manifesto, se houver.
     pub approval: Option<ApprovalRecord>,
+    /// Instante de criação do registro em UTC.
     pub created_at: DateTime<Utc>,
+    /// Instante da última alteração em UTC.
     pub updated_at: DateTime<Utc>,
 }
 
+/// Chave pública autorizada a verificar aprovações.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TrustedKey {
+    /// Identificador estável da chave no trust store.
     pub key_id: String,
+    /// Chave pública Ed25519 em hexadecimal.
     pub public_key_hex: String,
+    /// Descrição operacional da chave.
     pub description: String,
+    /// Operador que adicionou a chave.
     pub added_by: OperatorId,
+    /// Instante em que a chave foi adicionada.
     pub added_at: DateTime<Utc>,
+    /// Instante de revogação, quando a chave não deve mais ser aceita.
     #[serde(default)]
     pub revoked_at: Option<DateTime<Utc>>,
 }
 
+/// Conjunto persistente de chaves públicas confiáveis.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TrustStore {
     #[serde(default)]
@@ -211,11 +268,13 @@ impl TrustStore {
         Ok(record.clone())
     }
 
+    /// Obtém uma chave confiável pelo identificador.
     #[must_use]
     pub fn get(&self, key_id: &str) -> Option<&TrustedKey> {
         self.keys.get(key_id)
     }
 
+    /// Lista chaves confiáveis em ordem determinística por identificador.
     #[must_use]
     pub fn list(&self) -> Vec<&TrustedKey> {
         let mut keys: Vec<_> = self.keys.values().collect();
@@ -254,6 +313,7 @@ impl TrustStore {
     }
 }
 
+/// Registry persistente em memória para o ciclo de vida das skills.
 #[derive(Debug, Default)]
 pub struct SkillRegistry {
     skills: HashMap<String, SkillRecord>,
@@ -268,23 +328,37 @@ struct AttestedApproval {
     attestation: ApprovalAttestation,
 }
 
+/// Artefato ativo somente após verificação de hash, manifesto e assinatura.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ActiveSkillArtifact {
+    /// Nome da skill no registry.
     pub name: String,
+    /// Versão aprovada do manifesto.
     pub version: String,
+    /// Descrição exposta ao runtime.
     pub description: String,
+    /// Capabilities exigidas pelo artefato.
     pub permissions: Vec<Capability>,
+    /// Schema de entrada aprovado.
     pub input_schema: serde_json::Value,
+    /// Schema de saída aprovado.
     pub output_schema: serde_json::Value,
+    /// Caminho canônico do artefato verificado.
     pub artifact_path: PathBuf,
+    /// Hash SHA-256 do conteúdo verificado.
     pub artifact_sha256: String,
+    /// Digest dos campos de autoridade do manifesto.
     pub manifest_authority_sha256: String,
+    /// Atestação que vincula a decisão ao artefato e manifesto.
     pub attestation: ApprovalAttestation,
+    /// Operador que aprovou o artefato.
     pub approval_operator_id: OperatorId,
+    /// Justificativa registrada na aprovação.
     pub approval_reason: String,
 }
 
 impl SkillRegistry {
+    /// Carrega o registry JSON; arquivo ausente significa registry vazio.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, SkillError> {
         let path = path.as_ref();
         if !path.exists() {
@@ -295,6 +369,7 @@ impl SkillRegistry {
         Ok(Self { skills })
     }
 
+    /// Persiste o registry com escrita atômica e permissões restritas.
     pub fn save(&self, path: impl AsRef<Path>) -> Result<(), SkillError> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
@@ -310,6 +385,7 @@ impl SkillRegistry {
         Ok(())
     }
 
+    /// Aprova um artefato por hash, sem criar atestação executável V2.
     pub fn approve_artifact(
         &mut self,
         name: &str,
@@ -367,6 +443,7 @@ impl SkillRegistry {
         )
     }
 
+    /// Registra uma skill no estado `Candidate` após validar suas permissões.
     pub fn register_candidate(&mut self, manifest: SkillManifest) -> Result<(), SkillError> {
         if self.skills.contains_key(&manifest.name) {
             return Err(SkillError::AlreadyExists(manifest.name));
@@ -485,6 +562,7 @@ impl SkillRegistry {
         Ok(record.clone())
     }
 
+    /// Revoga uma skill ativa, impedindo sua seleção posterior para execução.
     pub fn revoke(&mut self, name: &str) -> Result<SkillRecord, SkillError> {
         let record = self
             .skills
@@ -501,11 +579,13 @@ impl SkillRegistry {
         Ok(record.clone())
     }
 
+    /// Obtém uma skill registrada pelo nome.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&SkillRecord> {
         self.skills.get(name)
     }
 
+    /// Lista skills no estado ativo, sem revalidar o artefato.
     #[must_use]
     pub fn active_skills(&self) -> Vec<&SkillRecord> {
         self.skills
@@ -695,6 +775,7 @@ pub fn load_signing_key(path: impl AsRef<Path>) -> Result<SigningKey, SkillError
     Ok(SigningKey::from_bytes(&bytes))
 }
 
+/// Calcula o SHA-256 do conteúdo de um arquivo em streaming.
 pub fn sha256_file(path: impl AsRef<Path>) -> Result<String, SkillError> {
     let mut file = File::open(path)?;
     let mut digest = Sha256::new();
