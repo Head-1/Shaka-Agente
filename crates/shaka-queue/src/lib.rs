@@ -1253,6 +1253,30 @@ impl QueueStore {
         let mut governed_envelope = envelope.clone();
         governed_envelope.execution_context = ExecutionContext::from_principal(principal);
         let limits = load_limits_tx(&transaction, &principal.tenant_id)?;
+        let existing_task = transaction
+            .query_row(
+                "SELECT task_id FROM api_tasks
+                 WHERE tenant_id = ?1 AND idempotency_key = ?2",
+                params![principal.tenant_id.0, idempotency_key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|task_id| load_task(&transaction, &task_id, &principal.tenant_id))
+            .transpose()?;
+        if let Some(existing) = existing_task {
+            if existing.request_fingerprint != request_fingerprint
+                || !same_plan_reference(
+                    existing.plan_id.as_ref(),
+                    existing.plan_revision,
+                    existing.plan_digest.as_deref(),
+                    plan_reference,
+                )
+            {
+                return Err(QueueError::IdempotencyConflict);
+            }
+            transaction.commit()?;
+            return Ok((SubmitOutcome::Existing, existing));
+        }
         let window_start = fixed_window_start(now, limits.window_seconds);
         for scope in [
             format!("tenant:{}:submit", principal.tenant_id.0),
@@ -1290,29 +1314,6 @@ impl QueueStore {
                  DO UPDATE SET request_count = request_count + 1",
                 params![scope, window_start.to_rfc3339()],
             )?;
-        }
-        if let Some(existing_id) = transaction
-            .query_row(
-                "SELECT task_id FROM api_tasks
-                 WHERE tenant_id = ?1 AND idempotency_key = ?2",
-                params![principal.tenant_id.0, idempotency_key],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
-        {
-            let existing = load_task(&transaction, &existing_id, &principal.tenant_id)?;
-            if existing.request_fingerprint != request_fingerprint
-                || !same_plan_reference(
-                    existing.plan_id.as_ref(),
-                    existing.plan_revision,
-                    existing.plan_digest.as_deref(),
-                    plan_reference,
-                )
-            {
-                return Err(QueueError::IdempotencyConflict);
-            }
-            transaction.commit()?;
-            return Ok((SubmitOutcome::Existing, existing));
         }
         let admission_approval_id = if let Some(reference) = plan_reference {
             plan_store::record_plan_admission_tx(
@@ -2652,6 +2653,64 @@ mod tests {
         );
         assert!(matches!(second, Err(QueueError::QuotaExceeded(_))));
         assert_eq!(task.task_id, replay.1.task_id);
+    }
+
+    #[test]
+    fn governed_replay_does_not_consume_rate_limit_window() {
+        let store = QueueStore::in_memory().unwrap();
+        let principal = principal();
+        store.bootstrap_principal(&principal).unwrap();
+        store
+            .set_limits(TenantLimits {
+                tenant_id: principal.tenant_id.clone(),
+                max_active_tasks: 10,
+                max_daily_tasks: 10,
+                max_daily_cost_microunits: 2_000_000,
+                requests_per_window: 1,
+                window_seconds: 60,
+            })
+            .unwrap();
+        let session = store
+            .create_session(principal.clone(), Value::Null)
+            .unwrap();
+        let task = envelope(&principal);
+        let first = store
+            .submit_task_governed(
+                session.session_id,
+                &principal,
+                "rate-limit-replay",
+                "rate-limit-replay-fingerprint",
+                &task,
+                1,
+                1,
+            )
+            .unwrap();
+        assert_eq!(first.0, SubmitOutcome::Created);
+        let replay = store
+            .submit_task_governed(
+                session.session_id,
+                &principal,
+                "rate-limit-replay",
+                "rate-limit-replay-fingerprint",
+                &task,
+                1,
+                1,
+            )
+            .unwrap();
+        assert_eq!(replay.0, SubmitOutcome::Existing);
+        let new_submission = store.submit_task_governed(
+            session.session_id,
+            &principal,
+            "rate-limit-new",
+            "rate-limit-new-fingerprint",
+            &envelope(&principal),
+            1,
+            1,
+        );
+        assert!(matches!(
+            new_submission,
+            Err(QueueError::RateLimited { .. })
+        ));
     }
 
     #[test]
