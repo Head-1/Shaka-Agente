@@ -18,12 +18,15 @@ use std::{
 use thiserror::Error;
 use uuid::Uuid;
 
+/// Alias do valor JSON usado nos contratos serializados do núcleo.
 pub type JsonValue = serde_json::Value;
 
+/// Identificador UUID de uma tarefa admitida pelo agente.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct TaskId(pub Uuid);
 
 impl TaskId {
+    /// Gera um identificador de tarefa aleatório e único no processo.
     #[must_use]
     pub fn new() -> Self {
         Self(Uuid::new_v4())
@@ -36,10 +39,12 @@ impl Default for TaskId {
     }
 }
 
+/// Identificador validado do tenant ao qual um recurso pertence.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct TenantId(pub String);
 
 impl TenantId {
+    /// Cria um tenant com identificador não vazio de até 128 bytes.
     pub fn new(value: impl Into<String>) -> Result<Self, CoreError> {
         let value = value.into();
         if value.trim().is_empty() || value.len() > 128 {
@@ -49,10 +54,12 @@ impl TenantId {
     }
 }
 
+/// Identificador validado do operador responsável por uma ação.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct OperatorId(pub String);
 
 impl OperatorId {
+    /// Cria um operador com identificador não vazio de até 128 bytes.
     pub fn new(value: impl Into<String>) -> Result<Self, CoreError> {
         let value = value.into();
         if value.trim().is_empty() || value.len() > 128 {
@@ -65,34 +72,53 @@ impl OperatorId {
 /// Papel RBAC associado ao principal que opera o agente.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Role {
+    /// Operador limitado a execução somente leitura e criação de skills.
     Operator,
+    /// Revisor autorizado a aprovar determinados artefatos e planos.
     Reviewer,
+    /// Administrador com autorização para ações administrativas protegidas.
     Administrator,
 }
 
 /// Ação protegida pelo host.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Action {
+    /// Executa uma operação sem efeitos externos.
     RunReadOnly,
+    /// Executa uma operação com efeito externo.
     RunExternal,
+    /// Registra uma nova skill candidata.
     CreateSkill,
+    /// Aprova uma skill para o próximo estágio do ciclo de vida.
     ApproveSkill,
+    /// Revoga uma skill ativa.
     RevokeSkill,
+    /// Cria ou exporta um backup permitido.
     Backup,
+    /// Restaura dados a partir de um backup permitido.
     Restore,
+    /// Verifica a cadeia de auditoria.
     VerifyAudit,
+    /// Remove memória conforme a política de retenção.
     PurgeMemory,
+    /// Gerencia identidades e autorização persistentes.
     ManageIam,
+    /// Aprova um plano de execução.
     ApprovePlan,
+    /// Retoma um plano pausado ou desconhecido sob governança.
     ResumePlan,
+    /// Resolve explicitamente um plano em estado desconhecido.
     ResolvePlanUnknown,
 }
 
 /// Identidade autenticada e escopo de tenant usado nas decisões do host.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Principal {
+    /// Identidade do operador autenticado.
     pub operator_id: OperatorId,
+    /// Tenant no qual o principal exerce autoridade.
     pub tenant_id: TenantId,
+    /// Papel RBAC usado para avaliar as ações.
     pub role: Role,
 }
 
@@ -406,24 +432,40 @@ impl PlanApprovalRequirement {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanState {
+    /// Plano criado, ainda sem proposta formal.
     Draft,
+    /// Plano proposto para validação.
     Proposed,
+    /// Plano que passou pela validação estrutural.
     Validated,
+    /// Plano aguardando aprovação humana.
     AwaitingApproval,
+    /// Plano autorizado para execução.
     Approved,
+    /// Plano com execução em andamento.
     Running,
+    /// Plano pausado e elegível para retomada governada.
     Paused,
+    /// Plano concluído com sucesso.
     Succeeded,
+    /// Plano encerrado por falha.
     Failed,
+    /// Solicitação de cancelamento registrada.
     CancelRequested,
+    /// Plano cancelado.
     Cancelled,
+    /// Plano em compensação de efeitos parciais.
     Compensating,
+    /// Compensação concluída.
     Compensated,
+    /// Estado indeterminado que exige resolução explícita.
     Unknown,
+    /// Plano rejeitado durante aprovação ou validação.
     Rejected,
 }
 
 impl PlanState {
+    /// Indica se o plano não admite novas transições normais.
     #[must_use]
     pub const fn is_terminal(self) -> bool {
         matches!(
@@ -432,6 +474,7 @@ impl PlanState {
         )
     }
 
+    /// Valida a transição de estado contra a máquina de estados do plano.
     pub fn validate_transition(self, next: Self) -> Result<(), CoreError> {
         let valid = match self {
             Self::Draft => matches!(next, Self::Proposed | Self::Rejected),
@@ -482,21 +525,34 @@ impl PlanState {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanStepState {
+    /// Etapa criada, aguardando que suas pré-condições sejam avaliadas.
     Pending,
+    /// Etapa pronta para execução ou aprovação.
     Ready,
+    /// Etapa em execução.
     Running,
+    /// Etapa concluída com sucesso.
     Succeeded,
+    /// Etapa encerrada por falha.
     Failed,
+    /// Etapa impedida por uma condição ou política.
     Blocked,
+    /// Etapa aguardando aprovação humana.
     AwaitingApproval,
+    /// Solicitação de cancelamento da etapa registrada.
     CancelRequested,
+    /// Etapa cancelada.
     Cancelled,
+    /// Etapa em compensação.
     Compensating,
+    /// Compensação da etapa concluída.
     Compensated,
+    /// Estado indeterminado que exige resolução explícita.
     Unknown,
 }
 
 impl PlanStepState {
+    /// Valida a transição de estado contra a máquina da etapa.
     pub fn validate_transition(self, next: Self) -> Result<(), CoreError> {
         let valid = match self {
             Self::Pending => matches!(next, Self::Ready | Self::Blocked | Self::Cancelled),
@@ -537,10 +593,15 @@ impl PlanStepState {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanTaskState {
+    /// Tarefa admitida e aguardando execução.
     Queued,
+    /// Tarefa em execução.
     Running,
+    /// Tarefa concluída com sucesso.
     Succeeded,
+    /// Tarefa encerrada por falha.
     Failed,
+    /// Tarefa cancelada.
     Cancelled,
 }
 

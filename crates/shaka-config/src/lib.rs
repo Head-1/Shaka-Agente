@@ -6,10 +6,14 @@ use std::{path::PathBuf, str::FromStr};
 use thiserror::Error;
 use url::Url;
 
+/// Ambiente operacional em que o runtime será executado.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Environment {
+    /// Ambiente local sem requisitos de produção.
     Development,
+    /// Ambiente intermediário com controles de execução externa.
     Staging,
+    /// Ambiente lockado com modelo externo, chave e endpoint HTTPS.
     Production,
 }
 
@@ -26,9 +30,12 @@ impl FromStr for Environment {
     }
 }
 
+/// Tipo de provedor de modelo aceito pela configuração.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ModelProvider {
+    /// Provedor local para desenvolvimento ou testes.
     Local,
+    /// Endpoint externo compatível com a API `OpenAI`.
     OpenAiCompatible,
 }
 
@@ -44,23 +51,37 @@ impl FromStr for ModelProvider {
     }
 }
 
+/// Configuração completa validada antes de iniciar o runtime.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppConfig {
+    /// Ambiente que determina os requisitos de segurança aplicados.
     pub environment: Environment,
+    /// Caminho do banco SQLite operacional.
     pub database: PathBuf,
+    /// Caminho do manifesto de skills confiável.
     pub skills_file: PathBuf,
+    /// Tenant padrão do processo.
     pub tenant_id: TenantId,
+    /// Principal host-side usado pelo processo.
     pub principal: Principal,
+    /// Provedor de modelo selecionado.
     pub model_provider: ModelProvider,
+    /// Endpoint do provedor de modelo.
     pub model_endpoint: Url,
+    /// Nome do modelo solicitado.
     pub model_name: String,
+    /// Chave de API; não deve ser incluída em sumários públicos ou logs.
     pub api_key: Option<String>,
+    /// Indica que uma execução live foi solicitada.
     pub live_requested: bool,
+    /// Confirmação explícita exigida para execução live em produção.
     pub live_confirmation: bool,
+    /// Indica que a auditoria é obrigatória para o runtime.
     pub audit_required: bool,
 }
 
 impl AppConfig {
+    /// Valida invariantes de ambiente, modelo, endpoint, auditoria e execução live.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.model_name.trim().is_empty() || self.model_name.len() > 256 {
             return Err(ConfigError::InvalidValue("model_name".to_owned()));
@@ -104,6 +125,7 @@ impl AppConfig {
         Ok(())
     }
 
+    /// Constrói e valida uma configuração a partir de valores textuais externos.
     #[allow(clippy::too_many_arguments)]
     pub fn from_values(
         environment: &str,
@@ -150,6 +172,7 @@ impl AppConfig {
         Ok(config)
     }
 
+    /// Produz um resumo operacional que informa apenas se a chave está configurada.
     #[must_use]
     pub fn public_summary(&self) -> ConfigSummary {
         ConfigSummary {
@@ -168,22 +191,35 @@ impl AppConfig {
     }
 }
 
+/// Resumo seguro da configuração para diagnóstico e observabilidade.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct ConfigSummary {
+    /// Ambiente ativo.
     pub environment: Environment,
+    /// Tenant selecionado.
     pub tenant_id: TenantId,
+    /// Operador selecionado.
     pub operator_id: OperatorId,
+    /// Papel resolvido do operador.
     pub role: Role,
+    /// Provedor de modelo selecionado.
     pub model_provider: ModelProvider,
+    /// Endpoint configurado, sem o segredo da chave.
     pub model_endpoint: Url,
+    /// Nome do modelo configurado.
     pub model_name: String,
+    /// Indica apenas a presença de uma chave, sem expor seu valor.
     pub api_key_configured: bool,
+    /// Indica se o modo live foi solicitado.
     pub live_requested: bool,
+    /// Indica se a confirmação live foi fornecida.
     pub live_confirmation: bool,
+    /// Indica se a auditoria permanece obrigatória.
     pub audit_required: bool,
 }
 
+/// Converte a representação textual de um papel em um papel host-side.
 pub fn parse_role(value: &str) -> Result<Role, ConfigError> {
     match value.to_ascii_lowercase().as_str() {
         "operator" => Ok(Role::Operator),
@@ -193,28 +229,40 @@ pub fn parse_role(value: &str) -> Result<Role, ConfigError> {
     }
 }
 
+/// Falhas de parsing e de validação de configuração.
 #[derive(Debug, Error)]
 pub enum ConfigError {
+    /// Ambiente textual desconhecido.
     #[error("ambiente inválido: {0}")]
     InvalidEnvironment(String),
+    /// Provedor textual desconhecido.
     #[error("provedor inválido: {0}")]
     InvalidProvider(String),
+    /// Papel textual desconhecido.
     #[error("papel inválido: {0}")]
     InvalidRole(String),
+    /// Endpoint que não pôde ser interpretado como URL.
     #[error("endpoint inválido: {0}")]
     InvalidEndpoint(String),
+    /// Campo de configuração vazio, excessivo ou incompatível.
     #[error("valor inválido: {0}")]
     InvalidValue(String),
+    /// Produção não pode usar o provedor local.
     #[error("configuração de produção exige um provedor externo")]
     ProductionRequiresExternalModel,
+    /// Produção exige uma chave de API não vazia.
     #[error("configuração de produção exige chave de API")]
     ProductionRequiresApiKey,
+    /// Produção exige endpoint HTTPS.
     #[error("configuração de produção exige endpoint HTTPS")]
     ProductionRequiresHttps,
+    /// O modo live exige confirmação explícita de implantação.
     #[error("modo live exige uma implantação explícita fora do ambiente production lockado")]
     LiveModeRequiresExplicitDeployment,
+    /// O principal não possui a ação requerida.
     #[error("principal não autorizado para a ação: {0:?}")]
     Unauthorized(Action),
+    /// Violação de contrato compartilhado do núcleo.
     #[error("erro de núcleo: {0}")]
     Core(#[from] CoreError),
 }

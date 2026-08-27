@@ -4,6 +4,11 @@ Todas as mudanças relevantes do Shaka serão registradas neste arquivo. O forma
 
 ## [Unreleased]
 
+### Documentação e validação
+
+- Consolidado o status dos BR-01 a BR-06 em [`docs/BACKLOG_STATUS.md`](docs/BACKLOG_STATUS.md), com evidências pré/pós, limites residuais e referência ao merge commit validado.
+- Atualizada a estratégia de testes e o runbook para refletir o executor repository-first, os probes de lifecycle/crash-recovery e a validação equivalente em CI, sandbox e VM.
+
 ### Planejado
 
 - Busca semântica com embeddings e recuperação híbrida.
