@@ -1851,6 +1851,15 @@ impl QueueStore {
         Ok(u64::try_from(count).unwrap_or(0))
     }
 
+    /// Executa `PRAGMA integrity_check` no banco SQLite atualmente aberto.
+    pub fn verify_integrity(&self) -> Result<bool, QueueError> {
+        let result: String =
+            self.connection
+                .lock()
+                .query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+        Ok(result.eq_ignore_ascii_case("ok"))
+    }
+
     /// Carrega o circuito nomeado, criando um snapshot fechado se necessário.
     pub fn load_circuit(&self, name: &str) -> Result<CircuitSnapshot, QueueError> {
         validate_key(name, "circuit name", 128)?;

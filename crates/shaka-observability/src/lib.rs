@@ -7,7 +7,7 @@
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use shaka_core::{AuditEvent, TaskId, TenantId, redact_sensitive};
-use shaka_memory::{MemoryError, MemoryStore};
+use shaka_memory::{AuditVerification, MemoryError, MemoryStore};
 use std::{collections::BTreeMap, sync::Arc};
 use thiserror::Error;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
@@ -610,6 +610,19 @@ impl AuditLogger {
         let event = AuditEvent::new(task_id, tenant_id, actor, action, outcome, metadata, None);
         let chained = self.memory.append_audit_event(&event)?;
         Ok(chained)
+    }
+
+    /// Verifica a integridade do banco de memória atualmente aberto.
+    pub fn verify_integrity(&self) -> Result<bool, MemoryError> {
+        self.memory.verify_integrity()
+    }
+
+    /// Verifica a cadeia de auditoria do tenant sem alterar o estado persistido.
+    pub fn verify_audit_chain(
+        &self,
+        tenant_id: &TenantId,
+    ) -> Result<AuditVerification, MemoryError> {
+        self.memory.verify_audit_chain(tenant_id)
     }
 
     /// Registra metadata JSON legada como campo textual.

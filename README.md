@@ -123,11 +123,18 @@ Consulte o health check:
 curl --fail --silent http://127.0.0.1:8080/healthz
 ```
 
-A resposta esperada apresenta status operacional `ok`, versão `0.8.2` e circuito `closed`. Os endpoints principais e os endpoints de planos estão descritos em [`docs/API_PUBLICA.md`](docs/API_PUBLICA.md).
+A resposta esperada apresenta status operacional `ok`, versão `0.8.2` e circuito `closed`. Antes de aceitar operação, consulte também `/readyz`, que verifica integridade, cadeia de auditoria e circuito. Os endpoints principais e os endpoints de planos estão descritos em [`docs/API_PUBLICA.md`](docs/API_PUBLICA.md).
+
+```bash
+curl --fail --silent http://127.0.0.1:8080/readyz
+```
+
+Em loopback sem `SHAKA_API_KEY`, a política local usa o principal local; um bind não local exige bearer válido. O readiness retorna `200` com `status: "ready"` somente quando os sinais estão prontos e `503` com `status: "failed"` quando o processo está vivo, mas não apto a operar.
 
 | Método | Endpoint | Finalidade |
 |---|---|---|
-| `GET` | `/healthz` | Saúde, versão, fila e circuito |
+| `GET` | `/healthz` | Saúde pública mínima: versão, fila e circuito |
+| `GET` | `/readyz` | Readiness protegido: integridade, auditoria, fila e circuito |
 | `POST` | `/v1/sessions` | Criar sessão |
 | `GET` | `/v1/sessions/{session_id}` | Consultar sessão |
 | `POST` | `/v1/sessions/{session_id}/tasks` | Enfileirar tarefa |

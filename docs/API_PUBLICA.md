@@ -73,6 +73,42 @@ Resposta conceitual:
 
 O campo `version` é derivado da versão do pacote compilado. O circuito pode aparecer como `closed`, `open` ou `half_open`; `open` significa que novas chamadas ao runtime devem permanecer bloqueadas até a política de recuperação permitir uma sonda.
 
+### Readiness operacional protegido
+
+O endpoint de prontidão separa processo vivo de serviço apto a operar. Ele reutiliza a autenticação bearer já existente e executa apenas verificações read-only do banco da fila, do store de auditoria, da cadeia de auditoria do tenant autenticado e do circuito:
+
+```http
+GET /readyz
+Authorization: Bearer <token>
+```
+
+Em modo local de loopback sem `SHAKA_API_KEY`, a política existente aceita o principal local sem header. Em bind não local, é obrigatório fornecer uma chave estática ou token IAM válido. Um bearer inválido é rejeitado com `401 Unauthorized`.
+
+Resposta pronta:
+
+```json
+{
+  "status": "ready",
+  "version": "0.8.2",
+  "database_integrity": true,
+  "audit_chain": {
+    "valid": true,
+    "checked_events": 0,
+    "failure_at": null
+  },
+  "queued_tasks": 0,
+  "circuit": {
+    "name": "agent-runtime",
+    "state": "closed",
+    "failure_count": 0,
+    "opened_at": null,
+    "next_probe_at": null
+  }
+}
+```
+
+O endpoint retorna `200 OK` somente quando a integridade, a cadeia de auditoria e o circuito estão prontos. Se qualquer sinal verificável não estiver pronto, retorna `503 Service Unavailable` com `status: "failed"`; falhas de acesso ao store retornam o erro interno sanitizado. O readiness não cria sessão, não enfileira tarefa, não executa ferramenta e não expõe conteúdo de negócio.
+
 ## 4. Sessões
 
 Sessões agrupam tarefas para um principal e tenant. A sessão não concede autoridade adicional; ela apenas fornece um contexto persistente para submissões e consultas.

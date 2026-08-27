@@ -107,11 +107,22 @@ O health check pode ser consultado com:
 curl --fail --silent http://127.0.0.1:8080/healthz
 ```
 
-A resposta esperada contém `status: "ok"`, `version: "0.8.2"` e circuito `closed`. A lista completa dos endpoints, incluindo o Plan Engine, está em [`docs/API_PUBLICA.md`](docs/API_PUBLICA.md). Os endpoints principais são:
+A resposta esperada contém `status: "ok"`, `version: "0.8.2"` e circuito `closed`. A lista completa dos endpoints, incluindo o Plan Engine, está em [`docs/API_PUBLICA.md`](docs/API_PUBLICA.md).
+
+Use também o readiness operacional antes de encaminhar tráfego ou aceitar uma operação administrativa:
+
+```bash
+curl --fail --silent http://127.0.0.1:8080/readyz
+```
+
+Em loopback sem `SHAKA_API_KEY`, a política local usa o principal local. Em bind não local, envie `Authorization: Bearer <token>` com uma credencial válida. O readiness verifica a integridade dos stores, a cadeia de auditoria do tenant autenticado, a fila e o circuito. `200 OK` com `status: "ready"` significa que os sinais estão prontos; `503 Service Unavailable` com `status: "failed"` significa que o processo está vivo, mas não deve receber operação até a causa ser investigada. Um bearer inválido retorna `401 Unauthorized`.
+
+Os endpoints principais são:
 
 | Endpoint | Finalidade |
 |---|---|
-| `GET /healthz` | Saúde, versão, fila e circuito |
+| `GET /healthz` | Saúde pública mínima: versão, fila e circuito |
+| `GET /readyz` | Readiness protegido: integridade, auditoria, fila e circuito |
 | `POST /v1/sessions` | Criar sessão local |
 | `GET /v1/sessions/{session_id}` | Consultar sessão |
 | `POST /v1/sessions/{session_id}/tasks` | Enfileirar tarefa |

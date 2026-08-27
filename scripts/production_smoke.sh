@@ -84,8 +84,8 @@ assert audit["valid"] is True and audit["checked_events"] >= 5
 assert doctor["status"] == "ready"
 assert sandbox["exit_code"] == 42
 assert health["status"] == "ok"
-
 def request(path, method="GET", payload=None, headers=None):
+
     data = None if payload is None else json.dumps(payload).encode()
     request_headers = {"content-type": "application/json"}
     request_headers.update(headers or {})
@@ -100,6 +100,16 @@ def request(path, method="GET", payload=None, headers=None):
             return response.status, json.loads(response.read())
     except urllib.error.HTTPError as error:
         return error.code, json.loads(error.read())
+
+status, readiness = request("/readyz")
+assert status == 200
+assert readiness["status"] == "ready"
+assert readiness["database_integrity"] is True
+assert readiness["audit_chain"]["valid"] is True
+status, denied_readiness = request(
+    "/readyz", headers={"Authorization": "Bearer invalid-token"}
+)
+assert status == 401 and "error" in denied_readiness
 
 iam_headers = {"Authorization": f"Bearer {token['token']}"}
 status, iam_session = request(
