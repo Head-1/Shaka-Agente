@@ -26,7 +26,7 @@ use shaka_observability::{AuditLogger, CorrelationContext, Telemetry};
 use shaka_orchestrator::{AgentRuntime, CancellationToken, OrchestratorError};
 use shaka_queue::{
     AuthSource, AuthenticatedPrincipal, CircuitBreaker, CircuitConfig, CircuitSnapshot,
-    FinishOutcome, LeaseToken, PlanApprovalOutcome, PlanCheckpoint, PlanClaimContext,
+    CircuitState, FinishOutcome, LeaseToken, PlanApprovalOutcome, PlanCheckpoint, PlanClaimContext,
     PlanInspectionIssue, PlanInspectionReport, PlanInspectionStatus, PlanResolutionDecision,
     PlanResolutionOutcome, PlanTaskReference, QueueError, QueueStore, SessionRecord, SubmitOutcome,
     TaskRecord, TaskStatus,
@@ -323,6 +323,7 @@ impl ApiState {
     pub fn router(&self) -> Router {
         Router::new()
             .route("/healthz", get(healthz))
+            .route("/readyz", get(readyz))
             .route("/v1/sessions", post(create_session))
             .route("/v1/sessions/{session_id}", get(get_session))
             .route("/v1/sessions/{session_id}/tasks", post(submit_task))
@@ -625,6 +626,16 @@ struct HealthResponse {
     circuit: CircuitSnapshot,
 }
 
+#[derive(Debug, Serialize)]
+struct ReadinessResponse {
+    status: &'static str,
+    version: &'static str,
+    database_integrity: bool,
+    audit_chain: shaka_memory::AuditVerification,
+    queued_tasks: u64,
+    circuit: CircuitSnapshot,
+}
+
 async fn healthz(State(state): State<ApiState>) -> Result<Json<HealthResponse>, ApiError> {
     let span = state
         .telemetry
@@ -637,6 +648,54 @@ async fn healthz(State(state): State<ApiState>) -> Result<Json<HealthResponse>, 
         queued_tasks,
         circuit: state.breaker.snapshot(),
     }))
+}
+
+async fn readyz(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, Json<ReadinessResponse>), ApiError> {
+    let span = state
+        .telemetry
+        .operation_span("api.readyz", &active_correlation().unwrap_or_default());
+    let _entered = span.enter();
+    let auth = authorize(&headers, &state)?;
+    let queue_integrity = state.queue.verify_integrity()?;
+    let audit_integrity = state.audit.verify_integrity().map_err(|error| {
+        warn!(
+            ?error,
+            "não foi possível verificar a integridade do store de auditoria"
+        );
+        ApiError::Internal
+    })?;
+    let audit_chain = state
+        .audit
+        .verify_audit_chain(&auth.principal.tenant_id)
+        .map_err(|error| {
+            warn!(?error, "não foi possível verificar a cadeia de auditoria");
+            ApiError::Internal
+        })?;
+    let queued_tasks = state.queue.queued_count()?;
+    let circuit = state.breaker.snapshot();
+    let database_integrity = queue_integrity && audit_integrity;
+    let ready =
+        database_integrity && audit_chain.valid && matches!(circuit.state, CircuitState::Closed);
+    let status = if ready { "ready" } else { "failed" };
+    let http_status = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    Ok((
+        http_status,
+        Json(ReadinessResponse {
+            status,
+            version: env!("CARGO_PKG_VERSION"),
+            database_integrity,
+            audit_chain,
+            queued_tasks,
+            circuit,
+        }),
+    ))
 }
 
 fn plan_detail(
@@ -2334,6 +2393,107 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn readiness_reports_operational_state_and_rejects_invalid_bearer() {
+        let state = state();
+        let response = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/readyz")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1_048_576)
+            .await
+            .unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["status"], "ready");
+        assert_eq!(payload["database_integrity"], true);
+        assert_eq!(payload["audit_chain"]["valid"], true);
+
+        let response = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/readyz")
+                    .header("authorization", "Bearer invalid-token")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn readiness_requires_bearer_when_api_key_is_configured() {
+        let base = state();
+        let configured = ApiState::new(
+            base.queue.clone(),
+            base.runtime.clone(),
+            base.audit.clone(),
+            base.principal.clone(),
+            ApiConfig {
+                api_key: Some("static-readiness-key".to_owned()),
+                ..ApiConfig::default()
+            },
+        )
+        .unwrap();
+        let response = configured
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/readyz")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = configured
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/readyz")
+                    .header("authorization", "Bearer static-readiness-key")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn readiness_fails_closed_when_circuit_is_open() {
+        let state = state();
+        for _ in 0..3 {
+            state.breaker.record_failure(Utc::now()).unwrap();
+        }
+        let response = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/readyz")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), 1_048_576)
+            .await
+            .unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["status"], "failed");
+        assert_eq!(payload["circuit"]["state"], "open");
     }
 
     #[tokio::test]

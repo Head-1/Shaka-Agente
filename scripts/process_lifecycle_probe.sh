@@ -68,9 +68,10 @@ crash_server() {
   echo "sigkill_status=$status"
 }
 
-wait_health() {
+wait_readiness() {
   for _ in $(seq 1 50); do
-    if curl --fail --silent "http://127.0.0.1:${PORT}/healthz" > "$TMP/health.json"; then
+    if curl --fail --silent "http://127.0.0.1:${PORT}/healthz" > "$TMP/health.json" \
+      && curl --fail --silent "http://127.0.0.1:${PORT}/readyz" > "$TMP/readiness.json"; then
       return 0
     fi
     sleep 0.1
@@ -88,19 +89,23 @@ start_server() {
     serve --bind "127.0.0.1:${PORT}" --workers 1 \
     > "$TMP/api-${1}.log" 2>&1 &
   API_PID=$!
-  if ! wait_health; then
+  if ! wait_readiness; then
     cat "$TMP/api-${1}.log" >&2
     return 1
   fi
-  python3 - "$TMP/health.json" <<'PY'
+  python3 - "$TMP/health.json" "$TMP/readiness.json" <<'PY'
 import json
 import pathlib
 import sys
 
 health = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+readiness = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
 assert health["status"] == "ok"
 assert health["circuit"]["state"] == "closed"
-print(json.dumps({"status": health["status"], "circuit": health["circuit"]}, ensure_ascii=False))
+assert readiness["status"] == "ready"
+assert readiness["database_integrity"] is True
+assert readiness["audit_chain"]["valid"] is True
+print(json.dumps({"health": health, "readiness": readiness}, ensure_ascii=False))
 PY
 }
 
