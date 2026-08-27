@@ -2,7 +2,7 @@
 
 O Shaka é um agente de IA **extensível, auditável e governado pelo operador**, implementado em Rust. A arquitetura prioriza contratos tipados, execução mediada pelo host, memória persistente, rastreabilidade e uma fronteira segura para capacidades dinâmicas.
 
-> **Estado atual:** a release estável mais recente é a [**v0.8.2**](https://github.com/Head-1/Shaka-Agente/releases/tag/v0.8.2), validada para operação local controlada em `dry-run`. A API HTTP usa loopback por padrão; planos `live`, mensageria externa, pesquisa autônoma na web, autopromoção de skills e controle irrestrito de subagentes permanecem fora dos limites desta versão.
+> **Estado atual:** a release estável mais recente é a [**v0.8.2**](https://github.com/Head-1/Shaka-Agente/releases/tag/v0.8.2), validada para operação local controlada em `dry-run`. A `main` corrente está no merge commit [`445bc65`](https://github.com/Head-1/Shaka-Agente/commit/445bc65553e8bdce305a24b4822bc36d16187ce9), com BR-01 a BR-06 corrigidos, cobertos e validados em CI, sandbox e VM. A API HTTP usa loopback por padrão; planos `live`, mensageria externa, pesquisa autônoma na web, autopromoção de skills e controle irrestrito de subagentes permanecem fora dos limites desta versão.
 
 ## O que a v0.8.2 entrega
 
@@ -30,7 +30,7 @@ A v0.8.2 mantém a base do **Plan Engine governado** e adiciona uma cadeia de pu
 | Autopromoção e autoevolução | Proibidas por governança |
 | Subagentes irrestritos | Fora do escopo |
 
-O histórico detalhado está em [`CHANGELOG.md`](CHANGELOG.md). O procedimento de operação sem conhecimento interno de Rust está em [`RUNBOOK_OPERACIONAL.md`](RUNBOOK_OPERACIONAL.md), o contrato HTTP e Rust público está em [`docs/API_PUBLICA.md`](docs/API_PUBLICA.md), e as evidências da validação pós-release estão em [`ETAPA9_VALIDACAO_POS_RELEASE.md`](ETAPA9_VALIDACAO_POS_RELEASE.md).
+O histórico detalhado está em [`CHANGELOG.md`](CHANGELOG.md). O status corrente de confiabilidade está em [`docs/BACKLOG_STATUS.md`](docs/BACKLOG_STATUS.md). O procedimento de operação sem conhecimento interno de Rust está em [`RUNBOOK_OPERACIONAL.md`](RUNBOOK_OPERACIONAL.md), a validação reproduzível do repositório está em [`docs/VALIDACAO_REPOSITORY_FIRST.md`](docs/VALIDACAO_REPOSITORY_FIRST.md), o contrato HTTP e Rust público está em [`docs/API_PUBLICA.md`](docs/API_PUBLICA.md), e as evidências da validação pós-release estão em [`ETAPA9_VALIDACAO_POS_RELEASE.md`](ETAPA9_VALIDACAO_POS_RELEASE.md).
 
 ## Modelo de segurança
 
@@ -234,7 +234,7 @@ git switch -c docs/minha-alteracao
 git diff --check
 ```
 
-Commits devem ser GPG assinados. A criação de tags, releases e merges deve ocorrer somente após revisão dos gates e confirmação apropriada.
+Commits devem ser assinados conforme a chave de assinatura configurada no repositório e verificados antes da publicação. A criação de tags, releases e merges deve ocorrer somente após revisão dos gates e confirmação apropriada.
 
 ## Produção candidata e limitações
 
