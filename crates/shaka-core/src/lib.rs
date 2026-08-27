@@ -243,11 +243,16 @@ pub const MAX_EXECUTION_ELAPSED_MS: u64 = 300_000;
 /// Limite superior de custo contabilizado, em microunits.
 pub const MAX_EXECUTION_COST_MICROUNITS: u64 = 10_000_000;
 
+/// Limites máximos de recursos para uma execução de tarefa ou plano.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExecutionBudget {
+    /// Número máximo de etapas permitidas.
     pub max_steps: u32,
+    /// Número máximo de chamadas de ferramenta permitidas.
     pub max_tool_calls: u32,
+    /// Duração máxima da execução em milissegundos.
     pub max_elapsed_ms: u64,
+    /// Custo máximo contabilizado em microunidades.
     pub max_cost_microunits: u64,
 }
 
@@ -330,6 +335,7 @@ impl TaskEnvelope {
 pub struct PlanId(pub Uuid);
 
 impl PlanId {
+    /// Gera um identificador aleatório para um plano.
     #[must_use]
     pub fn new() -> Self {
         Self(Uuid::new_v4())
@@ -347,6 +353,7 @@ impl Default for PlanId {
 pub struct PlanStepId(pub String);
 
 impl PlanStepId {
+    /// Cria um identificador de etapa após validar sua forma canônica.
     pub fn new(value: impl Into<String>) -> Result<Self, CoreError> {
         let value = value.into();
         validate_plan_key(&value, "step_id")?;
@@ -358,8 +365,10 @@ impl PlanStepId {
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanMode {
+    /// Executa somente simulações e validações sem efeitos externos.
     #[default]
     DryRun,
+    /// Permite execução ao vivo quando todas as políticas forem satisfeitas.
     Live,
 }
 
@@ -367,18 +376,24 @@ pub enum PlanMode {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanRisk {
+    /// Operação sem mutação ou efeito externo.
     ReadOnly,
+    /// Operação que altera estado local persistente.
     Mutation,
+    /// Operação que interage com sistema ou destinatário externo.
     ExternalEffect,
+    /// Operação não reversível; bloqueada pela política atual.
     Irreversible,
 }
 
 impl PlanRisk {
+    /// Informa se o risco exige aprovação humana antes da execução.
     #[must_use]
     pub const fn requires_approval(self) -> bool {
         !matches!(self, Self::ReadOnly)
     }
 
+    /// Retorna o nível mínimo de aprovação exigido pelo risco.
     #[must_use]
     pub const fn minimum_approval(self) -> PlanApprovalRequirement {
         match self {
@@ -393,12 +408,16 @@ impl PlanRisk {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanApprovalRequirement {
+    /// Nenhuma aprovação humana adicional é exigida.
     None,
+    /// Aprovação de revisor ou administrador é exigida.
     Reviewer,
+    /// Aprovação exclusiva de administrador é exigida.
     Administrator,
 }
 
 impl PlanApprovalRequirement {
+    /// Informa se um papel pode satisfazer este requisito de aprovação.
     #[must_use]
     pub const fn allows_role(self, role: &Role) -> bool {
         match self {
@@ -590,15 +609,50 @@ pub enum PlanTaskState {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum PlanCondition {
-    TaskStateIs { state: PlanTaskState },
-    StepSucceeded { step_id: PlanStepId },
-    ApprovalExists { step_id: Option<PlanStepId> },
-    CapabilityGranted { capability: Capability },
+    /// Exige que a tarefa esteja no estado especificado.
+    TaskStateIs {
+        /// Estado persistente exigido para a tarefa.
+        state: PlanTaskState,
+    },
+    /// Exige que uma etapa predecessora tenha sucesso.
+    StepSucceeded {
+        /// Identificador da etapa predecessora.
+        step_id: PlanStepId,
+    },
+    /// Exige uma aprovação global ou específica da etapa.
+    ApprovalExists {
+        /// Etapa cuja aprovação deve existir; `None` representa aprovação global.
+        step_id: Option<PlanStepId>,
+    },
+    /// Exige que uma capability tenha sido concedida ao contexto.
+    CapabilityGranted {
+        /// Capability exigida pela condição.
+        capability: Capability,
+    },
+    /// Exige que o circuit breaker esteja fechado.
     CircuitClosed,
-    BudgetRemainingAtLeast { budget: ExecutionBudget },
-    ArtifactDigestMatches { artifact: String, sha256: String },
-    IdempotencyKeyUnused { key_ref: String },
-    StateDigestMatches { sha256: String },
+    /// Exige que o budget restante seja suficiente.
+    BudgetRemainingAtLeast {
+        /// Limites mínimos restantes para prosseguir.
+        budget: ExecutionBudget,
+    },
+    /// Exige que um artefato corresponda ao hash aprovado.
+    ArtifactDigestMatches {
+        /// Identificador do artefato verificado.
+        artifact: String,
+        /// SHA-256 esperado do artefato.
+        sha256: String,
+    },
+    /// Exige que uma referência de idempotência ainda não tenha sido usada.
+    IdempotencyKeyUnused {
+        /// Referência da chave de idempotência.
+        key_ref: String,
+    },
+    /// Exige que o digest de estado corresponda ao esperado.
+    StateDigestMatches {
+        /// SHA-256 esperado do estado.
+        sha256: String,
+    },
 }
 
 impl PlanCondition {
@@ -628,10 +682,26 @@ impl PlanCondition {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum PlanAction {
-    ReadOnly { operation: String },
-    Mutation { operation: String },
-    ExecuteTool { tool_name: String },
-    ExternalEffect { operation: String },
+    /// Operação allowlisted sem mutação ou efeito externo.
+    ReadOnly {
+        /// Nome da operação somente leitura.
+        operation: String,
+    },
+    /// Operação que altera estado local.
+    Mutation {
+        /// Nome da operação mutável.
+        operation: String,
+    },
+    /// Chamada de ferramenta explicitamente registrada.
+    ExecuteTool {
+        /// Nome exato da ferramenta permitida.
+        tool_name: String,
+    },
+    /// Operação com efeito em sistema ou destinatário externo.
+    ExternalEffect {
+        /// Nome da operação externa.
+        operation: String,
+    },
 }
 
 impl PlanAction {
@@ -644,6 +714,7 @@ impl PlanAction {
         }
     }
 
+    /// Retorna o risco mínimo inerente à ação declarada.
     #[must_use]
     pub const fn minimum_risk(&self) -> PlanRisk {
         match self {
@@ -694,14 +765,23 @@ impl PlanExecutionScope {
 /// Etapa declarativa, imutável após a aprovação da revisão.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PlanStep {
+    /// Identificador estável da etapa.
     pub step_id: PlanStepId,
+    /// Etapas que precisam ser concluídas antes desta.
     pub depends_on: Vec<PlanStepId>,
+    /// Ação declarada que a etapa pode solicitar.
     pub action: PlanAction,
+    /// Condições verificadas antes da execução.
     pub preconditions: Vec<PlanCondition>,
+    /// Condições verificadas após a execução.
     pub postconditions: Vec<PlanCondition>,
+    /// Risco declarado para a etapa.
     pub risk: PlanRisk,
+    /// Aprovação mínima exigida pela etapa.
     pub approval: PlanApprovalRequirement,
+    /// Número máximo de tentativas da etapa.
     pub max_attempts: u32,
+    /// Etapa usada para compensar efeitos parciais, quando declarada.
     pub compensation_step_id: Option<PlanStepId>,
 }
 
@@ -745,36 +825,59 @@ impl PlanStep {
 /// Especificação canônica de um plano de execução.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PlanSpecInput {
+    /// Identificador do plano.
     pub plan_id: PlanId,
+    /// Tarefa à qual o plano pertence.
     pub task_id: TaskId,
+    /// Tenant proprietário do plano.
     pub tenant_id: TenantId,
+    /// Operador responsável pela proposta.
     pub operator_id: OperatorId,
+    /// Modo solicitado para a execução.
     pub mode: PlanMode,
+    /// Risco máximo declarado para o plano.
     pub risk: PlanRisk,
+    /// Aprovação mínima exigida pelo plano.
     pub approval: PlanApprovalRequirement,
+    /// Budget aplicado a todas as etapas.
     pub budget: ExecutionBudget,
+    /// Etapas declaradas na ordem de apresentação do plano.
     pub steps: Vec<PlanStep>,
 }
 
 /// Especificação canônica de um plano de execução.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PlanSpec {
+    /// Identificador do plano.
     pub plan_id: PlanId,
+    /// Tarefa à qual o plano pertence.
     pub task_id: TaskId,
+    /// Tenant proprietário do plano.
     pub tenant_id: TenantId,
+    /// Operador responsável pelo plano.
     pub operator_id: OperatorId,
+    /// Revisão monotônica do plano.
     pub revision: u32,
+    /// Modo de execução aprovado.
     pub mode: PlanMode,
+    /// Risco máximo declarado para o plano.
     pub risk: PlanRisk,
+    /// Aprovação mínima exigida pelo plano.
     pub approval: PlanApprovalRequirement,
+    /// Budget aplicado ao plano.
     pub budget: ExecutionBudget,
+    /// Etapas declarativas do plano.
     pub steps: Vec<PlanStep>,
+    /// Digest canônico usado para vincular a revisão.
     pub digest: String,
+    /// Estado persistente atual do plano.
     pub state: PlanState,
+    /// Instante de criação do plano em UTC.
     pub created_at: DateTime<Utc>,
 }
 
 impl PlanSpec {
+    /// Cria uma especificação validada e calcula seu digest inicial.
     pub fn new(input: PlanSpecInput) -> Result<Self, CoreError> {
         let mut plan = Self {
             plan_id: input.plan_id,
@@ -797,6 +900,7 @@ impl PlanSpec {
         Ok(plan)
     }
 
+    /// Valida limites, dependências, riscos e consistência estrutural do plano.
     pub fn validate_structure(&self) -> Result<(), CoreError> {
         if self.revision == 0 {
             return Err(CoreError::PlanInvalid(
