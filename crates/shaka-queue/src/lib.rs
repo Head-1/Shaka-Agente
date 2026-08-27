@@ -843,7 +843,7 @@ impl QueueStore {
                  JOIN api_users u ON u.operator_id = t.operator_id
                  JOIN api_tenants n ON n.tenant_id = u.tenant_id
                  WHERE t.token_hash = ?1 AND t.revoked_at IS NULL AND u.active = 1 AND n.active = 1
-                   AND (t.expires_at IS NULL OR t.expires_at > ?2)",
+                   AND t.expires_at > ?2",
                 params![token_hash, now.to_rfc3339()],
                 |row| {
                     Ok((
@@ -883,7 +883,7 @@ impl QueueStore {
                  JOIN api_users u ON u.operator_id = t.operator_id
                  JOIN api_tenants n ON n.tenant_id = u.tenant_id
                  WHERE t.revoked_at IS NULL AND u.active = 1 AND n.active = 1
-                   AND (t.expires_at IS NULL OR t.expires_at > ?1)
+                   AND t.expires_at > ?1
              )",
             params![Utc::now().to_rfc3339()],
             |row| row.get::<_, i64>(0),
@@ -2410,6 +2410,75 @@ mod tests {
                 .principal
                 .operator_id,
             operator
+        );
+    }
+
+    #[test]
+    fn legacy_null_expiry_token_is_rejected_fail_closed() {
+        let store = QueueStore::in_memory().unwrap();
+        let tenant = TenantId::new("tenant-iam-legacy").unwrap();
+        store.create_tenant(&tenant, "Tenant IAM Legacy").unwrap();
+        let operator = OperatorId::new("user-iam-legacy").unwrap();
+        store
+            .create_user(&operator, &tenant, &Role::Operator)
+            .unwrap();
+        let token = "shk_legacy_null_expiry";
+        store
+            .connection
+            .lock()
+            .execute(
+                "INSERT INTO api_tokens
+                 (token_id, token_hash, token_prefix, operator_id, created_at, expires_at, revoked_at, last_used_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, NULL)",
+                params![
+                    "tok_legacy_null_expiry",
+                    sha256_hex(token),
+                    "shk_legacy_",
+                    operator.0,
+                    Utc::now().to_rfc3339(),
+                ],
+            )
+            .unwrap();
+
+        match store.authenticate_token(token) {
+            Err(QueueError::Unauthorized) => {}
+            other => panic!("legacy null-expiry token was accepted: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_null_expiry_token_is_not_considered_active() {
+        let store = QueueStore::in_memory().unwrap();
+        let tenant = TenantId::new("tenant-iam-legacy-active").unwrap();
+        store
+            .create_tenant(&tenant, "Tenant IAM Legacy Active")
+            .unwrap();
+        let operator = OperatorId::new("user-iam-legacy-active").unwrap();
+        store
+            .create_user(&operator, &tenant, &Role::Operator)
+            .unwrap();
+        let token = "shk_legacy_null_expiry_active";
+        store
+            .connection
+            .lock()
+            .execute(
+                "INSERT INTO api_tokens
+                 (token_id, token_hash, token_prefix, operator_id, created_at, expires_at, revoked_at, last_used_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, NULL)",
+                params![
+                    "tok_legacy_null_expiry_active",
+                    sha256_hex(token),
+                    "shk_legacy_",
+                    operator.0,
+                    Utc::now().to_rfc3339(),
+                ],
+            )
+            .unwrap();
+
+        let active = store.has_active_tokens().unwrap();
+        assert!(
+            !active,
+            "legacy null-expiry token was counted as active: {active}"
         );
     }
 
