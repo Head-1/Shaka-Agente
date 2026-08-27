@@ -11,60 +11,94 @@ use std::{path::Path, time::Duration as StdDuration};
 use thiserror::Error;
 use uuid::Uuid;
 
+/// Erros de persistência, validação e integridade da memória.
 #[derive(Debug, Error)]
 pub enum MemoryError {
+    /// Falha de leitura ou escrita no SQLite.
     #[error("erro SQLite: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    /// Falha de acesso ao filesystem durante backup ou restauração.
     #[error("erro de filesystem: {0}")]
     Io(String),
+    /// Falha ao serializar ou desserializar um registro.
     #[error("erro de serialização: {0}")]
     Serialization(#[from] serde_json::Error),
+    /// Registro solicitado que não existe no tenant consultado.
     #[error("registro não encontrado: {0}")]
     NotFound(String),
+    /// Período de retenção que não respeita a política permitida.
     #[error("retenção inválida: {0}")]
     InvalidRetention(String),
+    /// Registro persistido que não pôde ser interpretado com segurança.
     #[error("registro episódico inválido: {0}")]
     InvalidRecord(String),
 }
 
+/// Registro episódico associado a uma execução observada pelo tenant.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EpisodicRecord {
+    /// Identificador único do episódio.
     pub id: Uuid,
+    /// Tenant proprietário do episódio.
     pub tenant_id: TenantId,
+    /// Tarefa de origem, quando o episódio veio de uma execução.
     pub task_id: Option<TaskId>,
+    /// Classificação operacional do episódio.
     pub kind: String,
+    /// Conteúdo persistido do episódio.
     pub content: String,
+    /// Resultado observado da execução.
     pub outcome: String,
+    /// Custo contabilizado em microunidades.
     pub cost_microunits: u64,
+    /// Tempo decorrido da execução em milissegundos.
     pub elapsed_ms: u64,
+    /// Instante de criação em UTC.
     pub created_at: DateTime<Utc>,
 }
 
+/// Registro semântico consolidado a partir de memória episódica.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SemanticRecord {
+    /// Identificador único do conhecimento consolidado.
     pub id: Uuid,
+    /// Tenant proprietário do registro semântico.
     pub tenant_id: TenantId,
+    /// Título de apresentação ou busca do conhecimento.
     pub title: String,
+    /// Conteúdo consolidado.
     pub content: String,
+    /// Episódio que originou o registro, quando conhecido.
     pub source_episode_id: Option<Uuid>,
+    /// Versão lógica do registro semântico.
     pub version: u32,
+    /// Instante de criação em UTC.
     pub created_at: DateTime<Utc>,
 }
 
+/// Resultado da verificação da cadeia de auditoria de um tenant.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AuditVerification {
+    /// Indica se todos os eventos verificados mantêm a cadeia válida.
     pub valid: bool,
+    /// Quantidade de eventos examinados até o resultado.
     pub checked_events: u64,
+    /// Identificador do primeiro evento inválido, quando encontrado.
     pub failure_at: Option<String>,
 }
 
+/// Item temporário de working memory com expiração explícita.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkingMemoryItem {
+    /// Chave do item dentro da tarefa.
     pub key: String,
+    /// Valor textual armazenado.
     pub value: String,
+    /// Instante a partir do qual o item não é mais retornado.
     pub expires_at: DateTime<Utc>,
 }
 
+/// Store SQLite para memória episódica, semântica, temporária e auditoria.
 #[derive(Debug)]
 pub struct MemoryStore {
     connection: parking_lot::Mutex<Connection>,
@@ -81,6 +115,7 @@ fn restrict_file_permissions(path: impl AsRef<Path>) -> Result<(), MemoryError> 
 }
 
 impl MemoryStore {
+    /// Abre ou cria um banco SQLite persistente e aplica seu schema idempotente.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, MemoryError> {
         let connection = Connection::open(path)?;
         connection.busy_timeout(StdDuration::from_secs(5))?;
@@ -91,6 +126,7 @@ impl MemoryStore {
         Ok(store)
     }
 
+    /// Cria um store SQLite efêmero, destinado a testes e validações locais.
     pub fn in_memory() -> Result<Self, MemoryError> {
         let connection = Connection::open_in_memory()?;
         connection.busy_timeout(StdDuration::from_secs(5))?;
@@ -153,6 +189,7 @@ impl MemoryStore {
         Ok(())
     }
 
+    /// Persiste um episódio pertencente ao tenant do próprio registro.
     pub fn append_episode(&self, record: &EpisodicRecord) -> Result<(), MemoryError> {
         self.connection.lock().execute(
             "INSERT INTO episodic_memory
@@ -173,6 +210,7 @@ impl MemoryStore {
         Ok(())
     }
 
+    /// Retorna os episódios mais recentes isolados pelo tenant e limitados por quantidade.
     pub fn recent_episodes(
         &self,
         tenant_id: &TenantId,
@@ -216,6 +254,7 @@ impl MemoryStore {
         Ok(episodes)
     }
 
+    /// Insere ou substitui um item de working memory no escopo tenant/tarefa.
     pub fn put_working(
         &self,
         tenant_id: &TenantId,
@@ -237,6 +276,7 @@ impl MemoryStore {
         Ok(())
     }
 
+    /// Carrega um item de working memory somente enquanto ele não expirou.
     pub fn get_working(
         &self,
         tenant_id: &TenantId,
@@ -269,6 +309,7 @@ impl MemoryStore {
             .transpose()
     }
 
+    /// Consolida um episódio existente do tenant em um registro semântico.
     pub fn consolidate_episode(
         &self,
         tenant_id: &TenantId,
@@ -313,6 +354,7 @@ impl MemoryStore {
         Ok(record)
     }
 
+    /// Remove episódios do tenant anteriores ao período de retenção informado.
     pub fn purge_older_than(
         &self,
         tenant_id: &TenantId,
@@ -331,6 +373,7 @@ impl MemoryStore {
         Ok(deleted)
     }
 
+    /// Acrescenta um evento à cadeia de auditoria do tenant em transação imediata.
     pub fn append_audit_event(&self, event: &AuditEvent) -> Result<AuditEvent, MemoryError> {
         let mut connection = self.connection.lock();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -359,6 +402,7 @@ impl MemoryStore {
         Ok(chained)
     }
 
+    /// Verifica a cadeia de auditoria na ordem estrutural de commit do tenant.
     pub fn verify_audit_chain(
         &self,
         tenant_id: &TenantId,
@@ -397,6 +441,7 @@ impl MemoryStore {
         })
     }
 
+    /// Executa `PRAGMA integrity_check` no banco atualmente aberto.
     pub fn verify_integrity(&self) -> Result<bool, MemoryError> {
         let result: String =
             self.connection
@@ -405,6 +450,7 @@ impl MemoryStore {
         Ok(result.eq_ignore_ascii_case("ok"))
     }
 
+    /// Cria um backup consistente no destino e restringe suas permissões em Unix.
     pub fn backup_to(&self, destination: impl AsRef<Path>) -> Result<(), MemoryError> {
         let destination = destination.as_ref();
         if let Some(parent) = destination.parent() {
@@ -418,6 +464,7 @@ impl MemoryStore {
         Ok(())
     }
 
+    /// Verifica a integridade de um arquivo SQLite sem abri-lo como store ativo.
     pub fn verify_integrity_at(path: impl AsRef<Path>) -> Result<bool, MemoryError> {
         let connection = Connection::open(path)?;
         let result: String =
@@ -425,6 +472,7 @@ impl MemoryStore {
         Ok(result.eq_ignore_ascii_case("ok"))
     }
 
+    /// Restaura o store a partir de um snapshot cuja integridade foi confirmada.
     pub fn restore_from(&self, source_path: impl AsRef<Path>) -> Result<(), MemoryError> {
         if !Self::verify_integrity_at(&source_path)? {
             return Err(MemoryError::Io(
