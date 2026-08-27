@@ -1,3 +1,8 @@
+//! Probe multiprocesso da cadeia de auditoria.
+//!
+//! Coordena processos concorrentes, força a queda de um filho e verifica que
+//! a cadeia de auditoria permanece válida após a recuperação.
+
 use chrono::{DateTime, Utc};
 use shaka_core::{AuditEvent, TenantId};
 use shaka_memory::MemoryStore;

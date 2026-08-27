@@ -1,3 +1,8 @@
+//! Probe multiprocesso de recuperação da fila.
+//!
+//! Reproduz a queda de um worker após o claim e verifica que a lease expirada
+//! retorna à fila e pode ser reclamada após a reabertura do banco.
+
 use chrono::{Duration, Utc};
 use serde_json::Value;
 use shaka_core::{OperatorId, Principal, Role, TaskEnvelope, TenantId};
