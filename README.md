@@ -2,7 +2,7 @@
 
 O Shaka é um agente de IA **extensível, auditável e governado pelo operador**, implementado em Rust. A arquitetura prioriza contratos tipados, execução mediada pelo host, memória persistente, rastreabilidade e uma fronteira segura para capacidades dinâmicas.
 
-> **Estado atual:** a release estável mais recente é a [**v0.8.2**](https://github.com/Head-1/Shaka-Agente/releases/tag/v0.8.2), validada para operação local controlada em `dry-run`. A `main` corrente está no merge commit [`48eeed2`](https://github.com/Head-1/Shaka-Agente/commit/48eeed2d2ba9a9caa975d0e376d24efc467ea380), após a série de PRs #31–#38. BR-01 a BR-06 permanecem documentados como corrigidos, cobertos e validados; a série também consolidou a documentação pública dos contratos de probes, sandbox, fila, memória, configuração, runtime, skills, identidade e governança de planos. Os ciclos repository-first tiveram CI, sandbox e VM aprovados, com branches de feature preservadas. A API HTTP usa loopback por padrão; planos `live`, mensageria externa, pesquisa autônoma na web, autopromoção de skills e controle irrestrito de subagentes permanecem fora dos limites desta versão.
+> **Estado atual:** a release estável mais recente é a [**v0.8.2**](https://github.com/Head-1/Shaka-Agente/releases/tag/v0.8.2), validada para operação local controlada em `dry-run`. A `main` corrente está no merge commit [`4bf4fe75`](https://github.com/Head-1/Shaka-Agente/commit/4bf4fe75aa31a29fec71cc43d3c168a54da5e577), após a PR #47; as PRs #31–#41 permanecem como histórico integrado anterior. BR-01 a BR-06 permanecem documentados como corrigidos, cobertos e validados; a série também consolidou a documentação pública dos contratos de probes, sandbox, fila, memória, configuração, runtime, skills, identidade e governança de planos. Os ciclos repository-first tiveram CI, sandbox e VM aprovados, com branches de feature preservadas. A API HTTP usa loopback por padrão; planos `live`, mensageria externa, pesquisa autônoma na web, autopromoção de skills e controle irrestrito de subagentes permanecem fora dos limites desta versão.
 
 ## O que a v0.8.2 entrega
 
@@ -37,7 +37,7 @@ Para continuidade e transferência, consulte o [`documento.md`](documento.md), g
 
 ## Estado repository-first e closeout documental
 
-O estado corrente verificável do repositório é o merge commit [`48eeed2`](https://github.com/Head-1/Shaka-Agente/commit/48eeed2d2ba9a9caa975d0e376d24efc467ea380). A cadeia integrada de PRs #31–#38 é:
+O estado histórico verificável da série documental #31–#38 é o merge commit [`48eeed2`](https://github.com/Head-1/Shaka-Agente/commit/48eeed2d2ba9a9caa975d0e376d24efc467ea380). O estado corrente verificável da `main` é o merge commit [`4bf4fe75`](https://github.com/Head-1/Shaka-Agente/commit/4bf4fe75aa31a29fec71cc43d3c168a54da5e577), após a PR #47. A cadeia integrada de PRs #31–#38 é:
 
 | PR | Escopo integrado | Merge commit |
 |---|---|---|
@@ -52,7 +52,7 @@ O estado corrente verificável do repositório é o merge commit [`48eeed2`](htt
 
 Os ciclos das PRs #31–#38 foram conduzidos com branch baseada no repositório, commit de trabalho assinado quando aplicável, CI remoto, validação em sandbox e confirmação independente na VM. As branches de feature permanecem disponíveis para auditoria; nenhum efeito externo novo foi habilitado pelo closeout.
 
-No `main` final, `cargo check --workspace --locked` concluiu com sucesso. A medição documental registrou 100 avisos `missing_docs`, todos em `shaka-core`: 1 módulo, 7 structs, 53 campos de struct, 2 itens associados, 6 métodos, 4 enums e 27 variantes. Esses avisos são dívida documental conhecida e não representam falha de compilação ou de operação; qualquer redução futura deve ocorrer em lotes isolados, com escopo e validação próprios.
+No estado histórico `48eeed2`, `cargo check --workspace --locked` registrou 100 avisos `missing_docs`, todos em `shaka-core`: 1 módulo, 7 structs, 53 campos de struct, 2 itens associados, 6 métodos, 4 enums e 27 variantes. Na `main` corrente `4bf4fe75`, a coleta explícita com `-W missing_docs` não registrou avisos. O saldo de 100 permanece como evidência histórica, não como saldo atual; qualquer nova redução deve ocorrer em lotes isolados, com escopo e validação próprios.
 
 ## Modelo de segurança
 
@@ -64,7 +64,7 @@ A release v0.8.2 não é uma implantação pública pronta por si só. Exposiç�
 
 ## Requisitos locais
 
-O workspace usa Rust edition 2024 e declara Rust `1.85` como versão mínima. O CI e o workflow de release utilizam Rust/Cargo `1.98.0` para validação reprodutível.
+O workspace usa Rust edition 2024 e declara Rust `1.85` como versão mínima. A política de lints é definida no workspace e herdada pelos crates por meio de `[lints] workspace = true`; `missing_docs` está configurado como warning, não como erro. O CI e o workflow de release utilizam Rust/Cargo `1.98.0` para validação reprodutível.
 
 Para validar o código-fonte, execute:
 

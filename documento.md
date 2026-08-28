@@ -3,7 +3,7 @@
 **Finalidade:** transferir o entendimento técnico e operacional do Shaka-Agente para o próximo desenvolvedor, engenheiro de confiabilidade ou agente de IA que precise manter, validar ou evoluir o sistema.
 
 **Data de elaboração:** 2026-08-28
-**Estado de referência:** `origin/main` em `ccfeef9ec84f36a5ff37077f51d5072306ecbe03`
+**Estado de referência:** `origin/main` em `4bf4fe75aa31a29fec71cc43d3c168a54da5e577`
 **Release funcional:** `v0.8.2`
 **Autor:** Manus AI
 
@@ -40,16 +40,16 @@ A versão atual é uma **base operacional local controlada**, não uma implanta�
 O SHA de referência atual é:
 
 ```text
-ccfeef9ec84f36a5ff37077f51d5072306ecbe03
+4bf4fe75aa31a29fec71cc43d3c168a54da5e577
 ```
 
-Esse commit é o merge da PR #46, `feat(storage): enforce SQLite database quota`, que integrou a quota total do SQLite. A branch de feature continua preservada em:
+Esse commit é o estado corrente da `main`, após o merge da PR #47, que incorporou o guia de continuidade e handoff. A quota total do SQLite permanece integrada no histórico pela PR #46. A branch de feature da quota continua preservada em:
 
 ```text
 chore/p0e-sqlite-quota -> 38eea16fcbe7bd9599be65a4ed7ecdcba9540a36
 ```
 
-Alguns documentos históricos do repositório ainda apontam para o estado anterior `48eeed2` e para a série de PRs #31–#38. Isso é uma **defasagem documental conhecida**, não uma indicação de que o merge P0-E não ocorreu. Antes de atualizar esses documentos, confirme `git rev-parse origin/main`, compare o conteúdo real e faça uma alteração documental isolada. Não reescreva históricos para apagar referências antigas.
+Alguns documentos históricos do repositório ainda apontam para o estado anterior `48eeed2` e para a série de PRs #31–#38. Isso é uma **referência histórica**, não uma indicação de que os merges P0-E ou #47 não ocorreram. O inventário histórico de 100 avisos `missing_docs` pertence ao estado `48eeed2`; a coleta explícita no estado corrente `4bf4fe75` registrou zero avisos. Antes de qualquer nova atualização, confirme `git rev-parse origin/main`, compare o conteúdo real e faça uma alteração documental isolada. Não reescreva históricos para apagar referências antigas.
 
 ## 4. Arquitetura em linguagem simples
 
@@ -128,7 +128,7 @@ gh repo clone Head-1/Shaka-Agente
 cd Shaka-Agente
 git fetch origin main
 test "$(git rev-parse origin/main)" = \
-  "ccfeef9ec84f36a5ff37077f51d5072306ecbe03"
+  "4bf4fe75aa31a29fec71cc43d3c168a54da5e577"
 git switch --detach origin/main
 test -z "$(git status --porcelain)"
 ```
@@ -213,7 +213,7 @@ working_tree=clean
 port_cleanup=PASS
 ```
 
-Warnings, especialmente `missing_docs`, devem ser registrados como dívida de qualidade. Eles não podem ser promovidos silenciosamente a “falhas críticas”, mas também não devem ser esquecidos. Se a execução parar em linker, falta de espaço, dependência ausente, porta ocupada ou processo residual, classifique a causa e corrija o ambiente de forma não destrutiva antes de concluir.
+Warnings, especialmente `missing_docs`, devem ser registrados como dívida de qualidade. Eles não podem ser promovidos silenciosamente a “falhas críticas”, mas também não devem ser esquecidos. O saldo de 100 avisos foi medido historicamente no SHA `48eeed2`; no SHA corrente `4bf4fe75`, a coleta explícita com `-W missing_docs` registrou zero avisos. Toda medição deve identificar o SHA validado e ser repetida após cada lote documental. Se a execução parar em linker, falta de espaço, dependência ausente, porta ocupada ou processo residual, classifique a causa e corrija o ambiente de forma não destrutiva antes de concluir.
 
 ## 12. Validação no segundo ambiente
 
