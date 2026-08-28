@@ -84,3 +84,9 @@ Restore exige administrador e deve ser validado em cópia de trabalho. Backups l
 A atualização de Wasmtime para 47.0.3 é parte do gate de segurança. `cargo audit` deve passar sem advisories reportados. Os detalhes estão em `DEPENDENCY_SECURITY_VALIDATION.md`.
 
 As lacunas restantes não são bugs ocultos: IAM remoto, cofre de segredos, backup externo automatizado, métricas remotas, mensageria, pesquisa web, subagentes distribuídos, assinatura de artefatos e multi-tenancy forte exigem nova fase com infraestrutura e threat model próprios.
+
+## 12. Guia principal de continuidade pós-P0-E
+
+O guia didático e operacional principal para a próxima pessoa desenvolvedora ou agente de IA está em [`documento.md`](documento.md). Ele deve ser lido junto com este memorando, pois consolida o estado atual no merge commit `ccfeef9ec84f36a5ff37077f51d5072306ecbe03`, a quota total SQLite do P0-E, o protocolo repository-first, os critérios de validação nos dois ambientes e as pendências que continuam fora do escopo.
+
+O memorando permanece como resumo de onboarding e handoff. O `documento.md` é a referência ampliada para continuidade técnica, operação, segurança, persistência e preparação de novas mudanças.
