@@ -353,3 +353,24 @@ Atestações V1, mesmo assinadas por chave confiável, não são executáveis. R
 **Evidência pré/pós:** `/home/ubuntu/full-audit/p0d-oversized-episode-red.log` registra a regressão executada no baseline com `red_test_exit=101` e a escrita indevida aceita. `/home/ubuntu/full-audit/p0d-oversized-episode-green.log` registra a mesma regressão passando após a guarda. `/home/ubuntu/full-audit/p0d-memory-validation.log` registra 19 testes do crate `shaka-memory`, incluindo a fronteira exata e o estresse concorrente.
 
 **Fora do escopo:** Não foram adicionados limite total de banco, retenção automática, pool de conexões, retry cego, multi-instância, cgroup, armazenamento externo ou RPO/RTO de infraestrutura. Qualquer desses itens exige decisão e testes próprios.
+
+## ADR-034 — Quota total configurável do arquivo SQLite
+
+**Status:** Em validação no ciclo P0-E.
+
+**Contexto:** O arquivo SQLite compartilhado por `MemoryStore` e `QueueStore` configurava WAL, `busy_timeout` e o schema, mas não configurava nem verificava uma quota total. A reprodução no baseline `4131979e2ffec174dc0f5085af24ab417bd9af2c` observou `page_size=4096`, `page_count=62` e `max_page_count=4294967294`, permitindo crescimento até o limite padrão do SQLite. O limite por registro de 65.536 bytes do ADR-033 não controla o crescimento acumulado de memória episódica, fila, planos, IAM e auditoria.
+
+**Decisão:** O host aplica uma quota configurável ao arquivo SQLite por `--database-max-bytes` ou `SHAKA_DATABASE_MAX_BYTES`. O default aprovado é `268435456` bytes (256 MiB), e valores abaixo de `1048576` bytes (1 MiB) são rejeitados antes da abertura. `MemoryStore` e `QueueStore` calculam o `max_page_count` a partir do `page_size`, aplicam o limite e leem de volta o valor efetivo; divergência falha fechada. Os métodos `open` e `in_memory` mantêm o default, enquanto variantes explícitas permitem testes e configurações validadas. `SQLITE_FULL` é mapeado para um erro estável de banco cheio, sem retry cego.
+
+**Consequências:** O crescimento do arquivo SQLite fica limitado por uma política explícita e consistente em todos os caminhos da CLI. A granularidade é de página, portanto o limite efetivo é arredondado para baixo ao `page_size`. Uma escrita que atinge a quota não deve ser repetida automaticamente e não deve ser interpretada como falha transitória do modelo. O resumo seguro de configuração passa a informar `database_max_bytes`, sem incluir credenciais.
+
+**Evidência pré/pós:** `/home/ubuntu/full-audit/p0e-quota-red.log` registra a reprodução válida no baseline, com `red_test_exit=101`, porque `max_page_count=4294967294` excedia a expectativa finita do harness. Os testes permanentes adicionados em `shaka-memory`, `shaka-queue`, `shaka-config` e `shaka-cli` cobrem aplicação, reabertura, valor inválido, default, valor explícito, falha de escrita por banco cheio e ausência de linha episódica parcial. A validação verde completa será registrada após os gates locais e o ciclo repository-first.
+
+**Base técnica:** O SQLite documenta `max_page_count` como o limite máximo de páginas do arquivo, `page_count` e `page_size` como as medidas para derivar o tamanho efetivo, `SQLITE_FULL` como falha de escrita quando o banco/disco está cheio e WAL como mecanismo que usa arquivo auxiliar até checkpoints.[1] [2] [3] [4]
+
+**Fora do escopo:** Esta decisão não estabelece quota física de todo o filesystem, não limita o tamanho máximo do arquivo `-wal` durante uma janela de checkpoint, não implementa retenção automática, compactação, cgroup, pool de conexões, backend distribuído, backup externo ou RPO/RTO. Aumentar a quota em uma implantação requer decisão operacional explícita; um processo externo que edite o SQLite diretamente não está sob a fronteira governada do Shaka.
+
+[1]: https://sqlite.org/pragma.html "SQLite PRAGMA statements — max_page_count, page_count e page_size"
+[2]: https://sqlite.org/limits.html "SQLite Implementation Limits"
+[3]: https://sqlite.org/rescode.html "SQLite Result and Error Codes — SQLITE_FULL"
+[4]: https://sqlite.org/wal.html "SQLite Write-Ahead Logging"

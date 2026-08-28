@@ -178,9 +178,10 @@ impl From<QueueError> for ApiError {
             }
             QueueError::InvalidIdentifier(_)
             | QueueError::InvalidInput(_)
+            | QueueError::InvalidDatabaseQuota { .. }
             | QueueError::Core(_) => Self::BadRequest(error.to_string()),
             QueueError::LeaseLost => Self::Conflict("lease da tarefa perdida".to_owned()),
-            QueueError::Sqlite(_) | QueueError::Serialization(_) => {
+            QueueError::DatabaseFull | QueueError::Sqlite(_) | QueueError::Serialization(_) => {
                 warn!(?error, "falha persistente na API");
                 Self::Internal
             }
@@ -1703,6 +1704,7 @@ fn finish_outcome_name(outcome: &FinishOutcome) -> &'static str {
 
 fn queue_error_type(error: &QueueError) -> &'static str {
     match error {
+        QueueError::DatabaseFull => "database_full",
         QueueError::Sqlite(_) => "sqlite",
         QueueError::Serialization(_) => "serialization",
         QueueError::Core(_) => "core",
@@ -1713,6 +1715,7 @@ fn queue_error_type(error: &QueueError) -> &'static str {
         QueueError::Unauthorized => "unauthorized",
         QueueError::Forbidden => "forbidden",
         QueueError::QuotaExceeded(_) => "quota_exceeded",
+        QueueError::InvalidDatabaseQuota { .. } => "invalid_database_quota",
         QueueError::RateLimited { .. } => "rate_limited",
         QueueError::LeaseLost => "lease_lost",
     }
@@ -2306,6 +2309,11 @@ mod tests {
             }),
             "rate_limited"
         );
+        assert_eq!(queue_error_type(&QueueError::DatabaseFull), "database_full");
+        assert!(matches!(
+            ApiError::from(QueueError::DatabaseFull),
+            ApiError::Internal
+        ));
         let runtime_error = OrchestratorError::ToolExecution("secret payload".to_owned());
         assert_eq!(orchestrator_error_type(&runtime_error), "tool_execution");
         assert_ne!(orchestrator_error_type(&runtime_error), "secret payload");

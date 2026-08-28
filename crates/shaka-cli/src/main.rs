@@ -9,9 +9,9 @@ use serde_json::{Value, json};
 use shaka_api::{ApiConfig, ApiState, serve as serve_api};
 use shaka_config::{AppConfig, ModelProvider};
 use shaka_core::{
-    Action, AuditEvent, Capability, CapabilitySet, ExecutionContext, PlanApproval,
-    PlanApprovalDecision, PlanId, PlanState, PlanStepId, Principal, Role, SkillManifest,
-    SkillStatus, TaskEnvelope,
+    Action, AuditEvent, Capability, CapabilitySet, DEFAULT_DATABASE_MAX_BYTES, ExecutionContext,
+    PlanApproval, PlanApprovalDecision, PlanId, PlanState, PlanStepId, Principal, Role,
+    SkillManifest, SkillStatus, TaskEnvelope,
 };
 use shaka_memory::MemoryStore;
 use shaka_observability::{AuditLogger, init_tracing};
@@ -39,6 +39,13 @@ use std::{
 struct Cli {
     #[arg(long, default_value = "data/shaka.db", env = "SHAKA_DATABASE")]
     database: PathBuf,
+    #[arg(
+        long,
+        default_value_t = DEFAULT_DATABASE_MAX_BYTES,
+        env = "SHAKA_DATABASE_MAX_BYTES",
+        help = "quota máxima do arquivo SQLite em bytes"
+    )]
+    database_max_bytes: u64,
     #[arg(long, default_value = "data/skills.json", env = "SHAKA_SKILLS_FILE")]
     skills_file: PathBuf,
     #[arg(
@@ -296,6 +303,7 @@ fn build_config(cli: &Cli, live: bool, live_confirmation: bool) -> Result<AppCon
     Ok(AppConfig::from_values(
         &cli.environment,
         cli.database.clone(),
+        cli.database_max_bytes,
         cli.skills_file.clone(),
         &cli.tenant,
         &cli.operator,
@@ -344,7 +352,7 @@ async fn run_agent(cli: &Cli, args: &RunArgs) -> Result<()> {
         Action::RunReadOnly
     };
     authorize(&config, &action)?;
-    let memory = Arc::new(open_memory(&config.database)?);
+    let memory = Arc::new(open_memory(&config.database, config.database_max_bytes)?);
     let mut envelope = TaskEnvelope::new(
         config.tenant_id.clone(),
         config.principal.operator_id.clone(),
@@ -365,13 +373,16 @@ async fn run_agent(cli: &Cli, args: &RunArgs) -> Result<()> {
 async fn serve_agent(cli: &Cli, args: &ServeArgs) -> Result<()> {
     let config = build_config(cli, args.live, args.confirm_live)?;
     authorize(&config, &Action::RunReadOnly)?;
-    let memory = Arc::new(open_memory(&config.database)?);
+    let memory = Arc::new(open_memory(&config.database, config.database_max_bytes)?);
     let model = build_model(&config)?;
     let mut tools = build_tool_registry(cli, &config)?;
     tools.register(Arc::new(EchoTool))?;
     let runtime = Arc::new(AgentRuntime::new(model, Arc::clone(&memory), tools));
     let audit = Arc::new(AuditLogger::new(memory));
-    let queue = Arc::new(QueueStore::open(&config.database)?);
+    let queue = Arc::new(QueueStore::open_with_max_bytes(
+        &config.database,
+        config.database_max_bytes,
+    )?);
     let bind_addr: SocketAddr = args
         .bind
         .parse()
@@ -418,7 +429,7 @@ fn build_tool_registry(cli: &Cli, config: &AppConfig) -> Result<ToolRegistry> {
 
 fn memory_command(cli: &Cli, args: &MemoryArgs) -> Result<()> {
     let config = build_config(cli, false, false)?;
-    let store = open_memory(&config.database)?;
+    let store = open_memory(&config.database, config.database_max_bytes)?;
     match &args.command {
         MemoryCommand::Recent { limit } => {
             authorize(&config, &Action::RunReadOnly)?;
@@ -472,7 +483,7 @@ fn skill_command(cli: &Cli, command: &SkillCommand) -> Result<()> {
             registry.register_candidate(manifest)?;
             registry.save(&config.skills_file)?;
             append_control_audit(
-                &open_memory(&config.database)?,
+                &open_memory(&config.database, config.database_max_bytes)?,
                 &config.principal,
                 "skill.candidate",
                 "success",
@@ -544,7 +555,7 @@ fn skill_command(cli: &Cli, command: &SkillCommand) -> Result<()> {
                 metadata.insert(String::from("protocol"), attestation.protocol.clone());
             }
             append_control_audit(
-                &open_memory(&config.database)?,
+                &open_memory(&config.database, config.database_max_bytes)?,
                 &config.principal,
                 "skill.approve",
                 "success",
@@ -568,7 +579,7 @@ fn skill_command(cli: &Cli, command: &SkillCommand) -> Result<()> {
             )?;
             trust_store.save(&cli.trust_file)?;
             append_control_audit(
-                &open_memory(&config.database)?,
+                &open_memory(&config.database, config.database_max_bytes)?,
                 &config.principal,
                 "skill.trust_generate",
                 "success",
@@ -590,7 +601,7 @@ fn skill_command(cli: &Cli, command: &SkillCommand) -> Result<()> {
             )?;
             trust_store.save(&cli.trust_file)?;
             append_control_audit(
-                &open_memory(&config.database)?,
+                &open_memory(&config.database, config.database_max_bytes)?,
                 &config.principal,
                 "skill.trust_add",
                 "success",
@@ -603,7 +614,7 @@ fn skill_command(cli: &Cli, command: &SkillCommand) -> Result<()> {
             let trusted = trust_store.revoke_key(key_id)?;
             trust_store.save(&cli.trust_file)?;
             append_control_audit(
-                &open_memory(&config.database)?,
+                &open_memory(&config.database, config.database_max_bytes)?,
                 &config.principal,
                 "skill.trust_revoke",
                 "success",
@@ -620,7 +631,7 @@ fn skill_command(cli: &Cli, command: &SkillCommand) -> Result<()> {
             let record = registry.revoke(name)?;
             registry.save(&config.skills_file)?;
             append_control_audit(
-                &open_memory(&config.database)?,
+                &open_memory(&config.database, config.database_max_bytes)?,
                 &config.principal,
                 "skill.revoke",
                 "success",
@@ -635,7 +646,7 @@ fn skill_command(cli: &Cli, command: &SkillCommand) -> Result<()> {
 #[allow(clippy::too_many_lines)]
 fn plan_command(cli: &Cli, command: &PlanCommand) -> Result<()> {
     let config = build_config(cli, false, false)?;
-    let store = QueueStore::open(&config.database)?;
+    let store = QueueStore::open_with_max_bytes(&config.database, config.database_max_bytes)?;
     store.bootstrap_principal(&config.principal)?;
     match command {
         PlanCommand::Validate { plan_id } => {
@@ -648,7 +659,7 @@ fn plan_command(cli: &Cli, command: &PlanCommand) -> Result<()> {
                 "blocked"
             };
             append_control_audit(
-                &open_memory(&config.database)?,
+                &open_memory(&config.database, config.database_max_bytes)?,
                 &config.principal,
                 "plan.validate",
                 outcome,
@@ -661,7 +672,7 @@ fn plan_command(cli: &Cli, command: &PlanCommand) -> Result<()> {
             let plan_id = parse_plan_id(plan_id)?;
             let inspection = store.inspect_plan(&config.tenant_id, &plan_id)?;
             append_control_audit(
-                &open_memory(&config.database)?,
+                &open_memory(&config.database, config.database_max_bytes)?,
                 &config.principal,
                 "plan.show",
                 "success",
@@ -725,7 +736,7 @@ fn plan_command(cli: &Cli, command: &PlanCommand) -> Result<()> {
             let outcome = store.approve_plan(&config.principal, &approval, &key)?;
             let inspection = store.inspect_plan(&config.tenant_id, &plan_id)?;
             append_control_audit(
-                &open_memory(&config.database)?,
+                &open_memory(&config.database, config.database_max_bytes)?,
                 &config.principal,
                 "plan.approve",
                 "success",
@@ -761,7 +772,7 @@ fn plan_command(cli: &Cli, command: &PlanCommand) -> Result<()> {
             )?;
             let inspection = store.inspect_plan(&config.tenant_id, &plan_id)?;
             append_control_audit(
-                &open_memory(&config.database)?,
+                &open_memory(&config.database, config.database_max_bytes)?,
                 &config.principal,
                 "plan.resume",
                 "success",
@@ -794,7 +805,7 @@ fn plan_command(cli: &Cli, command: &PlanCommand) -> Result<()> {
             };
             let inspection = store.inspect_plan(&config.tenant_id, &plan_id)?;
             append_control_audit(
-                &open_memory(&config.database)?,
+                &open_memory(&config.database, config.database_max_bytes)?,
                 &config.principal,
                 "plan.cancel",
                 "success",
@@ -818,7 +829,7 @@ fn plan_command(cli: &Cli, command: &PlanCommand) -> Result<()> {
                 "invalid"
             };
             append_control_audit(
-                &open_memory(&config.database)?,
+                &open_memory(&config.database, config.database_max_bytes)?,
                 &config.principal,
                 "plan.verify",
                 outcome,
@@ -834,7 +845,7 @@ fn plan_command(cli: &Cli, command: &PlanCommand) -> Result<()> {
             let plan_id = parse_plan_id(plan_id)?;
             let checkpoints = store.list_plan_checkpoints(&config.tenant_id, &plan_id)?;
             append_control_audit(
-                &open_memory(&config.database)?,
+                &open_memory(&config.database, config.database_max_bytes)?,
                 &config.principal,
                 "plan.checkpoints",
                 "success",
@@ -864,7 +875,7 @@ fn parse_approval_decision(value: &str) -> Result<PlanApprovalDecision, String> 
 fn iam_command(cli: &Cli, command: &IamCommand) -> Result<()> {
     let config = build_config(cli, false, false)?;
     authorize(&config, &Action::ManageIam)?;
-    let queue = QueueStore::open(&config.database)?;
+    let queue = QueueStore::open_with_max_bytes(&config.database, config.database_max_bytes)?;
     queue.bootstrap_principal(&config.principal)?;
     match command {
         IamCommand::TenantCreate {
@@ -874,7 +885,7 @@ fn iam_command(cli: &Cli, command: &IamCommand) -> Result<()> {
             let tenant_id = shaka_core::TenantId::new(tenant_id.clone())?;
             let record = queue.create_tenant(&tenant_id, display_name)?;
             append_control_audit(
-                &open_memory(&config.database)?,
+                &open_memory(&config.database, config.database_max_bytes)?,
                 &config.principal,
                 "iam.tenant.create",
                 "success",
@@ -893,7 +904,7 @@ fn iam_command(cli: &Cli, command: &IamCommand) -> Result<()> {
                 parse_role(role).context("role deve ser operator, reviewer ou administrator")?;
             let record = queue.create_user(&operator_id, &tenant_id, &role)?;
             append_control_audit(
-                &open_memory(&config.database)?,
+                &open_memory(&config.database, config.database_max_bytes)?,
                 &config.principal,
                 "iam.user.create",
                 "success",
@@ -915,7 +926,7 @@ fn iam_command(cli: &Cli, command: &IamCommand) -> Result<()> {
             let expires_at = Utc::now() + Duration::seconds(*expires_in_seconds);
             let issue = queue.issue_token(&operator_id, Some(expires_at))?;
             append_control_audit(
-                &open_memory(&config.database)?,
+                &open_memory(&config.database, config.database_max_bytes)?,
                 &config.principal,
                 "iam.token.issue",
                 "success",
@@ -926,7 +937,7 @@ fn iam_command(cli: &Cli, command: &IamCommand) -> Result<()> {
         IamCommand::TokenRevoke { token_id } => {
             queue.revoke_token(token_id)?;
             append_control_audit(
-                &open_memory(&config.database)?,
+                &open_memory(&config.database, config.database_max_bytes)?,
                 &config.principal,
                 "iam.token.revoke",
                 "success",
@@ -952,7 +963,7 @@ fn iam_command(cli: &Cli, command: &IamCommand) -> Result<()> {
                 window_seconds: *window_seconds,
             })?;
             append_control_audit(
-                &open_memory(&config.database)?,
+                &open_memory(&config.database, config.database_max_bytes)?,
                 &config.principal,
                 "iam.limits.set",
                 "success",
@@ -972,7 +983,7 @@ fn doctor(cli: &Cli) -> Result<()> {
     let mut report = serde_json::Map::new();
     match config {
         Ok(config) => {
-            let store = open_memory(&config.database)?;
+            let store = open_memory(&config.database, config.database_max_bytes)?;
             let integrity = store.verify_integrity()?;
             let audit = store.verify_audit_chain(&config.tenant_id)?;
             report.insert("config_valid".to_owned(), Value::Bool(true));
@@ -1000,7 +1011,7 @@ fn doctor(cli: &Cli) -> Result<()> {
 fn backup_command(cli: &Cli, output: &Path) -> Result<()> {
     let config = build_config(cli, false, false)?;
     authorize(&config, &Action::Backup)?;
-    let store = open_memory(&config.database)?;
+    let store = open_memory(&config.database, config.database_max_bytes)?;
     if !store.verify_integrity()? {
         anyhow::bail!("a integridade do banco de origem falhou; backup bloqueado")
     }
@@ -1015,7 +1026,7 @@ fn restore_command(cli: &Cli, input: &Path) -> Result<()> {
     if !input.exists() {
         anyhow::bail!("arquivo de restore não encontrado: {}", input.display())
     }
-    let store = open_memory(&config.database)?;
+    let store = open_memory(&config.database, config.database_max_bytes)?;
     store.restore_from(input)?;
     if !store.verify_integrity()? {
         anyhow::bail!("restore concluído, mas a integridade do banco falhou")
@@ -1027,7 +1038,7 @@ fn restore_command(cli: &Cli, input: &Path) -> Result<()> {
 fn verify_audit_command(cli: &Cli) -> Result<()> {
     let config = build_config(cli, false, false)?;
     authorize(&config, &Action::VerifyAudit)?;
-    let store = open_memory(&config.database)?;
+    let store = open_memory(&config.database, config.database_max_bytes)?;
     let verification = store.verify_audit_chain(&config.tenant_id)?;
     println!("{}", serde_json::to_string_pretty(&verification)?);
     if !verification.valid {
@@ -1073,11 +1084,11 @@ fn sandbox_demo() -> Result<()> {
     Ok(())
 }
 
-fn open_memory(path: &Path) -> Result<MemoryStore> {
+fn open_memory(path: &Path, max_database_bytes: u64) -> Result<MemoryStore> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("criando {}", parent.display()))?;
     }
-    Ok(MemoryStore::open(path)?)
+    Ok(MemoryStore::open_with_max_bytes(path, max_database_bytes)?)
 }
 
 fn parse_role(value: &str) -> Option<Role> {
@@ -1161,5 +1172,18 @@ mod tests {
             PlanApprovalDecision::Rejected
         );
         assert!(parse_approval_decision("execute").is_err());
+    }
+
+    #[test]
+    fn cli_uses_default_database_quota() {
+        let cli = Cli::try_parse_from(["shaka", "config"]).unwrap();
+        assert_eq!(cli.database_max_bytes, DEFAULT_DATABASE_MAX_BYTES);
+    }
+
+    #[test]
+    fn cli_accepts_explicit_database_quota() {
+        let cli =
+            Cli::try_parse_from(["shaka", "--database-max-bytes", "1048576", "config"]).unwrap();
+        assert_eq!(cli.database_max_bytes, 1024 * 1024);
     }
 }

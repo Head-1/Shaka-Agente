@@ -1,7 +1,9 @@
 //! Configuração validada do runtime Shaka.
 
 use serde::{Deserialize, Serialize};
-use shaka_core::{Action, CoreError, OperatorId, Principal, Role, TenantId};
+use shaka_core::{
+    Action, CoreError, MIN_DATABASE_MAX_BYTES, OperatorId, Principal, Role, TenantId,
+};
 use std::{path::PathBuf, str::FromStr};
 use thiserror::Error;
 use url::Url;
@@ -58,6 +60,8 @@ pub struct AppConfig {
     pub environment: Environment,
     /// Caminho do banco SQLite operacional.
     pub database: PathBuf,
+    /// Quota máxima do arquivo SQLite operacional, em bytes.
+    pub database_max_bytes: u64,
     /// Caminho do manifesto de skills confiável.
     pub skills_file: PathBuf,
     /// Tenant padrão do processo.
@@ -83,6 +87,11 @@ pub struct AppConfig {
 impl AppConfig {
     /// Valida invariantes de ambiente, modelo, endpoint, auditoria e execução live.
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.database_max_bytes < MIN_DATABASE_MAX_BYTES {
+            return Err(ConfigError::InvalidValue(format!(
+                "database_max_bytes deve ser pelo menos {MIN_DATABASE_MAX_BYTES} bytes"
+            )));
+        }
         if self.model_name.trim().is_empty() || self.model_name.len() > 256 {
             return Err(ConfigError::InvalidValue("model_name".to_owned()));
         }
@@ -130,6 +139,7 @@ impl AppConfig {
     pub fn from_values(
         environment: &str,
         database: PathBuf,
+        database_max_bytes: u64,
         skills_file: PathBuf,
         tenant: &str,
         operator: &str,
@@ -157,6 +167,7 @@ impl AppConfig {
         let config = Self {
             environment,
             database,
+            database_max_bytes,
             skills_file,
             tenant_id,
             principal,
@@ -183,6 +194,7 @@ impl AppConfig {
             model_provider: self.model_provider.clone(),
             model_endpoint: self.model_endpoint.clone(),
             model_name: self.model_name.clone(),
+            database_max_bytes: self.database_max_bytes,
             api_key_configured: self.api_key.is_some(),
             live_requested: self.live_requested,
             live_confirmation: self.live_confirmation,
@@ -209,6 +221,8 @@ pub struct ConfigSummary {
     pub model_endpoint: Url,
     /// Nome do modelo configurado.
     pub model_name: String,
+    /// Quota máxima do arquivo SQLite operacional, em bytes.
+    pub database_max_bytes: u64,
     /// Indica apenas a presença de uma chave, sem expor seu valor.
     pub api_key_configured: bool,
     /// Indica se o modo live foi solicitado.
@@ -271,11 +285,13 @@ pub enum ConfigError {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use shaka_core::DEFAULT_DATABASE_MAX_BYTES;
 
     fn base(environment: &str) -> AppConfig {
         AppConfig::from_values(
             environment,
             PathBuf::from("data.db"),
+            DEFAULT_DATABASE_MAX_BYTES,
             PathBuf::from("skills.json"),
             "tenant",
             "operator",
@@ -297,6 +313,7 @@ mod tests {
             AppConfig::from_values(
                 "production",
                 PathBuf::from("data.db"),
+                DEFAULT_DATABASE_MAX_BYTES,
                 PathBuf::from("skills.json"),
                 "tenant",
                 "operator",
@@ -318,6 +335,7 @@ mod tests {
         let result = AppConfig::from_values(
             "development",
             PathBuf::from("data.db"),
+            DEFAULT_DATABASE_MAX_BYTES,
             PathBuf::from("skills.json"),
             "tenant",
             "operator",
@@ -340,6 +358,29 @@ mod tests {
     fn development_summary_does_not_expose_secret() {
         let mut config = base("development");
         config.api_key = Some("secret".to_owned());
-        assert!(config.public_summary().api_key_configured);
+        let summary = config.public_summary();
+        assert!(summary.api_key_configured);
+        assert_eq!(summary.database_max_bytes, DEFAULT_DATABASE_MAX_BYTES);
+    }
+
+    #[test]
+    fn database_quota_below_minimum_is_rejected() {
+        let result = AppConfig::from_values(
+            "development",
+            PathBuf::from("data.db"),
+            MIN_DATABASE_MAX_BYTES - 1,
+            PathBuf::from("skills.json"),
+            "tenant",
+            "operator",
+            "operator",
+            "local",
+            "http://localhost:1",
+            "local",
+            None,
+            false,
+            false,
+            true,
+        );
+        assert!(matches!(result, Err(ConfigError::InvalidValue(_))));
     }
 }
