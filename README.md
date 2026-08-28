@@ -33,6 +33,8 @@ A v0.8.2 mantém a base do **Plan Engine governado** e adiciona uma cadeia de pu
 
 O histórico detalhado está em [`CHANGELOG.md`](CHANGELOG.md). O status corrente de confiabilidade está em [`docs/BACKLOG_STATUS.md`](docs/BACKLOG_STATUS.md). O procedimento de operação sem conhecimento interno de Rust está em [`RUNBOOK_OPERACIONAL.md`](RUNBOOK_OPERACIONAL.md), a validação reproduzível do repositório está em [`docs/VALIDACAO_REPOSITORY_FIRST.md`](docs/VALIDACAO_REPOSITORY_FIRST.md), o contrato HTTP e Rust público está em [`docs/API_PUBLICA.md`](docs/API_PUBLICA.md), e as evidências da validação pós-release estão em [`ETAPA9_VALIDACAO_POS_RELEASE.md`](ETAPA9_VALIDACAO_POS_RELEASE.md).
 
+Para continuidade e transferência, consulte o [`documento.md`](documento.md), guia didático pós-P0-E para Devs e agentes de IA, e o [`MEMORANDO_DE_HANDOFF_ONBOARDING.md`](MEMORANDO_DE_HANDOFF_ONBOARDING.md), resumo operacional de onboarding.
+
 ## Estado repository-first e closeout documental
 
 O estado corrente verificável do repositório é o merge commit [`48eeed2`](https://github.com/Head-1/Shaka-Agente/commit/48eeed2d2ba9a9caa975d0e376d24efc467ea380). A cadeia integrada de PRs #31–#38 é:
