@@ -141,7 +141,7 @@ A string de hash precisa conter exatamente 64 caracteres hexadecimais. A justifi
 }
 ```
 
-O conteúdo deve ser resumo operacional e não deve incluir segredos. Uma implantação com dados pessoais precisa aplicar classificação, redaction, retenção e exclusão por titular.
+O conteúdo deve ser resumo operacional, não deve incluir segredos e está limitado a 65.536 bytes por episódio. A validação ocorre antes da escrita SQLite e uma entrada acima do limite retorna `invalid_input` sem criar uma linha. Uma implantação com dados pessoais precisa aplicar classificação, redaction, retenção e exclusão por titular.
 
 ## 9. SandboxPolicy e SandboxResult
 

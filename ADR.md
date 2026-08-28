@@ -339,3 +339,17 @@ Atestações V1, mesmo assinadas por chave confiável, não são executáveis. R
 
 [1]: https://sqlite.org/lang_transaction.html "SQLite Transaction — DEFERRED, IMMEDIATE e SQLITE_BUSY"
 [2]: https://sqlite.org/c3ref/busy_timeout.html "SQLite C Interface — Set A Busy Timeout"
+
+## ADR-033 — Limite de payload episódico sob SQLite
+
+**Status:** Em validação no ciclo P0-D.
+
+**Contexto:** `MemoryStore::append_episode` aceitava qualquer tamanho de `content` antes de adquirir o lock ou executar a escrita SQLite. A reprodução no baseline inseriu um único conteúdo de 65.537 bytes sem erro; em um caminho interno ou consumidor Rust, isso permitia uma escrita patológica e não havia um contrato de limite por registro. A existência de `busy_timeout` e de transações imediatas não limita o tamanho de uma entrada.
+
+**Decisão:** O host rejeita `EpisodicRecord.content` acima de 65.536 bytes, antes do lock e da escrita SQLite, com o erro tipado `PayloadTooLarge`. O limite exato é aceito. O teste permanente também exercita oito conexões concorrentes escrevendo 256 episódios bounded e verifica que todos os registros sobrevivem com integridade válida.
+
+**Consequências:** Uma única entrada não pode consumir memória e I/O desproporcionais ao contrato episódico. A rejeição não modifica o banco e não é retryable sem reduzir o payload. O limite é por registro; não representa limite total de arquivo, retenção, quota de disco ou política de RPO/RTO.
+
+**Evidência pré/pós:** `/home/ubuntu/full-audit/p0d-oversized-episode-red.log` registra a regressão executada no baseline com `red_test_exit=101` e a escrita indevida aceita. `/home/ubuntu/full-audit/p0d-oversized-episode-green.log` registra a mesma regressão passando após a guarda. `/home/ubuntu/full-audit/p0d-memory-validation.log` registra 19 testes do crate `shaka-memory`, incluindo a fronteira exata e o estresse concorrente.
+
+**Fora do escopo:** Não foram adicionados limite total de banco, retenção automática, pool de conexões, retry cego, multi-instância, cgroup, armazenamento externo ou RPO/RTO de infraestrutura. Qualquer desses itens exige decisão e testes próprios.
