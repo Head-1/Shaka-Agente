@@ -12,6 +12,7 @@ A v0.8.2 mantém a base do **Plan Engine governado** e adiciona uma cadeia de pu
 |---|---|
 | Workspace Cargo com crates separados | Implementado |
 | Memória de trabalho e episódica | Persistente em SQLite |
+| Quota do arquivo SQLite | Configurável por `SHAKA_DATABASE_MAX_BYTES`; default de 256 MiB e aplicação por `max_page_count` |
 | Provedor local determinístico | Implementado |
 | Provedor OpenAI-compatível | Adaptador opcional; credencial somente pelo ambiente/cofre |
 | Function calling | Mediado pelo host e validado por schema |
@@ -78,6 +79,8 @@ cargo clippy --workspace --all-targets --locked -- \
 ```
 
 O banco SQLite, o catálogo de skills e outros dados locais devem permanecer fora do controle de versão. Não armazene API keys, tokens IAM, backups ou dados de usuários no repositório.
+
+A quota operacional do arquivo SQLite é configurável por `--database-max-bytes` ou `SHAKA_DATABASE_MAX_BYTES`; o default é `268435456` bytes (256 MiB) e valores abaixo de 1 MiB são rejeitados antes da abertura. `QueueStore` e `MemoryStore` aplicam e verificam o mesmo limite no arquivo compartilhado. A contenção usa páginas SQLite, portanto o limite efetivo é arredondado para baixo ao tamanho de página; ele não é uma quota física de todo o filesystem, nem elimina o crescimento temporário de arquivos auxiliares do WAL durante checkpoints [1]. Uma escrita que atinge o limite falha como armazenamento cheio e não deve ser repetida cegamente [2].
 
 ## Usar a CLI a partir do código-fonte
 
@@ -206,6 +209,11 @@ cargo run -p shaka-cli -- --role administrator \
 ```
 
 Consulte o [runbook operacional](RUNBOOK_OPERACIONAL.md) para retenção, recuperação de incidentes, skills e operação do container.
+
+### Referências da quota SQLite
+
+[1]: https://sqlite.org/wal.html "SQLite Write-Ahead Logging"
+[2]: https://sqlite.org/rescode.html "SQLite Result and Error Codes"
 
 ## Skills e governança humana
 

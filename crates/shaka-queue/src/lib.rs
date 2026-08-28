@@ -10,8 +10,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use shaka_core::{
-    ExecutionContext, OperatorId, PlanExecutionScope, PlanId, PlanStep, PlanStepId, Principal,
-    Role, TaskEnvelope, TaskId, TenantId,
+    DEFAULT_DATABASE_MAX_BYTES, ExecutionContext, MIN_DATABASE_MAX_BYTES, OperatorId,
+    PlanExecutionScope, PlanId, PlanStep, PlanStepId, Principal, Role, TaskEnvelope, TaskId,
+    TenantId,
 };
 use std::sync::Arc;
 use thiserror::Error;
@@ -32,9 +33,12 @@ pub use plan_store::{
 /// decisões de bloqueio; o consumidor não deve repetir a operação cegamente.
 #[derive(Debug, Error)]
 pub enum QueueError {
-    /// Falha de leitura ou escrita no SQLite.
+    /// Falha de leitura ou escrita no SQLite que não é falta de espaço.
     #[error("erro SQLite: {0}")]
-    Sqlite(#[from] rusqlite::Error),
+    Sqlite(rusqlite::Error),
+    /// O arquivo SQLite atingiu sua quota ou o filesystem está sem espaço.
+    #[error("banco SQLite atingiu o limite de armazenamento")]
+    DatabaseFull,
     /// Falha ao serializar ou desserializar um registro persistido.
     #[error("erro de serialização: {0}")]
     Serialization(#[from] serde_json::Error),
@@ -62,6 +66,16 @@ pub enum QueueError {
     /// Limite persistente do tenant excedido.
     #[error("quota excedida: {0}")]
     QuotaExceeded(String),
+    /// Quota SQLite configurada abaixo do mínimo operacional ou incompatível com o arquivo.
+    #[error(
+        "quota SQLite inválida: requested_bytes={requested_bytes}, minimum_bytes={minimum_bytes}"
+    )]
+    InvalidDatabaseQuota {
+        /// Quota solicitada em bytes.
+        requested_bytes: u64,
+        /// Menor quota aceita pelo contrato.
+        minimum_bytes: u64,
+    },
     /// Limite temporal de requisições excedido.
     #[error("rate limit excedido; tente novamente em {retry_after_seconds}s")]
     RateLimited {
@@ -413,11 +427,62 @@ pub struct QueueStore {
     connection: Mutex<Connection>,
 }
 
+fn configure_database_quota(connection: &Connection, max_bytes: u64) -> Result<(), QueueError> {
+    if max_bytes < MIN_DATABASE_MAX_BYTES {
+        return Err(QueueError::InvalidDatabaseQuota {
+            requested_bytes: max_bytes,
+            minimum_bytes: MIN_DATABASE_MAX_BYTES,
+        });
+    }
+    let page_size: i64 = connection.pragma_query_value(None, "page_size", |row| row.get(0))?;
+    let page_size = u64::try_from(page_size).map_err(|_| QueueError::InvalidDatabaseQuota {
+        requested_bytes: max_bytes,
+        minimum_bytes: MIN_DATABASE_MAX_BYTES,
+    })?;
+    let max_pages = max_bytes / page_size;
+    if max_pages == 0 {
+        return Err(QueueError::InvalidDatabaseQuota {
+            requested_bytes: max_bytes,
+            minimum_bytes: MIN_DATABASE_MAX_BYTES,
+        });
+    }
+    let effective_pages =
+        connection.pragma_update_and_check(None, "max_page_count", max_pages, |row| {
+            row.get::<_, i64>(0)
+        })?;
+    if effective_pages != i64::try_from(max_pages).unwrap_or(i64::MAX) {
+        return Err(QueueError::InvalidDatabaseQuota {
+            requested_bytes: max_bytes,
+            minimum_bytes: MIN_DATABASE_MAX_BYTES,
+        });
+    }
+    Ok(())
+}
+
+impl From<rusqlite::Error> for QueueError {
+    fn from(error: rusqlite::Error) -> Self {
+        if error.sqlite_error_code() == Some(rusqlite::ErrorCode::DiskFull) {
+            Self::DatabaseFull
+        } else {
+            Self::Sqlite(error)
+        }
+    }
+}
+
 impl QueueStore {
-    /// Abre ou cria um banco SQLite e executa migrações idempotentes.
+    /// Abre ou cria um banco SQLite com a quota padrão e executa migrações.
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, QueueError> {
+        Self::open_with_max_bytes(path, DEFAULT_DATABASE_MAX_BYTES)
+    }
+
+    /// Abre ou cria um banco SQLite com quota explícita em bytes.
+    pub fn open_with_max_bytes(
+        path: impl AsRef<std::path::Path>,
+        max_database_bytes: u64,
+    ) -> Result<Self, QueueError> {
         let connection = Connection::open(path)?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        configure_database_quota(&connection, max_database_bytes)?;
         let store = Self {
             connection: Mutex::new(connection),
         };
@@ -425,10 +490,16 @@ impl QueueStore {
         Ok(store)
     }
 
-    /// Cria um store efêmero para testes e validações locais.
+    /// Cria um store efêmero com a quota padrão para testes e validações locais.
     pub fn in_memory() -> Result<Self, QueueError> {
+        Self::in_memory_with_max_bytes(DEFAULT_DATABASE_MAX_BYTES)
+    }
+
+    /// Cria um store efêmero com quota explícita em bytes.
+    pub fn in_memory_with_max_bytes(max_database_bytes: u64) -> Result<Self, QueueError> {
         let connection = Connection::open_in_memory()?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        configure_database_quota(&connection, max_database_bytes)?;
         let store = Self {
             connection: Mutex::new(connection),
         };
@@ -2910,6 +2981,47 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
         let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+    }
+
+    #[test]
+    fn sqlite_quota_is_applied_and_survives_reopen() {
+        let path = std::env::temp_dir().join(format!("shaka-quota-queue-{}.db", Uuid::new_v4()));
+        let max_bytes = 4 * 1024 * 1024;
+        {
+            let store = QueueStore::open_with_max_bytes(&path, max_bytes).unwrap();
+            let connection = store.connection.lock();
+            let page_size: i64 = connection
+                .pragma_query_value(None, "page_size", |row| row.get(0))
+                .unwrap();
+            let max_page_count: i64 = connection
+                .pragma_query_value(None, "max_page_count", |row| row.get(0))
+                .unwrap();
+            let expected_pages =
+                i64::try_from(max_bytes / u64::try_from(page_size).unwrap()).unwrap();
+            assert_eq!(max_page_count, expected_pages);
+        }
+        let reopened = QueueStore::open_with_max_bytes(&path, max_bytes).unwrap();
+        let connection = reopened.connection.lock();
+        let page_size: i64 = connection
+            .pragma_query_value(None, "page_size", |row| row.get(0))
+            .unwrap();
+        let max_page_count: i64 = connection
+            .pragma_query_value(None, "max_page_count", |row| row.get(0))
+            .unwrap();
+        let expected_pages = i64::try_from(max_bytes / u64::try_from(page_size).unwrap()).unwrap();
+        assert_eq!(max_page_count, expected_pages);
+        drop(connection);
+        std::fs::remove_file(&path).unwrap();
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn sqlite_quota_rejects_values_below_minimum() {
+        assert!(matches!(
+            QueueStore::in_memory_with_max_bytes(MIN_DATABASE_MAX_BYTES - 1),
+            Err(QueueError::InvalidDatabaseQuota { .. })
+        ));
     }
 
     #[test]

@@ -213,6 +213,19 @@ Restaure primeiro em uma cópia de trabalho, nunca diretamente sobre o único ba
 
 Se o restore falhar por integridade ou incompatibilidade de schema, preserve o banco de destino, o snapshot de origem e a mensagem de erro; não tente substituir tabelas manualmente. O backup deve ser transferido para armazenamento externo criptografado. Defina RPO/RTO, retenção, criptografia, rotação e teste periódico de restauração antes de uma implantação pública.
 
+### Quota total do SQLite
+
+O arquivo operacional possui quota configurável por `--database-max-bytes` ou `SHAKA_DATABASE_MAX_BYTES`. O default é `268435456` bytes (256 MiB); valores abaixo de 1 MiB são rejeitados antes da abertura. `QueueStore` e `MemoryStore` aplicam a mesma quota no arquivo compartilhado por meio do limite de páginas SQLite e verificam o valor efetivo durante a inicialização.
+
+Para consultar ou sobrescrever a quota em uma operação controlada:
+
+```bash
+./shaka-linux-x86_64 config
+SHAKA_DATABASE_MAX_BYTES=268435456 ./shaka-linux-x86_64 doctor
+```
+
+Se uma escrita retornar `banco SQLite atingiu o limite de armazenamento`, não repita a operação cegamente. Preserve logs e o banco original, confirme o espaço físico disponível, faça backup consistente se o banco ainda estiver operacional, avalie a retenção permitida e só então escolha entre expurgo autorizado, aumento explícito da quota ou migração para armazenamento adequado. A quota de páginas limita o arquivo SQLite e não substitui a medição do filesystem; arquivos auxiliares do WAL podem ocupar espaço temporário adicional. Um restore de snapshot maior que a quota configurada deve falhar sem ser usado como atalho para remover a contenção.
+
 ## 8. Skills e aprovações humanas
 
 A criação de skill registra uma candidata; não gera nem executa código automaticamente:
@@ -252,7 +265,7 @@ export SHAKA_MODEL_API_KEY="nova-chave"
 ./shaka-linux-x86_64 run "teste de conectividade controlado"
 ```
 
-A memória episódica deve seguir a política do tenant. Cada episódio aceita no máximo 65.536 bytes em `content`; esse limite por registro não substitui retenção nem estabelece um limite total de crescimento do banco:
+A memória episódica deve seguir a política do tenant. Cada episódio aceita no máximo 65.536 bytes em `content`; esse limite por registro complementa a quota total do arquivo e não substitui retenção nem define sozinho a capacidade do banco:
 
 ```bash
 ./shaka-linux-x86_64 memory purge --days 30

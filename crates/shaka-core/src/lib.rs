@@ -22,6 +22,12 @@ use uuid::Uuid;
 /// Alias do valor JSON usado nos contratos serializados do núcleo.
 pub type JsonValue = serde_json::Value;
 
+/// Quota padrão do arquivo SQLite operacional, em bytes.
+pub const DEFAULT_DATABASE_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Menor quota configurável do arquivo SQLite operacional, em bytes.
+pub const MIN_DATABASE_MAX_BYTES: u64 = 1024 * 1024;
+
 /// Identificador UUID de uma tarefa admitida pelo agente.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct TaskId(pub Uuid);

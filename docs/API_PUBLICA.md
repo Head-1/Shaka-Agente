@@ -18,7 +18,7 @@ A exposição fora do loopback exige autenticação por `SHAKA_API_KEY` ou token
 | Identidade | Tenant, operador e papel vêm do principal autenticado no host |
 | Execução padrão | `dry_run: true` |
 | Idempotência | `Idempotency-Key` é obrigatório para submissões de tarefa, aprovações, retomadas e cancelamentos de planos |
-| Persistência | SQLite com isolamento por tenant, leases, transições e checkpoints |
+| Persistência | SQLite com isolamento por tenant, leases, transições, checkpoints e quota configurável por `SHAKA_DATABASE_MAX_BYTES` (256 MiB default) |
 | Recuperação | Fronteiras ambíguas são tratadas como `unknown` e exigem resolução humana |
 | Conteúdo sensível | Não enviar segredos, bearer tokens, prompts brutos ou payloads de ferramentas para logs ou evidências |
 
@@ -258,7 +258,7 @@ A retomada exige evidência vinculada ao incidente e não inventa sucesso para u
 
 ## 7. Respostas e erros
 
-Os erros HTTP são serializados com uma mensagem sanitizada e o `request_id` de correlação. O corpo não deve conter bearer token, API key, prompt bruto, argumentos de ferramenta ou resultado confidencial.
+Os erros HTTP são serializados com uma mensagem sanitizada e o `request_id` de correlação. O corpo não deve conter bearer token, API key, prompt bruto, argumentos de ferramenta ou resultado confidencial. Quando a persistência retorna `DatabaseFull`, a API não expõe detalhes do filesystem nem agenda retry; retorna a falha interna sanitizada para que a operação seja tratada pelo operador.
 
 | Status | Variante | Significado operacional |
 | --- | --- | --- |
@@ -268,7 +268,7 @@ Os erros HTTP são serializados com uma mensagem sanitizada e o `request_id` de 
 | `404` | `NotFound` | Sessão, tarefa ou plano não existe no tenant autenticado. |
 | `409` | `Conflict` | `Idempotency-Key` foi reutilizada com impressão digital diferente. |
 | `429` | `RateLimited` ou `QuotaExceeded` | Política de rate limit ou quota do tenant foi atingida; respeite `Retry-After` quando presente. |
-| `500` | `Internal` | Falha persistente ou de serialização; preserve `request_id` e interrompa retries indiscriminados. |
+| `500` | `Internal` | Falha persistente, banco cheio ou erro de serialização; preserve `request_id` e interrompa retries indiscriminados. |
 
 ## 8. Tipos Rust públicos
 

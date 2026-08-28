@@ -6,7 +6,9 @@
 use chrono::{DateTime, Duration, Utc};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, backup::Backup, params};
 use serde::{Deserialize, Serialize};
-use shaka_core::{AuditEvent, TaskId, TenantId};
+use shaka_core::{
+    AuditEvent, DEFAULT_DATABASE_MAX_BYTES, MIN_DATABASE_MAX_BYTES, TaskId, TenantId,
+};
 use std::{path::Path, time::Duration as StdDuration};
 use thiserror::Error;
 use uuid::Uuid;
@@ -14,9 +16,12 @@ use uuid::Uuid;
 /// Erros de persistência, validação e integridade da memória.
 #[derive(Debug, Error)]
 pub enum MemoryError {
-    /// Falha de leitura ou escrita no SQLite.
+    /// Falha de leitura ou escrita no SQLite que não é falta de espaço.
     #[error("erro SQLite: {0}")]
-    Sqlite(#[from] rusqlite::Error),
+    Sqlite(rusqlite::Error),
+    /// O arquivo SQLite atingiu sua quota ou o filesystem está sem espaço.
+    #[error("banco SQLite atingiu o limite de armazenamento")]
+    DatabaseFull,
     /// Falha de acesso ao filesystem durante backup ou restauração.
     #[error("erro de filesystem: {0}")]
     Io(String),
@@ -32,6 +37,16 @@ pub enum MemoryError {
     /// Registro persistido que não pôde ser interpretado com segurança.
     #[error("registro episódico inválido: {0}")]
     InvalidRecord(String),
+    /// Quota SQLite configurada abaixo do mínimo operacional ou incompatível com o arquivo.
+    #[error(
+        "quota SQLite inválida: requested_bytes={requested_bytes}, minimum_bytes={minimum_bytes}"
+    )]
+    InvalidDatabaseQuota {
+        /// Quota solicitada em bytes.
+        requested_bytes: u64,
+        /// Menor quota aceita pelo contrato.
+        minimum_bytes: u64,
+    },
     /// Campo textual excedeu o limite operacional de payload.
     #[error("campo {field} excede o limite de {max_bytes} bytes")]
     PayloadTooLarge {
@@ -115,6 +130,53 @@ pub struct MemoryStore {
 /// Limite de conteúdo por episódio para impedir uma única escrita patológica.
 pub const MAX_EPISODE_CONTENT_BYTES: usize = 64 * 1024;
 
+fn validate_database_max_bytes(max_bytes: u64) -> Result<(), MemoryError> {
+    if max_bytes < MIN_DATABASE_MAX_BYTES {
+        return Err(MemoryError::InvalidDatabaseQuota {
+            requested_bytes: max_bytes,
+            minimum_bytes: MIN_DATABASE_MAX_BYTES,
+        });
+    }
+    Ok(())
+}
+
+fn configure_database_quota(connection: &Connection, max_bytes: u64) -> Result<(), MemoryError> {
+    validate_database_max_bytes(max_bytes)?;
+    let page_size: i64 = connection.pragma_query_value(None, "page_size", |row| row.get(0))?;
+    let page_size = u64::try_from(page_size).map_err(|_| MemoryError::InvalidDatabaseQuota {
+        requested_bytes: max_bytes,
+        minimum_bytes: MIN_DATABASE_MAX_BYTES,
+    })?;
+    let max_pages = max_bytes / page_size;
+    if max_pages == 0 {
+        return Err(MemoryError::InvalidDatabaseQuota {
+            requested_bytes: max_bytes,
+            minimum_bytes: MIN_DATABASE_MAX_BYTES,
+        });
+    }
+    let effective_pages =
+        connection.pragma_update_and_check(None, "max_page_count", max_pages, |row| {
+            row.get::<_, i64>(0)
+        })?;
+    if effective_pages != i64::try_from(max_pages).unwrap_or(i64::MAX) {
+        return Err(MemoryError::InvalidDatabaseQuota {
+            requested_bytes: max_bytes,
+            minimum_bytes: MIN_DATABASE_MAX_BYTES,
+        });
+    }
+    Ok(())
+}
+
+impl From<rusqlite::Error> for MemoryError {
+    fn from(error: rusqlite::Error) -> Self {
+        if error.sqlite_error_code() == Some(rusqlite::ErrorCode::DiskFull) {
+            Self::DatabaseFull
+        } else {
+            Self::Sqlite(error)
+        }
+    }
+}
+
 const REQUIRED_SCHEMA_TABLES: [&str; 4] = [
     "episodic_memory",
     "semantic_memory",
@@ -133,10 +195,19 @@ fn restrict_file_permissions(path: impl AsRef<Path>) -> Result<(), MemoryError> 
 }
 
 impl MemoryStore {
-    /// Abre ou cria um banco SQLite persistente e aplica seu schema idempotente.
+    /// Abre ou cria um banco SQLite persistente com a quota padrão.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, MemoryError> {
+        Self::open_with_max_bytes(path, DEFAULT_DATABASE_MAX_BYTES)
+    }
+
+    /// Abre ou cria um banco SQLite persistente com quota explícita em bytes.
+    pub fn open_with_max_bytes(
+        path: impl AsRef<Path>,
+        max_database_bytes: u64,
+    ) -> Result<Self, MemoryError> {
         let connection = Connection::open(path)?;
         connection.busy_timeout(StdDuration::from_secs(5))?;
+        configure_database_quota(&connection, max_database_bytes)?;
         let store = Self {
             connection: parking_lot::Mutex::new(connection),
         };
@@ -144,10 +215,16 @@ impl MemoryStore {
         Ok(store)
     }
 
-    /// Cria um store SQLite efêmero, destinado a testes e validações locais.
+    /// Cria um store SQLite efêmero com a quota padrão, destinado a testes.
     pub fn in_memory() -> Result<Self, MemoryError> {
+        Self::in_memory_with_max_bytes(DEFAULT_DATABASE_MAX_BYTES)
+    }
+
+    /// Cria um store SQLite efêmero com quota explícita em bytes.
+    pub fn in_memory_with_max_bytes(max_database_bytes: u64) -> Result<Self, MemoryError> {
         let connection = Connection::open_in_memory()?;
         connection.busy_timeout(StdDuration::from_secs(5))?;
+        configure_database_quota(&connection, max_database_bytes)?;
         let store = Self {
             connection: parking_lot::Mutex::new(connection),
         };
@@ -592,6 +669,81 @@ mod tests {
             store.recent_episodes(&tenant, 1).unwrap()[0].content.len(),
             MAX_EPISODE_CONTENT_BYTES
         );
+    }
+
+    #[test]
+    fn sqlite_quota_is_applied_and_survives_reopen() {
+        let path = std::env::temp_dir().join(format!("shaka-quota-memory-{}.db", Uuid::new_v4()));
+        let max_bytes = 4 * 1024 * 1024;
+        {
+            let store = MemoryStore::open_with_max_bytes(&path, max_bytes).unwrap();
+            let connection = store.connection.lock();
+            let page_size: i64 = connection
+                .pragma_query_value(None, "page_size", |row| row.get(0))
+                .unwrap();
+            let max_page_count: i64 = connection
+                .pragma_query_value(None, "max_page_count", |row| row.get(0))
+                .unwrap();
+            let expected_pages =
+                i64::try_from(max_bytes / u64::try_from(page_size).unwrap()).unwrap();
+            assert_eq!(max_page_count, expected_pages);
+        }
+        let reopened = MemoryStore::open_with_max_bytes(&path, max_bytes).unwrap();
+        assert!(reopened.verify_integrity().unwrap());
+        let connection = reopened.connection.lock();
+        let page_size: i64 = connection
+            .pragma_query_value(None, "page_size", |row| row.get(0))
+            .unwrap();
+        let max_page_count: i64 = connection
+            .pragma_query_value(None, "max_page_count", |row| row.get(0))
+            .unwrap();
+        let expected_pages = i64::try_from(max_bytes / u64::try_from(page_size).unwrap()).unwrap();
+        assert_eq!(max_page_count, expected_pages);
+        drop(connection);
+        std::fs::remove_file(&path).unwrap();
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn sqlite_quota_rejects_writes_without_partial_episode() {
+        let store = MemoryStore::in_memory_with_max_bytes(MIN_DATABASE_MAX_BYTES).unwrap();
+        let tenant = TenantId::new("tenant-memory-quota").unwrap();
+        let mut accepted = 0;
+        let mut rejected = false;
+        for index in 0..64 {
+            let record = EpisodicRecord {
+                id: Uuid::new_v4(),
+                tenant_id: tenant.clone(),
+                task_id: None,
+                kind: format!("quota-{index}"),
+                content: "x".repeat(60 * 1024),
+                outcome: "success".to_owned(),
+                cost_microunits: 0,
+                elapsed_ms: 0,
+                created_at: Utc::now(),
+            };
+            match store.append_episode(&record) {
+                Ok(()) => accepted += 1,
+                Err(MemoryError::DatabaseFull) => {
+                    rejected = true;
+                    break;
+                }
+                Err(error) => panic!("unexpected quota test error: {error:?}"),
+            }
+        }
+        assert!(rejected);
+        assert!(accepted < 64);
+        assert_eq!(store.recent_episodes(&tenant, 64).unwrap().len(), accepted);
+        assert!(store.verify_integrity().unwrap());
+    }
+
+    #[test]
+    fn sqlite_quota_rejects_values_below_minimum() {
+        assert!(matches!(
+            MemoryStore::in_memory_with_max_bytes(MIN_DATABASE_MAX_BYTES - 1),
+            Err(MemoryError::InvalidDatabaseQuota { .. })
+        ));
     }
 
     #[test]

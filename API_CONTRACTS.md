@@ -165,7 +165,7 @@ No MVP o WASM não pode importar funções do host. Uma tentativa de import reto
 
 ## 10. Configuração e autorização
 
-A configuração pública informa ambiente, tenant, operador, papel, provedor, endpoint, nome do modelo, presença de chave, modo live e auditoria habilitada. A chave nunca aparece no resumo público; somente `api_key_configured: true/false` é exposto.
+A configuração pública informa ambiente, tenant, operador, papel, provedor, endpoint, nome do modelo, quota máxima do arquivo SQLite em `database_max_bytes`, presença de chave, modo live e auditoria habilitada. A chave nunca aparece no resumo público; somente `api_key_configured: true/false` é exposto. A quota padrão é `268435456` bytes (256 MiB), pode ser alterada por `--database-max-bytes` ou `SHAKA_DATABASE_MAX_BYTES`, e valores abaixo de `1048576` bytes são rejeitados antes de abrir o banco.
 
 Os papéis são `operator`, `reviewer` e `administrator`. A autorização é decidida pelo host por ação: execução somente leitura, execução externa, criação/aprovação/revogação de skill, backup, restore, expurgo e verificação de auditoria. O modelo não pode conceder capabilities ou papel por texto.
 
@@ -173,7 +173,7 @@ Os papéis são `operator`, `reviewer` e `administrator`. A autorização é dec
 
 `AuditEvent` inclui `tenant_id`, ator, ação, outcome, metadados, `previous_hash` e `event_hash`. Cada execução de ferramenta gera um evento `tool.execute`; falhas de modelo, orçamento e deadline geram um episódio e um evento `agent.run` com outcome `failure`. O `MemoryStore` reencadeia o evento por tenant e `verify_audit_chain` valida elo anterior, tenant e hash do conteúdo.
 
-A CLI oferece `doctor`, `backup`, `restore`, `verify-audit` e `config`. Backup usa a API online do SQLite. Restore deve ser executado por administrador e só inicia a cópia após confirmar a integridade e a presença do schema persistente obrigatório do Shaka; um snapshot SQLite válido, mas incompatível, é rejeitado sem mutar o destino e deve ser seguido por `doctor` e `verify-audit` em uma cópia de trabalho.
+A CLI oferece `doctor`, `backup`, `restore`, `verify-audit` e `config`. Backup usa a API online do SQLite. Restore deve ser executado por administrador e só inicia a cópia após confirmar a integridade e a presença do schema persistente obrigatório do Shaka; um snapshot SQLite válido, mas incompatível, é rejeitado sem mutar o destino e deve ser seguido por `doctor` e `verify-audit` em uma cópia de trabalho. `QueueStore` e `MemoryStore` aplicam e verificam a mesma quota de páginas no arquivo compartilhado. O limite é arredondado para baixo ao `page_size` efetivo e governa o arquivo SQLite; não é uma quota física de todo o filesystem e não elimina arquivos auxiliares temporários do WAL. Uma escrita que atinge o limite retorna falha de armazenamento, não deve ser repetida cegamente e não altera a política de retry de falhas transitórias do modelo.
 
 ## 12. Erros e semântica
 
@@ -187,6 +187,7 @@ A CLI oferece `doctor`, `backup`, `restore`, `verify-audit` e `config`. Backup u
 | `tool_execution_failed` | Ferramenta falhou | Depende de idempotência |
 | `host_imports_denied` | WASM tentou importar host | Não |
 | `approval_required` | Efeito exige aprovação | Não até aprovação |
+| `database_full` | Quota SQLite atingida ou filesystem sem espaço | Não; requer intervenção operacional |
 
 ## 13. API REST persistente v1
 
