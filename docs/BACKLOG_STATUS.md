@@ -1,7 +1,7 @@
 # Status consolidado do backlog de confiabilidade e closeout
 
 **Data de atualização:** 27 de agosto de 2026
-**Fonte de código:** `main` no merge commit [`48eeed2`](https://github.com/Head-1/Shaka-Agente/commit/48eeed2d2ba9a9caa975d0e376d24efc467ea380), após as PRs #31–#38 [1] [2] [3] [4] [5] [6] [7] [8]
+**Fonte histórica:** `main` no merge commit [`48eeed2`](https://github.com/Head-1/Shaka-Agente/commit/48eeed2d2ba9a9caa975d0e376d24efc467ea380), após as PRs #31–#38 [1] [2] [3] [4] [5] [6] [7] [8]. **Estado corrente:** `main` no merge commit [`4bf4fe75`](https://github.com/Head-1/Shaka-Agente/commit/4bf4fe75aa31a29fec71cc43d3c168a54da5e577), após a PR #47.
 **Estado de validação:** CI, sandbox e VM aprovados para a série integrada; o closeout não altera código funcional
 
 ## Visão executiva
@@ -44,11 +44,11 @@ A correção de BR-01 foi integrada na série histórica de hardening e document
 
 A evidência histórica inicial deste consolidado foi coletada no merge commit `445bc65`, com testes do workspace, smoke de produção, lifecycle do processo, crash/recovery do QueueStore, cadeia de auditoria multiprocesso e validação equivalente na VM. O estado final da `main` está no merge commit completo `48eeed2d2ba9a9caa975d0e376d24efc467ea380`, que inclui a série #31–#38 e foi validado em CI, sandbox e VM. O working tree permaneceu limpo e as portas operacionais dedicadas foram liberadas após as execuções.
 
-A validação final usada no closeout executou `cargo check --workspace --locked` com sucesso no SHA `48eeed2`. Os ciclos das PRs #36, #37 e #38 também tiveram validação pré-merge e pós-merge nos dois ambientes, nos SHAs finais `38b7a8c`, `d78a32a` e `48eeed2`, respectivamente. O protocolo executável está em [`docs/VALIDACAO_REPOSITORY_FIRST.md`](VALIDACAO_REPOSITORY_FIRST.md).
+A validação histórica usada no closeout executou `cargo check --workspace --locked` com sucesso no SHA `48eeed2`. A validação corrente da `main` em `4bf4fe75` também passou nos testes do workspace, clippy, smoke, probes de crash e coleta explícita de `missing_docs`. Os ciclos das PRs #36, #37 e #38 também tiveram validação pré-merge e pós-merge nos dois ambientes, nos SHAs finais `38b7a8c`, `d78a32a` e `48eeed2`, respectivamente. O protocolo executável está em [`docs/VALIDACAO_REPOSITORY_FIRST.md`](VALIDACAO_REPOSITORY_FIRST.md).
 
 ## Saldo documental conhecido
 
-No `main` final, o `cargo check --workspace --locked` produziu 100 avisos `missing_docs`, todos em `shaka-core`. A distribuição observada foi:
+No estado histórico `48eeed2`, o `cargo check --workspace --locked` produziu 100 avisos `missing_docs`, todos em `shaka-core`. Essa é uma linha de base histórica, não o saldo corrente. No estado corrente `4bf4fe75`, a coleta explícita com `RUSTFLAGS='-W missing_docs' cargo check --workspace --all-targets` e a verificação direta de `shaka-core` não produziram avisos.
 
 | Categoria | Quantidade |
 |---|---:|
@@ -61,7 +61,7 @@ No `main` final, o `cargo check --workspace --locked` produziu 100 avisos `missi
 | Variantes | 27 |
 | **Total** | **100** |
 
-Esses avisos são dívida documental conhecida sob a política `missing_docs=warn`; não representam falha de compilação, de CI ou de operação. A medição foi feita no SHA final antes do closeout e deve ser usada como linha de base para lotes futuros. A redução desse saldo deve ocorrer em branches isoladas, com escopo explícito, auditoria de diff e validação nos dois ambientes. O closeout não modifica código para reduzir esse número.
+Os 100 avisos são dívida documental histórica sob a política `missing_docs=warn`; não representam falha de compilação, de CI ou de operação. A medição corrente no SHA `4bf4fe75` registrou zero avisos. A política está declarada no workspace e é herdada pelos crates por meio de `[lints] workspace = true`. A evidência corrente foi coletada na VM com Rust/Cargo 1.98.0, árvore limpa e status de compilação zero. Novas reduções documentais somente devem ocorrer quando uma execução reproduzir um saldo positivo.
 
 ## Limites e decisões residuais
 
