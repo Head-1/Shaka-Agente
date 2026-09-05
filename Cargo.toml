@@ -26,24 +26,24 @@ anyhow = "1.0"
 axum = { version = "0.8", features = ["json", "http1"] }
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde", "clock"] }
-ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+ed25519-dalek = { version = "3.0", features = ["rand_core"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 hex = "0.4"
-jsonschema = "0.49.9"
+jsonschema = "0.52.1"
 parking_lot = "0.12"
-rand = "0.8"
+rand = "0.10"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-sha2 = "0.10"
+sha2 = "0.11"
 tower = "0.5"
 thiserror = "2.0"
 tokio = { version = "1.43", features = ["macros", "rt-multi-thread", "time", "sync", "signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 url = { version = "2.5", features = ["serde"] }
-wasmtime = { version = "47.0.4", default-features = false, features = ["runtime", "component-model", "cranelift"] }
+wasmtime = { version = "48.0.1", default-features = false, features = ["runtime", "component-model", "cranelift"] }
 wat = "1.227"
 uuid = { version = "1.11", features = ["serde", "v4"] }
 
