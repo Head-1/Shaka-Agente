@@ -2,7 +2,7 @@
 
 O Shaka é um agente de IA **extensível, auditável e governado pelo operador**, implementado em Rust. A arquitetura prioriza contratos tipados, execução mediada pelo host, memória persistente, rastreabilidade e uma fronteira segura para capacidades dinâmicas.
 
-> **Estado atual:** a release estável mais recente é a [**v0.8.2**](https://github.com/Head-1/Shaka-Agente/releases/tag/v0.8.2), validada para operação local controlada em `dry-run`. A `main` corrente está no merge commit [`48eeed2`](https://github.com/Head-1/Shaka-Agente/commit/48eeed2d2ba9a9caa975d0e376d24efc467ea380), após a série de PRs #31–#38. BR-01 a BR-06 permanecem documentados como corrigidos, cobertos e validados; a série também consolidou a documentação pública dos contratos de probes, sandbox, fila, memória, configuração, runtime, skills, identidade e governança de planos. Os ciclos repository-first tiveram CI, sandbox e VM aprovados, com branches de feature preservadas. A API HTTP usa loopback por padrão; planos `live`, mensageria externa, pesquisa autônoma na web, autopromoção de skills e controle irrestrito de subagentes permanecem fora dos limites desta versão.
+> **Estado atual:** a release estável mais recente é a [**v0.8.2**](https://github.com/Head-1/Shaka-Agente/releases/tag/v0.8.2), validada para operação local controlada em `dry-run`. A `main` corrente está no merge commit [`239f6b65`](https://github.com/Head-1/Shaka-Agente/commit/239f6b65d31accd718d70fac5a62f687f9eb2412), que integrou a correção de segurança do Wasmtime (`47.0.4`). BR-01 a BR-06 permanecem documentados como corrigidos, cobertos e validados; a série documental histórica também consolidou os contratos públicos de probes, sandbox, fila, memória, configuração, runtime, skills, identidade e governança de planos. A CI pós-merge e a validação independente devem ser citadas pelo SHA específico de cada execução. A API HTTP usa loopback por padrão; planos `live`, mensageria externa, pesquisa autônoma na web, autopromoção de skills e controle irrestrito de subagentes permanecem fora dos limites desta versão.
 
 ## O que a v0.8.2 entrega
 
@@ -37,7 +37,7 @@ Para continuidade e transferência, consulte o [`documento.md`](documento.md), g
 
 ## Estado repository-first e closeout documental
 
-O estado corrente verificável do repositório é o merge commit [`48eeed2`](https://github.com/Head-1/Shaka-Agente/commit/48eeed2d2ba9a9caa975d0e376d24efc467ea380). A cadeia integrada de PRs #31–#38 é:
+O estado corrente verificável do repositório é o merge commit [`239f6b65`](https://github.com/Head-1/Shaka-Agente/commit/239f6b65d31accd718d70fac5a62f687f9eb2412). A cadeia documental #31–#38 e a correção de segurança Wasmtime na PR #49 estão integradas; a cadeia histórica anterior permanece listada abaixo para auditoria:
 
 | PR | Escopo integrado | Merge commit |
 |---|---|---|
@@ -52,7 +52,7 @@ O estado corrente verificável do repositório é o merge commit [`48eeed2`](htt
 
 Os ciclos das PRs #31–#38 foram conduzidos com branch baseada no repositório, commit de trabalho assinado quando aplicável, CI remoto, validação em sandbox e confirmação independente na VM. As branches de feature permanecem disponíveis para auditoria; nenhum efeito externo novo foi habilitado pelo closeout.
 
-No `main` final, `cargo check --workspace --locked` concluiu com sucesso. A medição documental registrou 100 avisos `missing_docs`, todos em `shaka-core`: 1 módulo, 7 structs, 53 campos de struct, 2 itens associados, 6 métodos, 4 enums e 27 variantes. Esses avisos são dívida documental conhecida e não representam falha de compilação ou de operação; qualquer redução futura deve ocorrer em lotes isolados, com escopo e validação próprios.
+No estado histórico `48eeed2`, a medição documental registrou 100 avisos `missing_docs`, todos em `shaka-core`: 1 módulo, 7 structs, 53 campos de struct, 2 itens associados, 6 métodos, 4 enums e 27 variantes. Essa contagem é preservada como histórico. No estado corrente `239f6b65`, a coleta explícita com `RUSTFLAGS='-W missing_docs' cargo check --workspace --all-targets` registrou zero avisos. Qualquer nova medição deve registrar o SHA e o comando exato; redução futura deve ocorrer em lote isolado, com escopo e validação próprios.
 
 ## Modelo de segurança
 

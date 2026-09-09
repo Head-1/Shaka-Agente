@@ -1,8 +1,8 @@
 # Status consolidado do backlog de confiabilidade e closeout
 
 **Data de atualização:** 27 de agosto de 2026
-**Fonte de código:** `main` no merge commit [`48eeed2`](https://github.com/Head-1/Shaka-Agente/commit/48eeed2d2ba9a9caa975d0e376d24efc467ea380), após as PRs #31–#38 [1] [2] [3] [4] [5] [6] [7] [8]
-**Estado de validação:** CI, sandbox e VM aprovados para a série integrada; o closeout não altera código funcional
+**Fonte de código:** `main` no merge commit [`239f6b65`](https://github.com/Head-1/Shaka-Agente/commit/239f6b65d31accd718d70fac5a62f687f9eb2412), após a PR #49 de atualização de segurança do Wasmtime; as PRs #31–#38 permanecem como histórico integrado [1] [2] [3] [4] [5] [6] [7] [8]
+**Estado de validação:** a correção Wasmtime foi validada antes do merge com `cargo check`, testes, `missing_docs` forçado e `cargo audit` sem vulnerabilidades; qualquer novo closeout deve citar o SHA e o run correspondente
 
 ## Visão executiva
 
@@ -23,7 +23,7 @@ Os itens BR-01 a BR-06 foram analisados com o protocolo de engenharia do projeto
 
 ## Cadeia de integração repository-first
 
-A série integrada que levou a `main=48eeed2` é a seguinte:
+A série documental histórica que levou ao estado `48eeed2` é a seguinte; o estado corrente da `main` é `239f6b65`, que também integra a correção de segurança da PR #49:
 
 | PR | Natureza | Escopo | Merge commit |
 |---|---|---|---|
@@ -42,13 +42,13 @@ As correções funcionais dos BRs foram preservadas como histórico técnico; as
 
 A correção de BR-01 foi integrada na série histórica de hardening e documentada pela [PR #31][1]. A correção funcional de replay idempotente sob rate limit foi integrada pela [PR #32][2]. As PRs #33–#38 consolidaram a documentação pública dos probes, sandbox, fila, memória, configuração, runtime, skills, identidade e governança de planos [3] [4] [5] [6] [7] [8].
 
-A evidência histórica inicial deste consolidado foi coletada no merge commit `445bc65`, com testes do workspace, smoke de produção, lifecycle do processo, crash/recovery do QueueStore, cadeia de auditoria multiprocesso e validação equivalente na VM. O estado final da `main` está no merge commit completo `48eeed2d2ba9a9caa975d0e376d24efc467ea380`, que inclui a série #31–#38 e foi validado em CI, sandbox e VM. O working tree permaneceu limpo e as portas operacionais dedicadas foram liberadas após as execuções.
+A evidência histórica inicial deste consolidado foi coletada no merge commit `445bc65`, com testes do workspace, smoke de produção, lifecycle do processo, crash/recovery do QueueStore, cadeia de auditoria multiprocesso e validação equivalente na VM. O estado histórico final da série documental está no merge commit completo `48eeed2d2ba9a9caa975d0e376d24efc467ea380`; o estado corrente da `main` está em `239f6b65d31accd718d70fac5a62f687f9eb2412` após a PR #49. O working tree permaneceu limpo e as portas operacionais dedicadas foram liberadas após as execuções.
 
-A validação final usada no closeout executou `cargo check --workspace --locked` com sucesso no SHA `48eeed2`. Os ciclos das PRs #36, #37 e #38 também tiveram validação pré-merge e pós-merge nos dois ambientes, nos SHAs finais `38b7a8c`, `d78a32a` e `48eeed2`, respectivamente. O protocolo executável está em [`docs/VALIDACAO_REPOSITORY_FIRST.md`](VALIDACAO_REPOSITORY_FIRST.md).
+A validação final histórica usada no closeout executou `cargo check --workspace --locked` com sucesso no SHA `48eeed2`. Os ciclos das PRs #36, #37 e #38 também tiveram validação pré-merge e pós-merge nos dois ambientes, nos SHAs finais `38b7a8c`, `d78a32a` e `48eeed2`, respectivamente. Para o estado corrente `239f6b65`, a atualização do Wasmtime foi validada com `cargo audit` sem vulnerabilidades; novos gates devem registrar seus próprios resultados. O protocolo executável está em [`docs/VALIDACAO_REPOSITORY_FIRST.md`](VALIDACAO_REPOSITORY_FIRST.md).
 
 ## Saldo documental conhecido
 
-No `main` final, o `cargo check --workspace --locked` produziu 100 avisos `missing_docs`, todos em `shaka-core`. A distribuição observada foi:
+No estado histórico `48eeed2`, o `cargo check --workspace --locked` produziu 100 avisos `missing_docs`, todos em `shaka-core`. A distribuição observada foi:
 
 | Categoria | Quantidade |
 |---|---:|
@@ -61,7 +61,7 @@ No `main` final, o `cargo check --workspace --locked` produziu 100 avisos `missi
 | Variantes | 27 |
 | **Total** | **100** |
 
-Esses avisos são dívida documental conhecida sob a política `missing_docs=warn`; não representam falha de compilação, de CI ou de operação. A medição foi feita no SHA final antes do closeout e deve ser usada como linha de base para lotes futuros. A redução desse saldo deve ocorrer em branches isoladas, com escopo explícito, auditoria de diff e validação nos dois ambientes. O closeout não modifica código para reduzir esse número.
+Esses avisos são dívida documental histórica sob a política `missing_docs=warn`; não representam falha de compilação, de CI ou de operação. No estado corrente `239f6b65`, a coleta explícita com `RUSTFLAGS='-W missing_docs' cargo check --workspace --all-targets` registrou zero avisos. Toda nova medição deve identificar o SHA, o comando e o ambiente; a redução de qualquer saldo futuro deve ocorrer em branches isoladas, com escopo explícito, auditoria de diff e validação nos dois ambientes.
 
 ## Limites e decisões residuais
 
