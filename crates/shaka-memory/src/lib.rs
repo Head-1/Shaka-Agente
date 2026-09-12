@@ -1123,6 +1123,46 @@ mod tests {
     }
 
     #[test]
+    fn e1_backup_publishes_verifiable_snapshot_manifest() {
+        let store = MemoryStore::in_memory().unwrap();
+        let tenant = TenantId::new("tenant-e1-manifest").unwrap();
+        store
+            .append_episode(&EpisodicRecord {
+                id: Uuid::new_v4(),
+                tenant_id: tenant,
+                task_id: None,
+                kind: "e1-backup".to_owned(),
+                content: "snapshot must be externally verifiable".to_owned(),
+                outcome: "success".to_owned(),
+                cost_microunits: 0,
+                elapsed_ms: 0,
+                created_at: Utc::now(),
+            })
+            .unwrap();
+
+        let backup = std::env::temp_dir().join(format!("shaka-e1-backup-{}.db", Uuid::new_v4()));
+        let manifest = backup.with_extension("db.sha256");
+        store.backup_to(&backup).unwrap();
+
+        assert!(
+            manifest.is_file(),
+            "E1 exige manifesto sidecar com checksum do snapshot antes da confirmação externa"
+        );
+        let checksum = std::fs::read_to_string(&manifest).unwrap();
+        assert_eq!(checksum.trim().len(), 64);
+        assert!(
+            checksum
+                .trim()
+                .chars()
+                .all(|character| character.is_ascii_hexdigit())
+        );
+        assert!(MemoryStore::verify_integrity_at(&backup).unwrap());
+
+        std::fs::remove_file(backup).unwrap();
+        std::fs::remove_file(manifest).unwrap();
+    }
+
+    #[test]
     fn restore_replaces_target_with_consistent_source_snapshot() {
         let source =
             std::env::temp_dir().join(format!("shaka-restore-source-{}.db", Uuid::new_v4()));

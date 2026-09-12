@@ -75,13 +75,13 @@ cargo run -p shaka-cli -- backup --output backups/shaka.db
 cargo run -p shaka-cli -- restore --input backups/shaka.db
 ```
 
-O restore exige administrador e deve ser validado em cópia de trabalho, nunca substituindo diretamente o único banco operacional. A existência desses comandos não prova RPO/RTO nem backup externo: essa é a próxima frente E1.
+O restore exige administrador e deve ser validado em cópia de trabalho, nunca substituindo diretamente o único banco operacional. A existência desses comandos não prova RPO/RTO nem backup externo; essa garantia será implementada na frente E1.
 
 ## 12. Próxima frente autorizada para planejamento
 
-A próxima frente é **E1 — RPO/RTO e backup externo**. Antes de alterar o runtime, deve existir um ADR que defina escopo dos dados, perda máxima aceitável, tempo máximo de restauração, criptografia, retenção, destino externo, teste periódico e critérios de abortar. O primeiro teste deve cobrir uma restauração em destino separado, verificando integridade do banco e da cadeia de auditoria.
+A frente **E1 — RPO/RTO e backup externo** foi definida com RPO de **0 a 5 minutos** e RTO de **até 1 minuto**. O desenho aprovado é híbrido: solicitações por evento após checkpoint durável, coalescidas e single-flight, mais um timer de segurança de no máximo cinco minutos. A Online Backup API do SQLite será o mecanismo primário; o snapshot deverá ter checksum, metadados e validação antes da confirmação no destino externo isolado. O restore será fail-closed diante de checksum, integridade, schema ou cadeia de auditoria inválidos. O contrato completo está em [`docs/ADR-001-E1-RPO-RTO-BACKUP-EXTERNO.md`](docs/ADR-001-E1-RPO-RTO-BACKUP-EXTERNO.md).
 
-A implementação de E1 não deve começar enquanto a PR #50 não estiver mesclada, a CI pós-merge não estiver verde e a VM não tiver sido sincronizada para o novo SHA.
+O teste funcional de E1 já foi criado na branch de trabalho e falha no baseline por ausência do manifesto de checksum; isso comprova a lacuna sem afirmar que a implementação está pronta. A implementação do runtime não deve começar enquanto a PR #50 não estiver mesclada, a CI pós-merge não estiver verde e a VM não tiver sido sincronizada para o novo SHA.
 
 ## 13. Referência principal
 

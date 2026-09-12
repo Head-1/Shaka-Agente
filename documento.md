@@ -301,14 +301,14 @@ O P0-A a P0-E está encerrado. Os itens BR-01 a BR-06 também estão documentado
 |---|---|
 | Quota física do ambiente | Qual orçamento inclui SQLite, WAL, logs, temporários e outros processos? |
 | Retenção e compactação | O que pode ser removido sem violar auditoria, privacidade ou recuperação? |
-| RPO/RTO | Quanto de perda de dados e tempo de restauração são aceitáveis? |
-| Backup externo | Onde ficam cópias criptografadas e como a restauração será testada? |
+| RPO/RTO | Decididos em E1: RPO de 0 a 5 minutos e RTO de até 1 minuto; validar em dois ambientes. |
+| Backup externo | Implementar snapshot consistente, checksum, destino isolado e restore fail-closed; validar em dois ambientes. |
 | Observabilidade | Quais métricas e alertas operacionais serão obrigatórios? |
 | Hardening | Qual supervisor, filesystem, permissão, rotação e isolamento serão usados? |
 | Warnings | Quais lotes de documentação reduzem `missing_docs` sem esconder problemas? |
 | Produção pública | Qual threat model autoriza IAM remoto, HTTPS e efeitos externos? |
 
-Cada frente deve ter ADR, hipótese, critérios de aceitação e validação em dois ambientes. O planejamento inicial da frente E1 está em [`docs/ADR-001-E1-RPO-RTO-BACKUP-EXTERNO.md`](docs/ADR-001-E1-RPO-RTO-BACKUP-EXTERNO.md). Não iniciar várias dessas frentes simultaneamente apenas porque parecem relacionadas.
+Cada frente deve ter ADR, hipótese, critérios de aceitação e validação em dois ambientes. A decisão da frente E1 está registrada em [`docs/ADR-001-E1-RPO-RTO-BACKUP-EXTERNO.md`](docs/ADR-001-E1-RPO-RTO-BACKUP-EXTERNO.md); a implementação ainda não está concluída. Não iniciar várias dessas frentes simultaneamente apenas porque parecem relacionadas.
 
 ## 17. Checklist de transferência concluída
 
