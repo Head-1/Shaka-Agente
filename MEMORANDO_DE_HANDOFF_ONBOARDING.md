@@ -21,7 +21,7 @@ A regra de governança mais importante é:
 | `data/shaka.db` | Memória episódica, working memory, semântica e auditoria. | Potencialmente alta; pode conter dados de usuários. |
 | `data/skills.json` | Catálogo de skills e aprovações. | Alta para governança. |
 | `.env.example` | Nomes de variáveis, sem segredos. | Baixa. |
-| `docs/` | Material complementar. | Baixa, salvo dados inseridos manualmente. |
+| `docs/` | Material complementar, incluindo ADRs e validações. | Baixa, salvo dados inseridos manualmente. |
 | `.github/workflows/` | Pipeline de validação. | Alta para integridade da entrega. |
 
 ## 4. Responsabilidades
@@ -42,51 +42,47 @@ Quando uma ferramenta retorna `dry_run`, o sistema simulou o efeito e não deve 
 
 ## 7. Procedimento de onboarding
 
-A nova pessoa deve primeiro ler `README.md`, `ARCHITECTURE.md`, `SECURITY.md`, `SKILL_GOVERNANCE.md` e `RUNBOOK_OPERACIONAL.md`. Em seguida deve executar `cargo test --workspace`, `cargo run -- sandbox-demo` e uma tarefa local em dry-run.
+A nova pessoa deve primeiro ler `README.md`, `ARCHITECTURE.md`, `SECURITY.md`, `SKILL_GOVERNANCE.md`, `RUNBOOK_OPERACIONAL.md`, `API_CONTRACTS.md`, `TESTING_STRATEGY.md` e `docs/VALIDACAO_REPOSITORY_FIRST.md`. O guia ampliado de continuidade está em [`documento.md`](documento.md).
 
-Depois, deve inspecionar uma execução em `memory recent`, criar uma skill candidata de teste e confirmar que ela não se torna ativa sem aprovação. A aprovação deve ser exercitada somente com artefato de teste e hash conhecido.
+Depois, deve confirmar o SHA remoto da `origin/main`, a árvore limpa e o toolchain; executar `cargo fmt --all -- --check`, `cargo check --workspace --locked`, `cargo test --workspace --locked`, `cargo run -p shaka-cli -- sandbox-demo`, `cargo run -p shaka-cli -- config` e `cargo run -p shaka-cli -- doctor`.
+
+Por fim, deve executar uma tarefa local em `dry-run`, inspecionar uma execução em `memory recent`, criar uma skill candidata de teste e confirmar que ela não se torna ativa sem aprovação. A aprovação deve ser exercitada somente com artefato de teste e hash conhecido.
 
 ## 8. Procedimento de handoff
 
-A transferência deve registrar a versão do commit, versão de Rust, localização do banco, política de retenção, operador autorizado, responsável de segurança, estado das skills, endpoint do modelo e pendências. O novo responsável deve confirmar acesso mínimo necessário, nunca receber segredos por texto livre e assinar a confirmação de entendimento do runbook.
+A transferência deve registrar o SHA exato da `origin/main`, versão de Rust, localização do banco, política de retenção, operador autorizado, responsável de segurança, estado das skills, endpoint do modelo e pendências. O novo responsável deve confirmar acesso mínimo necessário, nunca receber segredos por texto livre e assinar a confirmação de entendimento do runbook.
+
+A referência corrente do repositório é o merge da PR #49, SHA `239f6b65d31accd718d70fac5a62f687f9eb2412`, com Wasmtime `47.0.4`. A PR #50, de reconciliação documental, deve ser considerada parte do estado corrente somente depois de seu merge protegido e da CI pós-merge; enquanto estiver aberta, seu SHA `1b7a25fd58d540a2f1e311048fc9ba10051d6a9c` é apenas candidato documental.
 
 ## 9. Contatos e lacunas
 
-Os nomes, contatos e responsáveis reais não são conhecidos pelo repositório e devem ser preenchidos pelo proprietário da implantação. Não invente contatos em documentação operacional. As lacunas atuais incluem IAM remoto, alertas remotos, backup externo automatizado, suporte a multi-tenancy forte, mensageria e processo formal de incidentes.
+Os nomes, contatos e responsáveis reais não são conhecidos pelo repositório e devem ser preenchidos pelo proprietário da implantação. Não invente contatos em documentação operacional. As lacunas atuais incluem RPO/RTO formal, cópia externa criptografada com restauração testada, orçamento físico global, retenção e compactação, métricas e alertas remotos, IAM remoto, mensageria, suporte a multi-tenancy forte e processo formal de incidentes.
 
 ## 10. Critério de transferência concluída
 
-O handoff está concluído quando a nova pessoa consegue compilar, testar, executar uma tarefa local, consultar memória, verificar o sandbox, criar uma skill candidata, explicar por que ela não está ativa e seguir o procedimento de revogação sem alterar arquivos de controle manualmente.
+O handoff está concluído quando a nova pessoa consegue compilar, testar, executar uma tarefa local, consultar memória, verificar o sandbox, criar uma skill candidata, explicar por que ela não está ativa, seguir o procedimento de revogação sem alterar arquivos de controle manualmente e explicar por que uma cópia local do SQLite não constitui, sozinha, uma estratégia de recuperação validada.
 
-## 11. Notas da release 0.2.0
+## 11. Estado técnico atual
 
-A release atual é uma produção candidata para operação controlada. O novo crate `shaka-config` valida ambiente, provedor, endpoint, credencial, papel, auditoria e modo live. Os papéis são `operator`, `reviewer` e `administrator`; a autorização acontece no host antes da ação.
+A release funcional é `v0.8.2`, em base operacional local controlada. O workspace usa Rust edition 2024, declara MSRV `1.85` e é validado com Rust/Cargo `1.98.0` nos ciclos registrados. A persistência usa SQLite com WAL, transações imediatas onde há necessidade de serialização e quota configurável; o default da quota é `268435456` bytes, ou 256 MiB, com mínimo de 1 MiB.
 
-Antes de assumir a operação, execute:
+O Wasmtime corrente é `47.0.4`. A versão `47.0.3` não deve ser reintroduzida: ela foi a origem dos advisories reproduzidos no ciclo de segurança anterior. A política `missing_docs` permanece como warning no manifesto, e o check forçado corrente foi validado sem warnings.
 
-```bash
-cargo fmt --all -- --check
-cargo test --workspace
-cargo run -- config
-cargo run -- doctor
-cargo run -- verify-audit
-```
-
-A rotina administrativa de backup e restore é:
+Os comandos administrativos de backup e restore são:
 
 ```bash
-cargo run -- backup --output backups/shaka.db
-cargo run -- restore --input backups/shaka.db
+cargo run -p shaka-cli -- backup --output backups/shaka.db
+cargo run -p shaka-cli -- restore --input backups/shaka.db
 ```
 
-Restore exige administrador e deve ser validado em cópia de trabalho. Backups locais devem ser enviados a armazenamento externo criptografado. O catálogo de skills agora usa escrita atômica e pode calcular SHA-256 do arquivo real com `--artifact`.
+O restore exige administrador e deve ser validado em cópia de trabalho, nunca substituindo diretamente o único banco operacional. A existência desses comandos não prova RPO/RTO nem backup externo: essa é a próxima frente E1.
 
-A atualização de Wasmtime para 47.0.3 é parte do gate de segurança. `cargo audit` deve passar sem advisories reportados. Os detalhes estão em `DEPENDENCY_SECURITY_VALIDATION.md`.
+## 12. Próxima frente autorizada para planejamento
 
-As lacunas restantes não são bugs ocultos: IAM remoto, cofre de segredos, backup externo automatizado, métricas remotas, mensageria, pesquisa web, subagentes distribuídos, assinatura de artefatos e multi-tenancy forte exigem nova fase com infraestrutura e threat model próprios.
+A próxima frente é **E1 — RPO/RTO e backup externo**. Antes de alterar o runtime, deve existir um ADR que defina escopo dos dados, perda máxima aceitável, tempo máximo de restauração, criptografia, retenção, destino externo, teste periódico e critérios de abortar. O primeiro teste deve cobrir uma restauração em destino separado, verificando integridade do banco e da cadeia de auditoria.
 
-## 12. Guia principal de continuidade pós-P0-E
+A implementação de E1 não deve começar enquanto a PR #50 não estiver mesclada, a CI pós-merge não estiver verde e a VM não tiver sido sincronizada para o novo SHA.
 
-O guia didático e operacional principal para a próxima pessoa desenvolvedora ou agente de IA está em [`documento.md`](documento.md). Ele deve ser lido junto com este memorando, pois consolida o estado atual no merge commit `ccfeef9ec84f36a5ff37077f51d5072306ecbe03`, a quota total SQLite do P0-E, o protocolo repository-first, os critérios de validação nos dois ambientes e as pendências que continuam fora do escopo.
+## 13. Referência principal
 
-O memorando permanece como resumo de onboarding e handoff. O `documento.md` é a referência ampliada para continuidade técnica, operação, segurança, persistência e preparação de novas mudanças.
+O [`documento.md`](documento.md) é o guia ampliado para continuidade técnica, operação, segurança, persistência e preparação de novas mudanças. Este memorando permanece como resumo de onboarding e handoff. Quando houver divergência, o SHA publicado no GitHub e o conteúdo versionado correspondente são a fonte da verdade.

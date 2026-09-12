@@ -129,7 +129,7 @@ git switch --detach origin/main
 test -z "$(git status --porcelain)"
 ```
 
-Em seguida, leia pelo menos `README.md`, `ARCHITECTURE.md`, `SECURITY.md`, `SKILL_GOVERNANCE.md`, `RUNBOOK_OPERACIONAL.md`, `API_CONTRACTS.md`, `TESTING_STRATEGY.md` e `docs/VALIDACAO_REPOSITORY_FIRST.md`. O arquivo `MEMORANDO_DE_HANDOFF_ONBOARDING.md` fornece um resumo anterior; este documento acrescenta o estado pós-P0-E.
+Em seguida, leia pelo menos `README.md`, `ARCHITECTURE.md`, `SECURITY.md`, `SKILL_GOVERNANCE.md`, `RUNBOOK_OPERACIONAL.md`, `API_CONTRACTS.md`, `TESTING_STRATEGY.md` e `docs/VALIDACAO_REPOSITORY_FIRST.md`. O arquivo `MEMORANDO_DE_HANDOFF_ONBOARDING.md` fornece o resumo de onboarding e handoff; este documento acrescenta o estado pós-P0-E e as regras detalhadas de continuidade.
 
 Confirme o ambiente e execute uma validação inicial:
 
@@ -308,7 +308,7 @@ O P0-A a P0-E está encerrado. Os itens BR-01 a BR-06 também estão documentado
 | Warnings | Quais lotes de documentação reduzem `missing_docs` sem esconder problemas? |
 | Produção pública | Qual threat model autoriza IAM remoto, HTTPS e efeitos externos? |
 
-Cada frente deve ter ADR, hipótese, critérios de aceitação e validação em dois ambientes. Não iniciar várias dessas frentes simultaneamente apenas porque parecem relacionadas.
+Cada frente deve ter ADR, hipótese, critérios de aceitação e validação em dois ambientes. O planejamento inicial da frente E1 está em [`docs/ADR-001-E1-RPO-RTO-BACKUP-EXTERNO.md`](docs/ADR-001-E1-RPO-RTO-BACKUP-EXTERNO.md). Não iniciar várias dessas frentes simultaneamente apenas porque parecem relacionadas.
 
 ## 17. Checklist de transferência concluída
 
