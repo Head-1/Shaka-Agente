@@ -52,11 +52,11 @@ Por fim, deve executar uma tarefa local em `dry-run`, inspecionar uma execução
 
 A transferência deve registrar o SHA exato da `origin/main`, versão de Rust, localização do banco, política de retenção, operador autorizado, responsável de segurança, estado das skills, endpoint do modelo e pendências. O novo responsável deve confirmar acesso mínimo necessário, nunca receber segredos por texto livre e assinar a confirmação de entendimento do runbook.
 
-A referência corrente do repositório é o merge da PR #49, SHA `239f6b65d31accd718d70fac5a62f687f9eb2412`, com Wasmtime `47.0.4`. A PR #50, de reconciliação documental, deve ser considerada parte do estado corrente somente depois de seu merge protegido e da CI pós-merge; enquanto estiver aberta, seu SHA `1b7a25fd58d540a2f1e311048fc9ba10051d6a9c` é apenas candidato documental.
+A referência de base do repositório é o merge da PR #49, SHA `239f6b65d31accd718d70fac5a62f687f9eb2412`, com Wasmtime `47.0.4`. A implementação E1 está na branch `docs/e1-handoff-rpo-rto`, commit `b6581c72bca5e2a69c7b066b7d525e8be21c73bd`, aguardando publicação formal por PR e CI. O relatório [`docs/E1-CLOSEOUT-VALIDACAO.md`](docs/E1-CLOSEOUT-VALIDACAO.md) registra as evidências da Sandbox e da VM; esse commit ainda não deve ser tratado como estado da `main` antes do merge protegido.
 
 ## 9. Contatos e lacunas
 
-Os nomes, contatos e responsáveis reais não são conhecidos pelo repositório e devem ser preenchidos pelo proprietário da implantação. Não invente contatos em documentação operacional. As lacunas atuais incluem RPO/RTO formal, cópia externa criptografada com restauração testada, orçamento físico global, retenção e compactação, métricas e alertas remotos, IAM remoto, mensageria, suporte a multi-tenancy forte e processo formal de incidentes.
+Os nomes, contatos e responsáveis reais não são conhecidos pelo repositório e devem ser preenchidos pelo proprietário da implantação. Não invente contatos em documentação operacional. As lacunas atuais incluem medição quantitativa de RPO/RTO, cópia externa criptografada, orçamento físico global, retenção e compactação, métricas e alertas remotos, IAM remoto, mensageria, suporte a multi-tenancy forte e processo formal de incidentes.
 
 ## 10. Critério de transferência concluída
 
@@ -75,13 +75,13 @@ cargo run -p shaka-cli -- backup --output backups/shaka.db
 cargo run -p shaka-cli -- restore --input backups/shaka.db
 ```
 
-O restore exige administrador e deve ser validado em cópia de trabalho, nunca substituindo diretamente o único banco operacional. A existência desses comandos não prova RPO/RTO nem backup externo; essa garantia será implementada na frente E1.
+O restore exige administrador e deve ser validado em cópia de trabalho, nunca substituindo diretamente o único banco operacional. Na E1, o restore exige manifesto SHA-256, falha antes de modificar o alvo quando o checksum diverge e foi validado com snapshot íntegro e corrompido na VM. Isso comprova o comportamento fail-closed, mas não substitui a medição quantitativa de RPO/RTO.
 
 ## 12. Próxima frente autorizada para planejamento
 
-A frente **E1 — RPO/RTO e backup externo** foi definida com RPO de **0 a 5 minutos** e RTO de **até 1 minuto**. O desenho aprovado é híbrido: solicitações por evento após checkpoint durável, coalescidas e single-flight, mais um timer de segurança de no máximo cinco minutos. A Online Backup API do SQLite será o mecanismo primário; o snapshot deverá ter checksum, metadados e validação antes da confirmação no destino externo isolado. O restore será fail-closed diante de checksum, integridade, schema ou cadeia de auditoria inválidos. O contrato completo está em [`docs/ADR-001-E1-RPO-RTO-BACKUP-EXTERNO.md`](docs/ADR-001-E1-RPO-RTO-BACKUP-EXTERNO.md).
+A frente **E1 — RPO/RTO e backup externo** foi implementada na branch `docs/e1-handoff-rpo-rto`, commit `b6581c72bca5e2a69c7b066b7d525e8be21c73bd`. O desenho híbrido foi integrado: evento após checkpoint durável, coalescência e single-flight, mais timer de segurança de no máximo cinco minutos. A Online Backup API produz o snapshot, o destino externo é isolado, o manifesto SHA-256 é obrigatório e o restore falha fechando diante de checksum, integridade ou schema inválidos. A implementação passou no Sandbox e foi reproduzida na VM. Ver [`docs/ADR-001-E1-RPO-RTO-BACKUP-EXTERNO.md`](docs/ADR-001-E1-RPO-RTO-BACKUP-EXTERNO.md) e [`docs/E1-CLOSEOUT-VALIDACAO.md`](docs/E1-CLOSEOUT-VALIDACAO.md).
 
-O teste funcional de E1 já foi criado na branch de trabalho e falha no baseline por ausência do manifesto de checksum; isso comprova a lacuna sem afirmar que a implementação está pronta. A implementação do runtime não deve começar enquanto a PR #50 não estiver mesclada, a CI pós-merge não estiver verde e a VM não tiver sido sincronizada para o novo SHA.
+Antes de iniciar E2, a branch E1 deve passar pela CI e pelo merge protegido. RPO de 0–5 minutos e RTO de até 1 minuto são objetivos aprovados; a medição quantitativa cronometrada permanece pendente.
 
 ## 13. Referência principal
 

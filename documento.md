@@ -277,6 +277,8 @@ cargo run -p shaka-cli -- --role administrator \
 
 O restore rejeita snapshot SQLite íntegro, porém incompatível com o schema obrigatório do Shaka, antes de copiar os dados. Se falhar, preserve origem, destino e erro; não substitua tabelas manualmente e não apague o banco original.
 
+Na E1, o restore também exige o manifesto sidecar `<snapshot>.db.sha256`. O checksum é verificado antes da integridade SQLite, do schema e da cópia para o destino. Uma divergência deve falhar fechando o procedimento e preservar o banco-alvo. O relatório de validação está em [`docs/E1-CLOSEOUT-VALIDACAO.md`](docs/E1-CLOSEOUT-VALIDACAO.md).
+
 ## 15. Resposta a incidentes
 
 Trate como incidente crítico uma execução externa não autorizada, autopromoção de skill, vazamento de segredo, violação de tenant, corrupção de auditoria, escape do sandbox ou alteração indevida de logs.
@@ -301,14 +303,14 @@ O P0-A a P0-E está encerrado. Os itens BR-01 a BR-06 também estão documentado
 |---|---|
 | Quota física do ambiente | Qual orçamento inclui SQLite, WAL, logs, temporários e outros processos? |
 | Retenção e compactação | O que pode ser removido sem violar auditoria, privacidade ou recuperação? |
-| RPO/RTO | Decididos em E1: RPO de 0 a 5 minutos e RTO de até 1 minuto; validar em dois ambientes. |
-| Backup externo | Implementar snapshot consistente, checksum, destino isolado e restore fail-closed; validar em dois ambientes. |
+| RPO/RTO | Objetivos aprovados em E1: RPO de 0 a 5 minutos e RTO de até 1 minuto. A medição quantitativa cronometrada ainda é backlog explícito. |
+| Backup externo | E1 implementada e reproduzida em Sandbox e VM: snapshot consistente, checksum, destino isolado, worker híbrido e restore fail-closed. |
 | Observabilidade | Quais métricas e alertas operacionais serão obrigatórios? |
 | Hardening | Qual supervisor, filesystem, permissão, rotação e isolamento serão usados? |
 | Warnings | Quais lotes de documentação reduzem `missing_docs` sem esconder problemas? |
 | Produção pública | Qual threat model autoriza IAM remoto, HTTPS e efeitos externos? |
 
-Cada frente deve ter ADR, hipótese, critérios de aceitação e validação em dois ambientes. A decisão da frente E1 está registrada em [`docs/ADR-001-E1-RPO-RTO-BACKUP-EXTERNO.md`](docs/ADR-001-E1-RPO-RTO-BACKUP-EXTERNO.md); a implementação ainda não está concluída. Não iniciar várias dessas frentes simultaneamente apenas porque parecem relacionadas.
+Cada frente deve ter ADR, hipótese, critérios de aceitação e validação em dois ambientes. A decisão e o closeout da frente E1 estão registrados em [`docs/ADR-001-E1-RPO-RTO-BACKUP-EXTERNO.md`](docs/ADR-001-E1-RPO-RTO-BACKUP-EXTERNO.md) e [`docs/E1-CLOSEOUT-VALIDACAO.md`](docs/E1-CLOSEOUT-VALIDACAO.md). Não iniciar várias frentes simultaneamente apenas porque parecem relacionadas; aguardar a publicação formal da E1 antes de iniciar E2.
 
 ## 17. Checklist de transferência concluída
 

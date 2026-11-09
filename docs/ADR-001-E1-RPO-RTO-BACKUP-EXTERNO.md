@@ -1,9 +1,9 @@
 # ADR-001 — E1: RPO/RTO e backup externo
 
-**Status:** Decisão aprovada para implementação incremental
-**Data:** 2026-09-11
+**Status:** Implementação concluída e validação operacional reproduzida; publicação formal pendente de PR/CI
+**Data:** 2026-09-11; closeout operacional em 2026-11-09
 **Escopo:** Contrato operacional, arquitetura e critérios de teste
-**Base técnica:** `origin/main` em `239f6b65d31accd718d70fac5a62f687f9eb2412`
+**Base técnica:** implementação validada no commit `b6581c72bca5e2a69c7b066b7d525e8be21c73bd`, derivado da `main` pós-PR #49
 
 ## Contexto
 
@@ -107,6 +107,14 @@ Este ADR não escolhe provedor concreto, não instala agente de backup, não exe
 ## Consequências
 
 O sistema terá um contrato operacional mensurável, mas a garantia ainda não existe até que o teste novo falhe no baseline, a implementação passe nos testes e a VM reproduza os mesmos resultados. A produção pública continua bloqueada até a validação completa. O destino externo passa a ser uma dependência operacional explícita: indisponibilidade ou falha de validação deve aparecer como estado de recuperação degradada, nunca como sucesso fictício.
+
+## Closeout da implementação
+
+No commit `b6581c72bca5e2a69c7b066b7d525e8be21c73bd`, a Sandbox passou formatter, `missing_docs` forçado, compilação locked, testes all-targets e `git diff --check`. A VM reproduziu a mesma suíte em worktree limpo, montou `/mnt/shaka-e1-external` em filesystem separado, iniciou o worker com `SHAKA_BACKUP_PATH`, exercitou checkpoint pós-aprovação por revisor distinto, verificou manifesto SHA-256, executou `PRAGMA integrity_check`, confirmou shutdown gracioso e preservou o backup após a parada.
+
+O ensaio controlado de restore corrompeu apenas uma cópia do snapshot. O sistema rejeitou a cópia por checksum divergente e manteve o alvo inalterado. O snapshot íntegro foi restaurado em banco temporário separado e passou na integridade SQLite. A evidência detalhada está em [`docs/E1-CLOSEOUT-VALIDACAO.md`](E1-CLOSEOUT-VALIDACAO.md).
+
+O closeout não declara RPO/RTO quantitativos medidos: os valores de RPO de 0–5 minutos e RTO de até 1 minuto continuam objetivos operacionais aprovados, enquanto o ensaio cronometrado de perda máxima e tempo até readiness permanece pendente.
 
 ## Referências
 

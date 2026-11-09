@@ -1,8 +1,8 @@
 # Status consolidado do backlog de confiabilidade e closeout
 
-**Data de atualização:** 27 de agosto de 2026
+**Data de atualização:** 9 de novembro de 2026
 **Fonte de código:** `main` no merge commit [`239f6b65`](https://github.com/Head-1/Shaka-Agente/commit/239f6b65d31accd718d70fac5a62f687f9eb2412), após a PR #49 de atualização de segurança do Wasmtime; as PRs #31–#38 permanecem como histórico integrado [1] [2] [3] [4] [5] [6] [7] [8]
-**Estado de validação:** a correção Wasmtime foi validada antes do merge com `cargo check`, testes, `missing_docs` forçado e `cargo audit` sem vulnerabilidades; qualquer novo closeout deve citar o SHA e o run correspondente
+**Estado de validação:** a correção Wasmtime foi validada antes do merge com `cargo check`, testes, `missing_docs` forçado e `cargo audit` sem vulnerabilidades. A E1 foi validada no Sandbox e reproduzida na VM no commit `b6581c72`; a publicação formal ainda depende de PR/CI/merge protegido.
 
 ## Visão executiva
 
@@ -64,6 +64,19 @@ No estado histórico `48eeed2`, o `cargo check --workspace --locked` produziu 10
 Esses avisos são dívida documental histórica sob a política `missing_docs=warn`; não representam falha de compilação, de CI ou de operação. No estado corrente `239f6b65`, a coleta explícita com `RUSTFLAGS='-W missing_docs' cargo check --workspace --all-targets` registrou zero avisos. Toda nova medição deve identificar o SHA, o comando e o ambiente; a redução de qualquer saldo futuro deve ocorrer em branches isoladas, com escopo explícito, auditoria de diff e validação nos dois ambientes.
 
 ## Limites e decisões residuais
+
+## E1 — RPO/RTO e backup externo
+
+| Item | Estado | Evidência |
+|---|---|---|
+| Snapshot SQLite externo | **Implementado e validado** | Online Backup API, destino em filesystem separado e worker residente habilitado. |
+| Disparo híbrido | **Implementado e validado** | Evento pós-checkpoint, timer de segurança, coalescência e single-flight; testes em `shaka-memory` e `shaka-queue`. |
+| Manifesto SHA-256 | **Implementado e validado** | Digest calculado no snapshot e confirmado na VM antes/depois do shutdown. |
+| Restore fail-closed | **Implementado e validado** | Cópia corrompida rejeitada por checksum sem modificar o alvo; snapshot íntegro restaurado em banco temporário. |
+| RPO 0–5 min / RTO ≤1 min | **Objetivo aprovado; medição quantitativa pendente** | O closeout funcional não substitui um ensaio cronometrado de perda máxima e tempo até readiness. |
+| Publicação | **Pendente** | Branch `docs/e1-handoff-rpo-rto`, commit `b6581c72bca5e2a69c7b066b7d525e8be21c73bd`; aguarda PR/CI/merge protegido. |
+
+O relatório completo está em [`docs/E1-CLOSEOUT-VALIDACAO.md`](E1-CLOSEOUT-VALIDACAO.md). A E2 não deve começar antes do fechamento formal da PR da E1.
 
 O BR-01 rejeita tokens legados sem expiração, mas não executa migração ou revogação em massa. Operadores que encontrem esses registros devem emitir credenciais com expiração finita e planejar a retirada dos registros antigos como operação separada.
 
