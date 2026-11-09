@@ -2471,10 +2471,12 @@ name = "shaka-memory"
 version = "0.8.2"
 dependencies = [
  "chrono",
+ "hex",
  "parking_lot",
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "shaka-core",
  "thiserror",
  "uuid",
@@ -2543,6 +2545,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "shaka-core",
+ "shaka-memory",
  "thiserror",
  "uuid",
 ]

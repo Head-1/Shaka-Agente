@@ -6,10 +6,16 @@
 use chrono::{DateTime, Duration, Utc};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, backup::Backup, params};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use shaka_core::{
     AuditEvent, DEFAULT_DATABASE_MAX_BYTES, MIN_DATABASE_MAX_BYTES, TaskId, TenantId,
 };
-use std::{path::Path, time::Duration as StdDuration};
+use std::{
+    fs::File,
+    io::Read,
+    path::{Path, PathBuf},
+    time::{Duration as StdDuration, Instant},
+};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -55,6 +61,91 @@ pub enum MemoryError {
         /// Tamanho máximo permitido em bytes.
         max_bytes: usize,
     },
+}
+
+/// Resultado de uma tentativa de execução do coordenador de backup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackupRun {
+    /// Um backup foi executado e confirmado pelo callback.
+    Completed,
+    /// Nenhuma solicitação estava vencida no instante consultado.
+    NotDue,
+    /// Outra execução já estava em andamento; a solicitação foi coalescida.
+    AlreadyRunning,
+}
+
+/// Coordenador single-flight para solicitações de backup por evento e por tempo.
+///
+/// O coordenador não transporta artefatos nem declara sucesso externo: o callback
+/// somente deve retornar `Ok` depois de concluir o snapshot e suas validações.
+#[derive(Debug)]
+pub struct BackupCoordinator {
+    state: parking_lot::Mutex<BackupCoordinatorState>,
+}
+
+#[derive(Debug)]
+struct BackupCoordinatorState {
+    interval: StdDuration,
+    last_success: Instant,
+    pending: bool,
+    running: bool,
+}
+
+impl BackupCoordinator {
+    /// Cria um coordenador com o timer ancorado no instante informado.
+    pub fn new(now: Instant, interval: StdDuration) -> Self {
+        Self {
+            state: parking_lot::Mutex::new(BackupCoordinatorState {
+                interval,
+                last_success: now,
+                pending: false,
+                running: false,
+            }),
+        }
+    }
+
+    /// Sinaliza que um commit durável relevante terminou.
+    pub fn request_event(&self) {
+        self.state.lock().pending = true;
+    }
+
+    /// Indica se há estado mais recente aguardando confirmação externa.
+    pub fn has_pending_request(&self) -> bool {
+        self.state.lock().pending
+    }
+
+    /// Executa uma solicitação vencida sem permitir duas execuções concorrentes.
+    pub fn poll<F>(&self, now: Instant, backup: F) -> Result<BackupRun, MemoryError>
+    where
+        F: FnOnce() -> Result<(), MemoryError>,
+    {
+        {
+            let mut state = self.state.lock();
+            if state.running {
+                state.pending = true;
+                return Ok(BackupRun::AlreadyRunning);
+            }
+            if !state.pending && now.duration_since(state.last_success) < state.interval {
+                return Ok(BackupRun::NotDue);
+            }
+            state.running = true;
+            state.pending = false;
+        }
+
+        let result = backup();
+        let mut state = self.state.lock();
+        state.running = false;
+        match result {
+            Ok(()) => {
+                state.last_success = now;
+                Ok(BackupRun::Completed)
+            }
+            Err(error) => {
+                state.pending = true;
+                Err(error)
+            }
+        }
+    }
 }
 
 /// Registro episódico associado a uma execução observada pelo tenant.
@@ -557,12 +648,34 @@ impl MemoryStore {
         if let Some(parent) = destination.parent() {
             std::fs::create_dir_all(parent).map_err(|error| MemoryError::Io(error.to_string()))?;
         }
-        let source = self.connection.lock();
-        let mut target = Connection::open(destination)?;
-        let backup = Backup::new(&source, &mut target)?;
-        backup.run_to_completion(100, StdDuration::from_millis(25), None)?;
-        restrict_file_permissions(destination)?;
-        Ok(())
+        let temporary = temporary_backup_path(destination, "db");
+        let manifest = checksum_manifest_path(destination);
+        let temporary_manifest = temporary_backup_path(&manifest, "sha256");
+        let result = (|| {
+            {
+                let source = self.connection.lock();
+                let mut target = Connection::open(&temporary)?;
+                let backup = Backup::new(&source, &mut target)?;
+                backup.run_to_completion(100, StdDuration::from_millis(25), None)?;
+            }
+            std::fs::rename(&temporary, destination)
+                .map_err(|error| MemoryError::Io(error.to_string()))?;
+            restrict_file_permissions(destination)?;
+
+            let checksum = sha256_file(destination)?;
+            std::fs::write(&temporary_manifest, format!("{checksum}\n"))
+                .map_err(|error| MemoryError::Io(error.to_string()))?;
+            restrict_file_permissions(&temporary_manifest)?;
+            std::fs::rename(&temporary_manifest, &manifest)
+                .map_err(|error| MemoryError::Io(error.to_string()))?;
+            restrict_file_permissions(&manifest)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+            let _ = std::fs::remove_file(&temporary_manifest);
+        }
+        result
     }
 
     /// Verifica a integridade de um arquivo SQLite sem abri-lo como store ativo.
@@ -593,6 +706,11 @@ impl MemoryStore {
 
     /// Restaura o store a partir de um snapshot cuja integridade e schema foram confirmados.
     pub fn restore_from(&self, source_path: impl AsRef<Path>) -> Result<(), MemoryError> {
+        if !verify_checksum_manifest_at(&source_path)? {
+            return Err(MemoryError::Io(
+                "checksum do backup de origem falhou".to_owned(),
+            ));
+        }
         if !Self::verify_integrity_at(&source_path)? {
             return Err(MemoryError::Io(
                 "integridade do backup de origem falhou".to_owned(),
@@ -611,6 +729,50 @@ impl MemoryStore {
     }
 }
 
+fn checksum_manifest_path(path: impl AsRef<Path>) -> PathBuf {
+    path.as_ref().with_extension("db.sha256")
+}
+
+fn temporary_backup_path(path: impl AsRef<Path>, suffix: &str) -> PathBuf {
+    let path = path.as_ref();
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("backup");
+    path.with_file_name(format!(".{file_name}.partial-{suffix}-{}", Uuid::new_v4()))
+}
+
+fn sha256_file(path: impl AsRef<Path>) -> Result<String, MemoryError> {
+    let mut file = File::open(path).map_err(|error| MemoryError::Io(error.to_string()))?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| MemoryError::Io(error.to_string()))?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(hex::encode(digest.finalize()))
+}
+
+fn verify_checksum_manifest_at(path: impl AsRef<Path>) -> Result<bool, MemoryError> {
+    let path = path.as_ref();
+    let expected = std::fs::read_to_string(checksum_manifest_path(path))
+        .map_err(|error| MemoryError::Io(format!("manifesto de checksum ausente: {error}")))?;
+    let expected = expected.trim();
+    if expected.len() != 64
+        || !expected
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+    {
+        return Ok(false);
+    }
+    Ok(expected.eq_ignore_ascii_case(&sha256_file(path)?))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -620,6 +782,82 @@ mod tests {
         sync::{Arc, Barrier, mpsc},
         thread,
     };
+
+    #[test]
+    fn backup_coordinator_coalesces_events_and_enforces_timer() {
+        let now = Instant::now();
+        let coordinator = BackupCoordinator::new(now, StdDuration::from_secs(300));
+        assert_eq!(coordinator.poll(now, || Ok(())).unwrap(), BackupRun::NotDue);
+
+        coordinator.request_event();
+        assert_eq!(
+            coordinator.poll(now, || Ok(())).unwrap(),
+            BackupRun::Completed
+        );
+        assert!(!coordinator.has_pending_request());
+        assert_eq!(
+            coordinator
+                .poll(now + StdDuration::from_secs(299), || Ok(()))
+                .unwrap(),
+            BackupRun::NotDue
+        );
+        assert_eq!(
+            coordinator
+                .poll(now + StdDuration::from_secs(300), || Ok(()))
+                .unwrap(),
+            BackupRun::Completed
+        );
+
+        coordinator.request_event();
+        let error = coordinator
+            .poll(now + StdDuration::from_secs(301), || {
+                Err(MemoryError::Io(
+                    "external destination unavailable".to_owned(),
+                ))
+            })
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("external destination unavailable")
+        );
+        assert!(coordinator.has_pending_request());
+        assert_eq!(
+            coordinator
+                .poll(now + StdDuration::from_secs(302), || Ok(()))
+                .unwrap(),
+            BackupRun::Completed
+        );
+    }
+
+    #[test]
+    fn backup_coordinator_rejects_parallel_execution() {
+        let now = Instant::now();
+        let coordinator = Arc::new(BackupCoordinator::new(now, StdDuration::from_secs(300)));
+        coordinator.request_event();
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let worker_coordinator = Arc::clone(&coordinator);
+        let worker_entered = Arc::clone(&entered);
+        let worker_release = Arc::clone(&release);
+        let worker = thread::spawn(move || {
+            worker_coordinator.poll(now, || {
+                worker_entered.wait();
+                worker_release.wait();
+                Ok(())
+            })
+        });
+
+        entered.wait();
+        assert_eq!(
+            coordinator
+                .poll(now, || panic!("backup concorrente foi executado"))
+                .unwrap(),
+            BackupRun::AlreadyRunning
+        );
+        release.wait();
+        assert_eq!(worker.join().unwrap().unwrap(), BackupRun::Completed);
+    }
 
     #[test]
     fn oversized_episode_payload_is_rejected_before_sqlite_write() {
@@ -1083,6 +1321,11 @@ mod tests {
         source_connection.close().unwrap();
 
         assert!(MemoryStore::verify_integrity_at(&source).unwrap());
+        std::fs::write(
+            checksum_manifest_path(&source),
+            format!("{}\n", sha256_file(&source).unwrap()),
+        )
+        .unwrap();
         let error = target_store.restore_from(&source).unwrap_err();
         assert!(
             error
@@ -1094,7 +1337,8 @@ mod tests {
             "preserve"
         );
         assert!(target_store.verify_integrity().unwrap());
-        std::fs::remove_file(source).unwrap();
+        std::fs::remove_file(&source).unwrap();
+        std::fs::remove_file(checksum_manifest_path(&source)).unwrap();
         std::fs::remove_file(target).unwrap();
     }
 
@@ -1119,7 +1363,8 @@ mod tests {
         let restored = MemoryStore::open(&backup).unwrap();
         assert_eq!(restored.recent_episodes(&tenant, 10).unwrap().len(), 1);
         assert!(restored.verify_integrity().unwrap());
-        std::fs::remove_file(backup).unwrap();
+        std::fs::remove_file(&backup).unwrap();
+        std::fs::remove_file(checksum_manifest_path(&backup)).unwrap();
     }
 
     #[test]
@@ -1163,6 +1408,65 @@ mod tests {
     }
 
     #[test]
+    fn restore_rejects_checksum_mismatch_without_mutating_target() {
+        let source =
+            std::env::temp_dir().join(format!("shaka-checksum-source-{}.db", Uuid::new_v4()));
+        let target =
+            std::env::temp_dir().join(format!("shaka-checksum-target-{}.db", Uuid::new_v4()));
+        let source_store = MemoryStore::in_memory().unwrap();
+        let tenant = TenantId::new("tenant-checksum").unwrap();
+        source_store
+            .append_episode(&EpisodicRecord {
+                id: Uuid::new_v4(),
+                tenant_id: tenant.clone(),
+                task_id: None,
+                kind: "checksum-source".to_owned(),
+                content: "source".to_owned(),
+                outcome: "success".to_owned(),
+                cost_microunits: 0,
+                elapsed_ms: 0,
+                created_at: Utc::now(),
+            })
+            .unwrap();
+        source_store.backup_to(&source).unwrap();
+
+        let target_store = MemoryStore::open(&target).unwrap();
+        target_store
+            .append_episode(&EpisodicRecord {
+                id: Uuid::new_v4(),
+                tenant_id: tenant.clone(),
+                task_id: None,
+                kind: "checksum-target".to_owned(),
+                content: "preserve".to_owned(),
+                outcome: "success".to_owned(),
+                cost_microunits: 0,
+                elapsed_ms: 0,
+                created_at: Utc::now(),
+            })
+            .unwrap();
+        std::fs::write(
+            checksum_manifest_path(&source),
+            format!("{}\n", "0".repeat(64)),
+        )
+        .unwrap();
+
+        let error = target_store.restore_from(&source).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("checksum do backup de origem falhou")
+        );
+        assert_eq!(
+            target_store.recent_episodes(&tenant, 10).unwrap()[0].content,
+            "preserve"
+        );
+        assert!(target_store.verify_integrity().unwrap());
+        std::fs::remove_file(&source).unwrap();
+        std::fs::remove_file(checksum_manifest_path(&source)).unwrap();
+        std::fs::remove_file(&target).unwrap();
+    }
+
+    #[test]
     fn restore_replaces_target_with_consistent_source_snapshot() {
         let source =
             std::env::temp_dir().join(format!("shaka-restore-source-{}.db", Uuid::new_v4()));
@@ -1199,6 +1503,12 @@ mod tests {
             })
             .unwrap();
 
+        drop(source_store);
+        std::fs::write(
+            checksum_manifest_path(&source),
+            format!("{}\n", sha256_file(&source).unwrap()),
+        )
+        .unwrap();
         target_store.restore_from(&source).unwrap();
         assert_eq!(
             target_store.recent_episodes(&source_tenant, 10).unwrap()[0].content,
@@ -1211,7 +1521,8 @@ mod tests {
                 .is_empty()
         );
         assert!(target_store.verify_integrity().unwrap());
-        std::fs::remove_file(source).unwrap();
+        std::fs::remove_file(&source).unwrap();
+        std::fs::remove_file(checksum_manifest_path(&source)).unwrap();
         std::fs::remove_file(target).unwrap();
     }
 

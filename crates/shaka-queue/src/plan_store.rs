@@ -3,7 +3,10 @@
 //! As transições são append-only e encadeadas por SHA-256; inconsistências ou
 //! fronteiras ambíguas não são convertidas em sucesso automaticamente.
 
-use super::{FinishOutcome, QueueError, QueueStore, TaskRecord, TaskStatus};
+use super::{
+    FinishOutcome, PlanBackupReason, PlanBackupRequest, QueueError, QueueStore, TaskRecord,
+    TaskStatus,
+};
 use chrono::{DateTime, Utc};
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
@@ -778,6 +781,14 @@ impl QueueStore {
             ],
         )?;
         transaction.commit()?;
+        self.notify_backup(PlanBackupRequest {
+            tenant_id: tenant_id.clone(),
+            plan_id: checkpoint.plan_id.clone(),
+            revision: checkpoint.revision,
+            sequence: checkpoint.sequence,
+            state_digest: checkpoint.state_digest.clone(),
+            reason: PlanBackupReason::Checkpoint,
+        });
         Ok(())
     }
 
@@ -841,6 +852,14 @@ impl QueueStore {
         apply_transition_tx(&transaction_db, tenant_id, transition)?;
         insert_transition_tx(&transaction_db, transition)?;
         transaction_db.commit()?;
+        self.notify_backup(PlanBackupRequest {
+            tenant_id: tenant_id.clone(),
+            plan_id: transition.plan_id.clone(),
+            revision: transition.revision,
+            sequence: transition.sequence,
+            state_digest: None,
+            reason: PlanBackupReason::Transition,
+        });
         Ok(())
     }
 
@@ -3186,12 +3205,13 @@ fn safe_error(error: &QueueError) -> String {
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::SubmitOutcome;
+    use crate::{BackupRun, PlanBackupAdapter, PlanBackupSink, SubmitOutcome};
     use chrono::Duration;
     use shaka_core::{
         ExecutionBudget, OperatorId, PlanAction, PlanApprovalRequirement, PlanMode, PlanRisk,
         PlanSpecInput, Role, TaskId,
     };
+    use shaka_memory::MemoryStore;
     use std::{
         sync::{Arc, Barrier, mpsc},
         thread,
@@ -3287,6 +3307,17 @@ mod tests {
         principal
     }
 
+    #[derive(Debug, Default)]
+    struct RecordingBackupSink {
+        requests: std::sync::Mutex<Vec<PlanBackupRequest>>,
+    }
+
+    impl PlanBackupSink for RecordingBackupSink {
+        fn request_backup(&self, request: PlanBackupRequest) {
+            self.requests.lock().unwrap().push(request);
+        }
+    }
+
     fn compensation_plan() -> PlanSpec {
         PlanSpec::new(PlanSpecInput {
             plan_id: PlanId::new(),
@@ -3342,6 +3373,106 @@ mod tests {
             Err(QueueError::NotFound(_))
         ));
         assert_eq!(store.save_plan(&plan).unwrap().plan.digest, plan.digest);
+    }
+
+    #[test]
+    fn plan_engine_emits_backup_request_only_after_new_durable_state() {
+        let sink = Arc::new(RecordingBackupSink::default());
+        let store = QueueStore::in_memory()
+            .unwrap()
+            .with_backup_sink(Arc::clone(&sink) as Arc<dyn PlanBackupSink>);
+        let plan = test_plan();
+        store.save_plan(&plan).unwrap();
+        let created_at = Utc::now();
+        let checkpoint = PlanCheckpoint {
+            plan_id: plan.plan_id.clone(),
+            revision: plan.revision,
+            sequence: 1,
+            step_id: None,
+            phase: PlanCheckpointPhase::BeforeStep,
+            status: PlanCheckpointStatus::Succeeded,
+            state_digest: Some("a".repeat(64)),
+            created_at,
+        };
+
+        store
+            .append_plan_checkpoint(&plan.tenant_id, &checkpoint)
+            .unwrap();
+        store
+            .append_plan_checkpoint(&plan.tenant_id, &checkpoint)
+            .unwrap();
+
+        let transition = PlanStoreTransition::new(
+            plan.plan_id.clone(),
+            plan.revision,
+            1,
+            PlanTransitionEntity::Plan,
+            None,
+            PlanTransitionState::Plan(PlanState::Draft),
+            PlanTransitionState::Plan(PlanState::Proposed),
+            "backup-event-transition",
+            None,
+            created_at,
+        )
+        .unwrap();
+        store
+            .record_plan_transition(&plan.tenant_id, &transition)
+            .unwrap();
+        store
+            .record_plan_transition(&plan.tenant_id, &transition)
+            .unwrap();
+
+        let requests = sink.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].reason, PlanBackupReason::Checkpoint);
+        assert_eq!(requests[0].sequence, 1);
+        assert_eq!(requests[0].state_digest, Some("a".repeat(64)));
+        assert_eq!(requests[1].reason, PlanBackupReason::Transition);
+        assert_eq!(requests[1].sequence, 1);
+        assert_eq!(requests[1].state_digest, None);
+    }
+
+    #[test]
+    fn plan_engine_checkpoint_drives_real_memory_snapshot_through_adapter() {
+        let memory = Arc::new(MemoryStore::in_memory().unwrap());
+        let destination =
+            std::env::temp_dir().join(format!("shaka-e1-3-plan-adapter-{}.db", Uuid::new_v4()));
+        let manifest = destination.with_extension("db.sha256");
+        let now = std::time::Instant::now();
+        let adapter = Arc::new(PlanBackupAdapter::new(
+            Arc::clone(&memory),
+            destination.clone(),
+            now,
+            StdDuration::from_secs(300),
+        ));
+        let store = QueueStore::in_memory()
+            .unwrap()
+            .with_backup_sink(Arc::clone(&adapter) as Arc<dyn PlanBackupSink>);
+        let plan = test_plan();
+        store.save_plan(&plan).unwrap();
+        store
+            .append_plan_checkpoint(
+                &plan.tenant_id,
+                &PlanCheckpoint {
+                    plan_id: plan.plan_id.clone(),
+                    revision: plan.revision,
+                    sequence: 1,
+                    step_id: None,
+                    phase: PlanCheckpointPhase::AfterStep,
+                    status: PlanCheckpointStatus::Succeeded,
+                    state_digest: Some("b".repeat(64)),
+                    created_at: Utc::now(),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(adapter.poll(now).unwrap(), BackupRun::Completed);
+        assert!(destination.exists());
+        assert!(manifest.exists());
+        assert!(MemoryStore::verify_integrity_at(&destination).unwrap());
+
+        let _ = std::fs::remove_file(destination);
+        let _ = std::fs::remove_file(manifest);
     }
 
     #[test]

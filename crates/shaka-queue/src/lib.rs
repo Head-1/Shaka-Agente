@@ -14,7 +14,8 @@ use shaka_core::{
     PlanExecutionScope, PlanId, PlanStep, PlanStepId, Principal, Role, TaskEnvelope, TaskId,
     TenantId,
 };
-use std::sync::Arc;
+use shaka_memory::{BackupCoordinator, BackupRun, MemoryError, MemoryStore};
+use std::{path::PathBuf, sync::Arc, time::Instant};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -26,6 +27,86 @@ pub use plan_store::{
     PlanResolutionDecision, PlanResolutionOutcome, PlanResumeReport, PlanResumeStatus,
     PlanStoreTransition, PlanTaskReference, PlanTransitionEntity, PlanTransitionState,
 };
+
+/// Motivo que originou uma solicitação de snapshot do Plan Engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanBackupReason {
+    /// Um checkpoint novo foi confirmado no SQLite.
+    Checkpoint,
+    /// Uma transição append-only nova foi confirmada no SQLite.
+    Transition,
+}
+
+/// Evento mínimo emitido após uma mudança durável do Plan Engine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanBackupRequest {
+    /// Tenant proprietário do estado persistido.
+    pub tenant_id: TenantId,
+    /// Plano cujo estado foi alterado.
+    pub plan_id: PlanId,
+    /// Revisão do plano.
+    pub revision: u32,
+    /// Sequência monotônica do checkpoint ou transição.
+    pub sequence: u64,
+    /// Digest do estado, quando fornecido pelo checkpoint.
+    pub state_digest: Option<String>,
+    /// Fonte do pedido de snapshot.
+    pub reason: PlanBackupReason,
+}
+
+/// Sink para encaminhar pedidos ao coordenador de backup.
+pub trait PlanBackupSink: Send + Sync + std::fmt::Debug {
+    /// Recebe um pedido somente depois de o commit SQLite ter sido concluído.
+    fn request_backup(&self, request: PlanBackupRequest);
+}
+
+/// Adaptador entre eventos duráveis do Plan Engine e snapshots da memória.
+///
+/// O método [`Self::request_backup`] somente sinaliza o coordenador. A operação
+/// de filesystem ocorre em [`Self::poll`], permitindo que o chamador escolha um
+/// worker ou timer para executar o backup sem manter a transação SQLite aberta.
+#[derive(Debug)]
+pub struct PlanBackupAdapter {
+    coordinator: Arc<BackupCoordinator>,
+    memory: Arc<MemoryStore>,
+    destination: PathBuf,
+}
+
+impl PlanBackupAdapter {
+    /// Cria um adaptador com destino externo e relógio inicial controlável.
+    pub fn new(
+        memory: Arc<MemoryStore>,
+        destination: impl Into<PathBuf>,
+        now: Instant,
+        interval: std::time::Duration,
+    ) -> Self {
+        Self {
+            coordinator: Arc::new(BackupCoordinator::new(now, interval)),
+            memory,
+            destination: destination.into(),
+        }
+    }
+
+    /// Acesso ao coordenador para composição com workers e sondas operacionais.
+    #[must_use]
+    pub fn coordinator(&self) -> Arc<BackupCoordinator> {
+        Arc::clone(&self.coordinator)
+    }
+
+    /// Executa o backup quando um evento ou o timer de segurança o torna devido.
+    pub fn poll(&self, now: Instant) -> Result<BackupRun, MemoryError> {
+        let memory = Arc::clone(&self.memory);
+        let destination = self.destination.clone();
+        self.coordinator
+            .poll(now, move || memory.backup_to(destination))
+    }
+}
+
+impl PlanBackupSink for PlanBackupAdapter {
+    fn request_backup(&self, _request: PlanBackupRequest) {
+        self.coordinator.request_event();
+    }
+}
 
 /// Erros da fila, do IAM host-side e da persistência SQLite.
 ///
@@ -425,6 +506,7 @@ impl Default for CircuitConfig {
 #[derive(Debug)]
 pub struct QueueStore {
     connection: Mutex<Connection>,
+    backup_sink: Option<Arc<dyn PlanBackupSink>>,
 }
 
 fn configure_database_quota(connection: &Connection, max_bytes: u64) -> Result<(), QueueError> {
@@ -485,6 +567,7 @@ impl QueueStore {
         configure_database_quota(&connection, max_database_bytes)?;
         let store = Self {
             connection: Mutex::new(connection),
+            backup_sink: None,
         };
         store.migrate()?;
         Ok(store)
@@ -502,9 +585,23 @@ impl QueueStore {
         configure_database_quota(&connection, max_database_bytes)?;
         let store = Self {
             connection: Mutex::new(connection),
+            backup_sink: None,
         };
         store.migrate()?;
         Ok(store)
+    }
+
+    /// Anexa o sink de backup sem alterar a semântica das transações existentes.
+    #[must_use]
+    pub fn with_backup_sink(mut self, sink: Arc<dyn PlanBackupSink>) -> Self {
+        self.backup_sink = Some(sink);
+        self
+    }
+
+    pub(crate) fn notify_backup(&self, request: PlanBackupRequest) {
+        if let Some(sink) = &self.backup_sink {
+            sink.request_backup(request);
+        }
     }
 
     #[allow(clippy::too_many_lines)]
@@ -3307,5 +3404,54 @@ mod tests {
         let loaded = store.get_task(&task_id, &principal.tenant_id).unwrap();
         assert_eq!(loaded.envelope.budget.max_steps, 4);
         assert_eq!(loaded.envelope.budget.max_cost_microunits, 500);
+    }
+
+    #[test]
+    fn plan_backup_adapter_runs_event_and_timer_snapshots() {
+        let memory = Arc::new(MemoryStore::in_memory().unwrap());
+        let destination =
+            std::env::temp_dir().join(format!("shaka-e1-3-adapter-{}.db", Uuid::new_v4()));
+        let manifest = destination.with_extension("db.sha256");
+        let now = Instant::now();
+        let adapter = Arc::new(PlanBackupAdapter::new(
+            Arc::clone(&memory),
+            destination.clone(),
+            now,
+            std::time::Duration::from_secs(300),
+        ));
+
+        assert_eq!(
+            adapter.poll(now).unwrap(),
+            BackupRun::NotDue,
+            "o adaptador não deve fazer backup sem evento antes do timer"
+        );
+        adapter.request_backup(PlanBackupRequest {
+            tenant_id: TenantId::new("tenant-adapter").unwrap(),
+            plan_id: PlanId::new(),
+            revision: 1,
+            sequence: 1,
+            state_digest: None,
+            reason: PlanBackupReason::Checkpoint,
+        });
+        assert_eq!(adapter.poll(now).unwrap(), BackupRun::Completed);
+        assert!(destination.exists());
+        assert!(manifest.exists());
+        assert!(MemoryStore::verify_integrity_at(&destination).unwrap());
+
+        assert_eq!(
+            adapter
+                .poll(now + std::time::Duration::from_secs(299))
+                .unwrap(),
+            BackupRun::NotDue
+        );
+        assert_eq!(
+            adapter
+                .poll(now + std::time::Duration::from_secs(300))
+                .unwrap(),
+            BackupRun::Completed
+        );
+
+        let _ = std::fs::remove_file(destination);
+        let _ = std::fs::remove_file(manifest);
     }
 }
