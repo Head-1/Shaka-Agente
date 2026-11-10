@@ -168,6 +168,25 @@ pub enum QueueError {
     LeaseLost,
 }
 
+pub(crate) fn sqlite_i64<T>(value: T, field: &str) -> Result<i64, QueueError>
+where
+    T: TryInto<i64>,
+{
+    value
+        .try_into()
+        .map_err(|_| QueueError::InvalidInput(format!("{field} excede SQLite INTEGER")))
+}
+
+pub(crate) fn sqlite_u64(row: &rusqlite::Row<'_>, column: usize) -> rusqlite::Result<u64> {
+    let value = row.get::<_, i64>(column)?;
+    u64::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(column, value))
+}
+
+pub(crate) fn sqlite_u32(row: &rusqlite::Row<'_>, column: usize) -> rusqlite::Result<u32> {
+    let value = row.get::<_, i64>(column)?;
+    u32::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(column, value))
+}
+
 /// Estado persistido de uma tarefa da fila.
 ///
 /// `Queued`, `Running` e `CancelRequested` são estados não terminais;
@@ -521,7 +540,7 @@ fn configure_database_quota(connection: &Connection, max_bytes: u64) -> Result<(
         requested_bytes: max_bytes,
         minimum_bytes: MIN_DATABASE_MAX_BYTES,
     })?;
-    let max_pages = max_bytes / page_size;
+    let max_pages = sqlite_i64(max_bytes / page_size, "max_page_count")?;
     if max_pages == 0 {
         return Err(QueueError::InvalidDatabaseQuota {
             requested_bytes: max_bytes,
@@ -532,7 +551,7 @@ fn configure_database_quota(connection: &Connection, max_bytes: u64) -> Result<(
         connection.pragma_update_and_check(None, "max_page_count", max_pages, |row| {
             row.get::<_, i64>(0)
         })?;
-    if effective_pages != i64::try_from(max_pages).unwrap_or(i64::MAX) {
+    if effective_pages != max_pages {
         return Err(QueueError::InvalidDatabaseQuota {
             requested_bytes: max_bytes,
             minimum_bytes: MIN_DATABASE_MAX_BYTES,
@@ -1099,11 +1118,14 @@ impl QueueStore {
                     max_daily_cost_microunits = ?3, requests_per_window = ?4, window_seconds = ?5
              WHERE tenant_id = ?6",
             params![
-                limits.max_active_tasks,
-                limits.max_daily_tasks,
-                limits.max_daily_cost_microunits,
-                limits.requests_per_window,
-                limits.window_seconds,
+                sqlite_i64(limits.max_active_tasks, "max_active_tasks")?,
+                sqlite_i64(limits.max_daily_tasks, "max_daily_tasks")?,
+                sqlite_i64(
+                    limits.max_daily_cost_microunits,
+                    "max_daily_cost_microunits"
+                )?,
+                sqlite_i64(limits.requests_per_window, "requests_per_window")?,
+                sqlite_i64(limits.window_seconds, "window_seconds")?,
                 limits.tenant_id.0,
             ],
         )?;
@@ -1128,11 +1150,11 @@ impl QueueStore {
                 |row| {
                     Ok(TenantLimits {
                         tenant_id: tenant_id.clone(),
-                        max_active_tasks: row.get(0)?,
-                        max_daily_tasks: row.get(1)?,
-                        max_daily_cost_microunits: row.get(2)?,
-                        requests_per_window: row.get(3)?,
-                        window_seconds: row.get(4)?,
+                        max_active_tasks: sqlite_u32(row, 0)?,
+                        max_daily_tasks: sqlite_u32(row, 1)?,
+                        max_daily_cost_microunits: sqlite_u64(row, 2)?,
+                        requests_per_window: sqlite_u32(row, 3)?,
+                        window_seconds: sqlite_u32(row, 4)?,
                     })
                 },
             )
@@ -2268,11 +2290,11 @@ fn load_limits_tx(
             |row| {
                 Ok(TenantLimits {
                     tenant_id: tenant_id.clone(),
-                    max_active_tasks: row.get(0)?,
-                    max_daily_tasks: row.get(1)?,
-                    max_daily_cost_microunits: row.get(2)?,
-                    requests_per_window: row.get(3)?,
-                    window_seconds: row.get(4)?,
+                    max_active_tasks: sqlite_u32(row, 0)?,
+                    max_daily_tasks: sqlite_u32(row, 1)?,
+                    max_daily_cost_microunits: sqlite_u64(row, 2)?,
+                    requests_per_window: sqlite_u32(row, 3)?,
+                    window_seconds: sqlite_u32(row, 4)?,
                 })
             },
         )
@@ -2293,11 +2315,14 @@ fn ensure_limits_tx(
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![
             tenant_id.0,
-            limits.max_active_tasks,
-            limits.max_daily_tasks,
-            limits.max_daily_cost_microunits,
-            limits.requests_per_window,
-            limits.window_seconds,
+            sqlite_i64(limits.max_active_tasks, "max_active_tasks")?,
+            sqlite_i64(limits.max_daily_tasks, "max_daily_tasks")?,
+            sqlite_i64(
+                limits.max_daily_cost_microunits,
+                "max_daily_cost_microunits"
+            )?,
+            sqlite_i64(limits.requests_per_window, "requests_per_window")?,
+            sqlite_i64(limits.window_seconds, "window_seconds")?,
         ],
     )?;
     let _ = now;
@@ -2312,11 +2337,11 @@ fn load_tenant_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TenantRecord> {
     let limits = TenantLimits {
         tenant_id: TenantId::new(tenant_id.clone())
             .map_err(|error| to_sql_error(QueueError::Core(error)))?,
-        max_active_tasks: row.get(4)?,
-        max_daily_tasks: row.get(5)?,
-        max_daily_cost_microunits: row.get(6)?,
-        requests_per_window: row.get(7)?,
-        window_seconds: row.get(8)?,
+        max_active_tasks: sqlite_u32(row, 4)?,
+        max_daily_tasks: sqlite_u32(row, 5)?,
+        max_daily_cost_microunits: sqlite_u64(row, 6)?,
+        requests_per_window: sqlite_u32(row, 7)?,
+        window_seconds: sqlite_u32(row, 8)?,
     };
     Ok(TenantRecord {
         tenant_id: limits.tenant_id.clone(),
@@ -3453,5 +3478,23 @@ mod tests {
 
         let _ = std::fs::remove_file(destination);
         let _ = std::fs::remove_file(manifest);
+    }
+
+    #[test]
+    fn sqlite_integer_conversion_is_fail_closed() {
+        assert!(sqlite_i64(u64::MAX, "sequence").is_err());
+        assert_eq!(
+            sqlite_i64(u32::MAX, "sequence").unwrap(),
+            i64::from(u32::MAX)
+        );
+
+        let connection = Connection::open_in_memory().unwrap();
+        let negative = connection
+            .query_row("SELECT -1", [], |row| sqlite_u64(row, 0))
+            .unwrap_err();
+        assert!(matches!(
+            negative,
+            rusqlite::Error::IntegralValueOutOfRange(0, -1)
+        ));
     }
 }

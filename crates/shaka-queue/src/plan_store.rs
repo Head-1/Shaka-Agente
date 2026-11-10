@@ -5,7 +5,7 @@
 
 use super::{
     FinishOutcome, PlanBackupReason, PlanBackupRequest, QueueError, QueueStore, TaskRecord,
-    TaskStatus,
+    TaskStatus, sqlite_i64, sqlite_u64,
 };
 use chrono::{DateTime, Utc};
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
@@ -724,7 +724,7 @@ impl QueueStore {
                 "SELECT sequence FROM plan_checkpoints
                  WHERE plan_id = ?1 AND revision = ?2 ORDER BY sequence DESC LIMIT 1",
                 params![checkpoint.plan_id.0.to_string(), checkpoint.revision],
-                |row| row.get::<_, u64>(0),
+                |row| sqlite_u64(row, 0),
             )
             .optional()?;
         if previous.is_some_and(|sequence| checkpoint.sequence <= sequence) {
@@ -735,7 +735,7 @@ impl QueueStore {
                     params![
                         checkpoint.plan_id.0.to_string(),
                         checkpoint.revision,
-                        checkpoint.sequence
+                        sqlite_i64(checkpoint.sequence, "checkpoint.sequence")?
                     ],
                     |row| {
                         Ok((
@@ -772,7 +772,7 @@ impl QueueStore {
             params![
                 checkpoint.plan_id.0.to_string(),
                 checkpoint.revision,
-                checkpoint.sequence,
+                sqlite_i64(checkpoint.sequence, "checkpoint.sequence")?,
                 checkpoint.step_id.as_ref().map(|id| id.0.clone()),
                 checkpoint.phase.as_str(),
                 checkpoint.status.as_str(),
@@ -838,7 +838,7 @@ impl QueueStore {
                 "SELECT sequence, event_hash FROM plan_transitions
                  WHERE plan_id = ?1 AND revision = ?2 ORDER BY sequence DESC LIMIT 1",
                 params![transition.plan_id.0.to_string(), transition.revision],
-                |row| Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?)),
+                |row| Ok((sqlite_u64(row, 0)?, row.get::<_, String>(1)?)),
             )
             .optional()?;
         let expected_sequence = last.as_ref().map_or(1, |row| row.0 + 1);
@@ -1462,7 +1462,7 @@ impl QueueStore {
             .query_map(params![plan_id.0.to_string(), revision], |row| {
                 let step_id = row.get::<_, Option<String>>(1)?;
                 Ok((
-                    row.get::<_, u64>(0)?,
+                    sqlite_u64(row, 0)?,
                     step_id,
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
@@ -1588,7 +1588,7 @@ impl QueueStore {
             params![
                 plan_id.0.to_string(),
                 revision,
-                checkpoint_sequence,
+                sqlite_i64(checkpoint_sequence, "checkpoint.sequence")?,
                 state_digest,
                 Utc::now().to_rfc3339()
             ],
@@ -1721,7 +1721,7 @@ impl QueueStore {
                 params![
                     plan_id.0.to_string(),
                     revision,
-                    checkpoint_sequence,
+                    sqlite_i64(checkpoint_sequence, "checkpoint.sequence")?,
                     Utc::now().to_rfc3339(),
                     tenant_id.0
                 ],
@@ -2837,7 +2837,7 @@ fn insert_checkpoint_tx(
         params![
             plan_id.0.to_string(),
             revision,
-            sequence,
+            sqlite_i64(sequence, "checkpoint.sequence")?,
             step_id.map(|id| id.0.clone()),
             phase.as_str(),
             status.as_str(),
@@ -2965,7 +2965,7 @@ fn insert_transition_tx(
             transition.transition_id.to_string(),
             transition.plan_id.0.to_string(),
             transition.revision,
-            transition.sequence,
+            sqlite_i64(transition.sequence, "transition.sequence")?,
             transition.entity.as_str(),
             transition.entity_id.as_ref().map(|id| id.0.clone()),
             serde_json::to_string(transition)?,
@@ -3060,7 +3060,7 @@ fn last_transition_tx(
             "SELECT sequence, event_hash FROM plan_transitions
              WHERE plan_id = ?1 AND revision = ?2 ORDER BY sequence DESC LIMIT 1",
             params![plan_id.0.to_string(), revision],
-            |row| Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?)),
+            |row| Ok((sqlite_u64(row, 0)?, row.get::<_, String>(1)?)),
         )
         .optional()?)
 }
@@ -3075,7 +3075,7 @@ fn next_checkpoint_sequence_tx(
             "SELECT sequence FROM plan_checkpoints
              WHERE plan_id = ?1 AND revision = ?2 ORDER BY sequence DESC LIMIT 1",
             params![plan_id.0.to_string(), revision],
-            |row| row.get::<_, u64>(0),
+            |row| sqlite_u64(row, 0),
         )
         .optional()?;
     Ok(last.map_or(1, |sequence| sequence + 1))

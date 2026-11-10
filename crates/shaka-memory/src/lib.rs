@@ -93,6 +93,7 @@ struct BackupCoordinatorState {
 
 impl BackupCoordinator {
     /// Cria um coordenador com o timer ancorado no instante informado.
+    #[must_use]
     pub fn new(now: Instant, interval: StdDuration) -> Self {
         Self {
             state: parking_lot::Mutex::new(BackupCoordinatorState {
@@ -238,7 +239,11 @@ fn configure_database_quota(connection: &Connection, max_bytes: u64) -> Result<(
         requested_bytes: max_bytes,
         minimum_bytes: MIN_DATABASE_MAX_BYTES,
     })?;
-    let max_pages = max_bytes / page_size;
+    let max_pages =
+        i64::try_from(max_bytes / page_size).map_err(|_| MemoryError::InvalidDatabaseQuota {
+            requested_bytes: max_bytes,
+            minimum_bytes: MIN_DATABASE_MAX_BYTES,
+        })?;
     if max_pages == 0 {
         return Err(MemoryError::InvalidDatabaseQuota {
             requested_bytes: max_bytes,
@@ -249,7 +254,7 @@ fn configure_database_quota(connection: &Connection, max_bytes: u64) -> Result<(
         connection.pragma_update_and_check(None, "max_page_count", max_pages, |row| {
             row.get::<_, i64>(0)
         })?;
-    if effective_pages != i64::try_from(max_pages).unwrap_or(i64::MAX) {
+    if effective_pages != max_pages {
         return Err(MemoryError::InvalidDatabaseQuota {
             requested_bytes: max_bytes,
             minimum_bytes: MIN_DATABASE_MAX_BYTES,
@@ -383,6 +388,12 @@ impl MemoryStore {
                 max_bytes: MAX_EPISODE_CONTENT_BYTES,
             });
         }
+        let cost_microunits = i64::try_from(record.cost_microunits).map_err(|_| {
+            MemoryError::InvalidRecord("cost_microunits excede SQLite INTEGER".to_owned())
+        })?;
+        let elapsed_ms = i64::try_from(record.elapsed_ms).map_err(|_| {
+            MemoryError::InvalidRecord("elapsed_ms excede SQLite INTEGER".to_owned())
+        })?;
         self.connection.lock().execute(
             "INSERT INTO episodic_memory
              (id, tenant_id, task_id, kind, content, outcome, cost_microunits, elapsed_ms, created_at)
@@ -394,8 +405,8 @@ impl MemoryStore {
                 record.kind,
                 record.content,
                 record.outcome,
-                record.cost_microunits,
-                record.elapsed_ms,
+                cost_microunits,
+                elapsed_ms,
                 record.created_at.to_rfc3339(),
             ],
         )?;
@@ -431,6 +442,11 @@ impl MemoryStore {
             let created_at = DateTime::parse_from_rfc3339(&created_at)
                 .map_err(|_| MemoryError::InvalidRecord("episodic created_at inválido".to_owned()))?
                 .with_timezone(&Utc);
+            let cost_microunits = u64::try_from(row.get::<_, i64>(5)?).map_err(|_| {
+                MemoryError::InvalidRecord("cost_microunits SQLite negativo".to_owned())
+            })?;
+            let elapsed_ms = u64::try_from(row.get::<_, i64>(6)?)
+                .map_err(|_| MemoryError::InvalidRecord("elapsed_ms SQLite negativo".to_owned()))?;
             episodes.push(EpisodicRecord {
                 id,
                 tenant_id: TenantId(tenant_id.0.clone()),
@@ -438,8 +454,8 @@ impl MemoryStore {
                 kind: row.get(2)?,
                 content: row.get(3)?,
                 outcome: row.get(4)?,
-                cost_microunits: row.get(5)?,
-                elapsed_ms: row.get(6)?,
+                cost_microunits,
+                elapsed_ms,
                 created_at,
             });
         }
@@ -745,7 +761,7 @@ fn temporary_backup_path(path: impl AsRef<Path>, suffix: &str) -> PathBuf {
 fn sha256_file(path: impl AsRef<Path>) -> Result<String, MemoryError> {
     let mut file = File::open(path).map_err(|error| MemoryError::Io(error.to_string()))?;
     let mut digest = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
     loop {
         let read = file
             .read(&mut buffer)

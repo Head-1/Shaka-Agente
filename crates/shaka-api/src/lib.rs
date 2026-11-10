@@ -1302,8 +1302,7 @@ async fn backup_loop(shutdown: ShutdownFlag, adapter: Arc<PlanBackupAdapter>) {
             Ok(Ok(shaka_memory::BackupRun::Completed)) => {
                 info!("backup externo confirmado pelo worker residente");
             }
-            Ok(Ok(shaka_memory::BackupRun::AlreadyRunning))
-            | Ok(Ok(shaka_memory::BackupRun::NotDue)) => {}
+            Ok(Ok(shaka_memory::BackupRun::AlreadyRunning | shaka_memory::BackupRun::NotDue)) => {}
             Ok(Err(error)) => {
                 warn!(
                     ?error,
