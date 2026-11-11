@@ -14,6 +14,7 @@ serde_json.workspace = true
 sha2.workspace = true
 hex.workspace = true
 shaka-core = { path = "../shaka-core" }
+shaka-memory = { path = "../shaka-memory" }
 thiserror.workspace = true
 uuid = { version = "1.11", features = ["v4", "serde"] }
 

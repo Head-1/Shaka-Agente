@@ -18,7 +18,10 @@ use shaka_observability::{AuditLogger, init_tracing};
 use shaka_orchestrator::{
     AgentRuntime, EchoTool, LocalModel, OpenAiCompatibleModel, ToolRegistry, WasmSkillTool,
 };
-use shaka_queue::{PlanInspectionStatus, PlanResolutionDecision, QueueStore, TenantLimits};
+use shaka_queue::{
+    PlanBackupAdapter, PlanBackupSink, PlanInspectionStatus, PlanResolutionDecision, QueueStore,
+    TenantLimits,
+};
 use shaka_sandbox::{SandboxPolicy, WasmExecutor};
 use shaka_skills::{SkillRegistry, TrustStore, load_signing_key, public_key_hex, save_signing_key};
 use uuid::Uuid;
@@ -28,6 +31,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Instant,
 };
 
 #[derive(Debug, Parser)]
@@ -215,6 +219,12 @@ struct ServeArgs {
     live: bool,
     #[arg(long, env = "SHAKA_CONFIRM_LIVE", default_value_t = false, hide = true)]
     confirm_live: bool,
+    #[arg(
+        long,
+        env = "SHAKA_BACKUP_PATH",
+        help = "destino externo montado para snapshots SQLite; sem este parâmetro o backup residente fica desabilitado"
+    )]
+    backup_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -378,11 +388,21 @@ async fn serve_agent(cli: &Cli, args: &ServeArgs) -> Result<()> {
     let mut tools = build_tool_registry(cli, &config)?;
     tools.register(Arc::new(EchoTool))?;
     let runtime = Arc::new(AgentRuntime::new(model, Arc::clone(&memory), tools));
-    let audit = Arc::new(AuditLogger::new(memory));
-    let queue = Arc::new(QueueStore::open_with_max_bytes(
-        &config.database,
-        config.database_max_bytes,
-    )?);
+    let audit = Arc::new(AuditLogger::new(Arc::clone(&memory)));
+    let queue = QueueStore::open_with_max_bytes(&config.database, config.database_max_bytes)?;
+    let backup_adapter = args.backup_path.as_ref().map(|destination| {
+        Arc::new(PlanBackupAdapter::new(
+            Arc::clone(&memory),
+            destination.clone(),
+            Instant::now(),
+            std::time::Duration::from_secs(300),
+        ))
+    });
+    let queue = if let Some(adapter) = &backup_adapter {
+        Arc::new(queue.with_backup_sink(Arc::clone(adapter) as Arc<dyn PlanBackupSink>))
+    } else {
+        Arc::new(queue)
+    };
     let bind_addr: SocketAddr = args
         .bind
         .parse()
@@ -397,6 +417,12 @@ async fn serve_agent(cli: &Cli, args: &ServeArgs) -> Result<()> {
     };
     let state = ApiState::new(queue, runtime, audit, config.principal, api_config)
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let state = if let Some(adapter) = backup_adapter {
+        state.with_backup_adapter(adapter)
+    } else {
+        tracing::warn!("SHAKA_BACKUP_PATH não configurado; backup residente desabilitado");
+        state
+    };
     serve_api(state)
         .await
         .map_err(|error| anyhow::anyhow!(error.to_string()))

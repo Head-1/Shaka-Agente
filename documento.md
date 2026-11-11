@@ -3,7 +3,7 @@
 **Finalidade:** transferir o entendimento técnico e operacional do Shaka-Agente para o próximo desenvolvedor, engenheiro de confiabilidade ou agente de IA que precise manter, validar ou evoluir o sistema.
 
 **Data de elaboração:** 2026-08-28
-**Estado de referência:** `origin/main` em `ccfeef9ec84f36a5ff37077f51d5072306ecbe03`
+**Estado de referência:** `origin/main` em `239f6b65d31accd718d70fac5a62f687f9eb2412` (merge da PR #49, atualização de segurança do Wasmtime para `47.0.4`)
 **Release funcional:** `v0.8.2`
 **Autor:** Manus AI
 
@@ -19,7 +19,7 @@ Este guia é um mapa de continuidade, não substitui os contratos mais detalhado
 
 O Shaka é um agente de IA em Rust para execução governada de tarefas. Ele recebe um objetivo, usa um provedor de modelo local ou compatível com OpenAI, valida ferramentas no host, persiste memória e auditoria em SQLite e executa módulos WASM em sandbox restrito. O agente pode sugerir melhorias, mas não pode promover suas próprias skills, alterar políticas ou conceder autoridade a si mesmo.
 
-A versão atual é uma **base operacional local controlada**, não uma implantação pública irrestrita. O padrão é loopback, provedor local, tarefas em `dry-run` e rejeição de efeitos externos. Planos `live`, mensageria externa, pesquisa autônoma na web, autopromoção de skills e subagentes irrestritos continuam bloqueados ou fora do escopo.
+A versão atual é uma **base operacional local controlada**, não uma implantação pública irrestrita. O padrão é loopback, provedor local, tarefas em `dry-run` e rejeição de efeitos externos. A versão corrente inclui Wasmtime `47.0.4`; não reverter para `47.0.3`, que foi identificado com advisories de segurança. Planos `live`, mensageria externa, pesquisa autônoma na web, autopromoção de skills e subagentes irrestritos continuam bloqueados ou fora do escopo.
 
 | Área | Estado atual comprovado |
 |---|---|
@@ -29,7 +29,7 @@ A versão atual é uma **base operacional local controlada**, não uma implanta�
 | Auditoria | Cadeia de hashes por tenant, com redaction e verificação administrativa |
 | Fila | Sessões, idempotência, prioridade, leases, retry, cancelamento e circuit breaker persistentes |
 | API | HTTP local com health/readiness, sessões, tarefas e cancelamento |
-| Sandbox | Wasmtime deny-by-default, sem WASI, rede, filesystem ou imports do host |
+| Sandbox | Wasmtime `47.0.4`, deny-by-default, sem WASI, rede, filesystem ou imports do host |
 | Skills | Catálogo com estados, hash, aprovação humana e revogação |
 | Quota SQLite | Configurável; default 256 MiB; mínimo 1 MiB; aplicada em `QueueStore` e `MemoryStore` |
 | P0-A a P0-E | Concluídos, mesclados e validados em sandbox e VM |
@@ -37,17 +37,13 @@ A versão atual é uma **base operacional local controlada**, não uma implanta�
 
 ## 3. Fonte de verdade e divergências documentais
 
-O SHA de referência atual é:
+O SHA de referência corrente é:
 
 ```text
-ccfeef9ec84f36a5ff37077f51d5072306ecbe03
+239f6b65d31accd718d70fac5a62f687f9eb2412
 ```
 
-Esse commit é o merge da PR #46, `feat(storage): enforce SQLite database quota`, que integrou a quota total do SQLite. A branch de feature continua preservada em:
-
-```text
-chore/p0e-sqlite-quota -> 38eea16fcbe7bd9599be65a4ed7ecdcba9540a36
-```
+Esse commit é o merge da PR #49, `fix(security): update wasmtime to patched release`, que atualizou o Wasmtime para `47.0.4` e eliminou os advisories reproduzidos no `47.0.3`. O P0-E permanece integrado no histórico anterior; referências a `ccfeef9`, `48eeed2` e outros SHAs devem ser lidas como evidência histórica, não como estado corrente.
 
 Alguns documentos históricos do repositório ainda apontam para o estado anterior `48eeed2` e para a série de PRs #31–#38. Isso é uma **defasagem documental conhecida**, não uma indicação de que o merge P0-E não ocorreu. Antes de atualizar esses documentos, confirme `git rev-parse origin/main`, compare o conteúdo real e faça uma alteração documental isolada. Não reescreva históricos para apagar referências antigas.
 
@@ -128,12 +124,12 @@ gh repo clone Head-1/Shaka-Agente
 cd Shaka-Agente
 git fetch origin main
 test "$(git rev-parse origin/main)" = \
-  "ccfeef9ec84f36a5ff37077f51d5072306ecbe03"
+  "239f6b65d31accd718d70fac5a62f687f9eb2412"
 git switch --detach origin/main
 test -z "$(git status --porcelain)"
 ```
 
-Em seguida, leia pelo menos `README.md`, `ARCHITECTURE.md`, `SECURITY.md`, `SKILL_GOVERNANCE.md`, `RUNBOOK_OPERACIONAL.md`, `API_CONTRACTS.md`, `TESTING_STRATEGY.md` e `docs/VALIDACAO_REPOSITORY_FIRST.md`. O arquivo `MEMORANDO_DE_HANDOFF_ONBOARDING.md` fornece um resumo anterior; este documento acrescenta o estado pós-P0-E.
+Em seguida, leia pelo menos `README.md`, `ARCHITECTURE.md`, `SECURITY.md`, `SKILL_GOVERNANCE.md`, `RUNBOOK_OPERACIONAL.md`, `API_CONTRACTS.md`, `TESTING_STRATEGY.md` e `docs/VALIDACAO_REPOSITORY_FIRST.md`. O arquivo `MEMORANDO_DE_HANDOFF_ONBOARDING.md` fornece o resumo de onboarding e handoff; este documento acrescenta o estado pós-P0-E e as regras detalhadas de continuidade.
 
 Confirme o ambiente e execute uma validação inicial:
 
@@ -177,7 +173,12 @@ A configuração esperada para commits é SSH signing. A chave privada nunca dev
 git config --get gpg.format
 git config --get commit.gpgsign
 git config --get user.signingkey
+# Exemplo do fluxo validado; a chave privada permanece local ao ambiente.
+git config gpg.format ssh
+git config user.signingkey "$HOME/.ssh/shaka-agente-auth"
+git config commit.gpgsign true
 git commit -S -m "tipo(escopo): descrição curta"
+git verify-commit HEAD
 git log -1 --show-signature --format=fuller
 ```
 
@@ -191,7 +192,7 @@ A PR deve incluir hipótese, red→green, correção, testes, limites, SHA e evi
 
 ## 11. Contrato de validação completo
 
-O executor oficial é `scripts/validate_postmerge.sh`. Ele deve rodar em checkout limpo, com `SHAKA_EXPECTED_HEAD` apontando para o SHA que está sendo validado.
+O executor oficial é `scripts/validate_postmerge.sh`; a CI e esse script são a autoridade sobre os gates realmente executados. Ele deve rodar em checkout limpo, com `SHAKA_EXPECTED_HEAD` apontando para o SHA que está sendo validado.
 
 ```bash
 SHAKA_EXPECTED_HEAD="$(git rev-parse HEAD)" \
@@ -276,6 +277,8 @@ cargo run -p shaka-cli -- --role administrator \
 
 O restore rejeita snapshot SQLite íntegro, porém incompatível com o schema obrigatório do Shaka, antes de copiar os dados. Se falhar, preserve origem, destino e erro; não substitua tabelas manualmente e não apague o banco original.
 
+Na E1, o restore também exige o manifesto sidecar `<snapshot>.db.sha256`. O checksum é verificado antes da integridade SQLite, do schema e da cópia para o destino. Uma divergência deve falhar fechando o procedimento e preservar o banco-alvo. O relatório de validação está em [`docs/E1-CLOSEOUT-VALIDACAO.md`](docs/E1-CLOSEOUT-VALIDACAO.md).
+
 ## 15. Resposta a incidentes
 
 Trate como incidente crítico uma execução externa não autorizada, autopromoção de skill, vazamento de segredo, violação de tenant, corrupção de auditoria, escape do sandbox ou alteração indevida de logs.
@@ -300,14 +303,14 @@ O P0-A a P0-E está encerrado. Os itens BR-01 a BR-06 também estão documentado
 |---|---|
 | Quota física do ambiente | Qual orçamento inclui SQLite, WAL, logs, temporários e outros processos? |
 | Retenção e compactação | O que pode ser removido sem violar auditoria, privacidade ou recuperação? |
-| RPO/RTO | Quanto de perda de dados e tempo de restauração são aceitáveis? |
-| Backup externo | Onde ficam cópias criptografadas e como a restauração será testada? |
+| RPO/RTO | Objetivos aprovados em E1: RPO de 0 a 5 minutos e RTO de até 1 minuto. A medição quantitativa cronometrada ainda é backlog explícito. |
+| Backup externo | E1 implementada e reproduzida em Sandbox e VM: snapshot consistente, checksum, destino isolado, worker híbrido e restore fail-closed. |
 | Observabilidade | Quais métricas e alertas operacionais serão obrigatórios? |
 | Hardening | Qual supervisor, filesystem, permissão, rotação e isolamento serão usados? |
 | Warnings | Quais lotes de documentação reduzem `missing_docs` sem esconder problemas? |
 | Produção pública | Qual threat model autoriza IAM remoto, HTTPS e efeitos externos? |
 
-Cada frente deve ter ADR, hipótese, critérios de aceitação e validação em dois ambientes. Não iniciar várias dessas frentes simultaneamente apenas porque parecem relacionadas.
+Cada frente deve ter ADR, hipótese, critérios de aceitação e validação em dois ambientes. A decisão e o closeout da frente E1 estão registrados em [`docs/ADR-001-E1-RPO-RTO-BACKUP-EXTERNO.md`](docs/ADR-001-E1-RPO-RTO-BACKUP-EXTERNO.md) e [`docs/E1-CLOSEOUT-VALIDACAO.md`](docs/E1-CLOSEOUT-VALIDACAO.md). Não iniciar várias frentes simultaneamente apenas porque parecem relacionadas; aguardar a publicação formal da E1 antes de iniciar E2.
 
 ## 17. Checklist de transferência concluída
 

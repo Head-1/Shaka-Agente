@@ -3,7 +3,10 @@
 //! As transições são append-only e encadeadas por SHA-256; inconsistências ou
 //! fronteiras ambíguas não são convertidas em sucesso automaticamente.
 
-use super::{FinishOutcome, QueueError, QueueStore, TaskRecord, TaskStatus};
+use super::{
+    FinishOutcome, PlanBackupReason, PlanBackupRequest, QueueError, QueueStore, TaskRecord,
+    TaskStatus, sqlite_i64, sqlite_u64,
+};
 use chrono::{DateTime, Utc};
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
@@ -721,7 +724,7 @@ impl QueueStore {
                 "SELECT sequence FROM plan_checkpoints
                  WHERE plan_id = ?1 AND revision = ?2 ORDER BY sequence DESC LIMIT 1",
                 params![checkpoint.plan_id.0.to_string(), checkpoint.revision],
-                |row| row.get::<_, u64>(0),
+                |row| sqlite_u64(row, 0),
             )
             .optional()?;
         if previous.is_some_and(|sequence| checkpoint.sequence <= sequence) {
@@ -732,7 +735,7 @@ impl QueueStore {
                     params![
                         checkpoint.plan_id.0.to_string(),
                         checkpoint.revision,
-                        checkpoint.sequence
+                        sqlite_i64(checkpoint.sequence, "checkpoint.sequence")?
                     ],
                     |row| {
                         Ok((
@@ -769,7 +772,7 @@ impl QueueStore {
             params![
                 checkpoint.plan_id.0.to_string(),
                 checkpoint.revision,
-                checkpoint.sequence,
+                sqlite_i64(checkpoint.sequence, "checkpoint.sequence")?,
                 checkpoint.step_id.as_ref().map(|id| id.0.clone()),
                 checkpoint.phase.as_str(),
                 checkpoint.status.as_str(),
@@ -778,6 +781,14 @@ impl QueueStore {
             ],
         )?;
         transaction.commit()?;
+        self.notify_backup(PlanBackupRequest {
+            tenant_id: tenant_id.clone(),
+            plan_id: checkpoint.plan_id.clone(),
+            revision: checkpoint.revision,
+            sequence: checkpoint.sequence,
+            state_digest: checkpoint.state_digest.clone(),
+            reason: PlanBackupReason::Checkpoint,
+        });
         Ok(())
     }
 
@@ -827,7 +838,7 @@ impl QueueStore {
                 "SELECT sequence, event_hash FROM plan_transitions
                  WHERE plan_id = ?1 AND revision = ?2 ORDER BY sequence DESC LIMIT 1",
                 params![transition.plan_id.0.to_string(), transition.revision],
-                |row| Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?)),
+                |row| Ok((sqlite_u64(row, 0)?, row.get::<_, String>(1)?)),
             )
             .optional()?;
         let expected_sequence = last.as_ref().map_or(1, |row| row.0 + 1);
@@ -841,6 +852,14 @@ impl QueueStore {
         apply_transition_tx(&transaction_db, tenant_id, transition)?;
         insert_transition_tx(&transaction_db, transition)?;
         transaction_db.commit()?;
+        self.notify_backup(PlanBackupRequest {
+            tenant_id: tenant_id.clone(),
+            plan_id: transition.plan_id.clone(),
+            revision: transition.revision,
+            sequence: transition.sequence,
+            state_digest: None,
+            reason: PlanBackupReason::Transition,
+        });
         Ok(())
     }
 
@@ -1443,7 +1462,7 @@ impl QueueStore {
             .query_map(params![plan_id.0.to_string(), revision], |row| {
                 let step_id = row.get::<_, Option<String>>(1)?;
                 Ok((
-                    row.get::<_, u64>(0)?,
+                    sqlite_u64(row, 0)?,
                     step_id,
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
@@ -1569,7 +1588,7 @@ impl QueueStore {
             params![
                 plan_id.0.to_string(),
                 revision,
-                checkpoint_sequence,
+                sqlite_i64(checkpoint_sequence, "checkpoint.sequence")?,
                 state_digest,
                 Utc::now().to_rfc3339()
             ],
@@ -1702,7 +1721,7 @@ impl QueueStore {
                 params![
                     plan_id.0.to_string(),
                     revision,
-                    checkpoint_sequence,
+                    sqlite_i64(checkpoint_sequence, "checkpoint.sequence")?,
                     Utc::now().to_rfc3339(),
                     tenant_id.0
                 ],
@@ -2818,7 +2837,7 @@ fn insert_checkpoint_tx(
         params![
             plan_id.0.to_string(),
             revision,
-            sequence,
+            sqlite_i64(sequence, "checkpoint.sequence")?,
             step_id.map(|id| id.0.clone()),
             phase.as_str(),
             status.as_str(),
@@ -2946,7 +2965,7 @@ fn insert_transition_tx(
             transition.transition_id.to_string(),
             transition.plan_id.0.to_string(),
             transition.revision,
-            transition.sequence,
+            sqlite_i64(transition.sequence, "transition.sequence")?,
             transition.entity.as_str(),
             transition.entity_id.as_ref().map(|id| id.0.clone()),
             serde_json::to_string(transition)?,
@@ -3041,7 +3060,7 @@ fn last_transition_tx(
             "SELECT sequence, event_hash FROM plan_transitions
              WHERE plan_id = ?1 AND revision = ?2 ORDER BY sequence DESC LIMIT 1",
             params![plan_id.0.to_string(), revision],
-            |row| Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?)),
+            |row| Ok((sqlite_u64(row, 0)?, row.get::<_, String>(1)?)),
         )
         .optional()?)
 }
@@ -3056,7 +3075,7 @@ fn next_checkpoint_sequence_tx(
             "SELECT sequence FROM plan_checkpoints
              WHERE plan_id = ?1 AND revision = ?2 ORDER BY sequence DESC LIMIT 1",
             params![plan_id.0.to_string(), revision],
-            |row| row.get::<_, u64>(0),
+            |row| sqlite_u64(row, 0),
         )
         .optional()?;
     Ok(last.map_or(1, |sequence| sequence + 1))
@@ -3186,12 +3205,13 @@ fn safe_error(error: &QueueError) -> String {
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::SubmitOutcome;
+    use crate::{BackupRun, PlanBackupAdapter, PlanBackupSink, SubmitOutcome};
     use chrono::Duration;
     use shaka_core::{
         ExecutionBudget, OperatorId, PlanAction, PlanApprovalRequirement, PlanMode, PlanRisk,
         PlanSpecInput, Role, TaskId,
     };
+    use shaka_memory::MemoryStore;
     use std::{
         sync::{Arc, Barrier, mpsc},
         thread,
@@ -3287,6 +3307,17 @@ mod tests {
         principal
     }
 
+    #[derive(Debug, Default)]
+    struct RecordingBackupSink {
+        requests: std::sync::Mutex<Vec<PlanBackupRequest>>,
+    }
+
+    impl PlanBackupSink for RecordingBackupSink {
+        fn request_backup(&self, request: PlanBackupRequest) {
+            self.requests.lock().unwrap().push(request);
+        }
+    }
+
     fn compensation_plan() -> PlanSpec {
         PlanSpec::new(PlanSpecInput {
             plan_id: PlanId::new(),
@@ -3342,6 +3373,106 @@ mod tests {
             Err(QueueError::NotFound(_))
         ));
         assert_eq!(store.save_plan(&plan).unwrap().plan.digest, plan.digest);
+    }
+
+    #[test]
+    fn plan_engine_emits_backup_request_only_after_new_durable_state() {
+        let sink = Arc::new(RecordingBackupSink::default());
+        let store = QueueStore::in_memory()
+            .unwrap()
+            .with_backup_sink(Arc::clone(&sink) as Arc<dyn PlanBackupSink>);
+        let plan = test_plan();
+        store.save_plan(&plan).unwrap();
+        let created_at = Utc::now();
+        let checkpoint = PlanCheckpoint {
+            plan_id: plan.plan_id.clone(),
+            revision: plan.revision,
+            sequence: 1,
+            step_id: None,
+            phase: PlanCheckpointPhase::BeforeStep,
+            status: PlanCheckpointStatus::Succeeded,
+            state_digest: Some("a".repeat(64)),
+            created_at,
+        };
+
+        store
+            .append_plan_checkpoint(&plan.tenant_id, &checkpoint)
+            .unwrap();
+        store
+            .append_plan_checkpoint(&plan.tenant_id, &checkpoint)
+            .unwrap();
+
+        let transition = PlanStoreTransition::new(
+            plan.plan_id.clone(),
+            plan.revision,
+            1,
+            PlanTransitionEntity::Plan,
+            None,
+            PlanTransitionState::Plan(PlanState::Draft),
+            PlanTransitionState::Plan(PlanState::Proposed),
+            "backup-event-transition",
+            None,
+            created_at,
+        )
+        .unwrap();
+        store
+            .record_plan_transition(&plan.tenant_id, &transition)
+            .unwrap();
+        store
+            .record_plan_transition(&plan.tenant_id, &transition)
+            .unwrap();
+
+        let requests = sink.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].reason, PlanBackupReason::Checkpoint);
+        assert_eq!(requests[0].sequence, 1);
+        assert_eq!(requests[0].state_digest, Some("a".repeat(64)));
+        assert_eq!(requests[1].reason, PlanBackupReason::Transition);
+        assert_eq!(requests[1].sequence, 1);
+        assert_eq!(requests[1].state_digest, None);
+    }
+
+    #[test]
+    fn plan_engine_checkpoint_drives_real_memory_snapshot_through_adapter() {
+        let memory = Arc::new(MemoryStore::in_memory().unwrap());
+        let destination =
+            std::env::temp_dir().join(format!("shaka-e1-3-plan-adapter-{}.db", Uuid::new_v4()));
+        let manifest = destination.with_extension("db.sha256");
+        let now = std::time::Instant::now();
+        let adapter = Arc::new(PlanBackupAdapter::new(
+            Arc::clone(&memory),
+            destination.clone(),
+            now,
+            StdDuration::from_secs(300),
+        ));
+        let store = QueueStore::in_memory()
+            .unwrap()
+            .with_backup_sink(Arc::clone(&adapter) as Arc<dyn PlanBackupSink>);
+        let plan = test_plan();
+        store.save_plan(&plan).unwrap();
+        store
+            .append_plan_checkpoint(
+                &plan.tenant_id,
+                &PlanCheckpoint {
+                    plan_id: plan.plan_id.clone(),
+                    revision: plan.revision,
+                    sequence: 1,
+                    step_id: None,
+                    phase: PlanCheckpointPhase::AfterStep,
+                    status: PlanCheckpointStatus::Succeeded,
+                    state_digest: Some("b".repeat(64)),
+                    created_at: Utc::now(),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(adapter.poll(now).unwrap(), BackupRun::Completed);
+        assert!(destination.exists());
+        assert!(manifest.exists());
+        assert!(MemoryStore::verify_integrity_at(&destination).unwrap());
+
+        let _ = std::fs::remove_file(destination);
+        let _ = std::fs::remove_file(manifest);
     }
 
     #[test]
