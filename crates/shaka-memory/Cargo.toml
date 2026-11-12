@@ -11,6 +11,8 @@ parking_lot.workspace = true
 rusqlite = { workspace = true, features = ["backup"] }
 serde.workspace = true
 serde_json.workspace = true
+hex.workspace = true
+sha2.workspace = true
 shaka-core = { path = "../shaka-core" }
 thiserror.workspace = true
 uuid = { version = "1.11", features = ["v4", "serde"] }

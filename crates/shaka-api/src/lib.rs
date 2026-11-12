@@ -26,10 +26,10 @@ use shaka_observability::{AuditLogger, CorrelationContext, Telemetry};
 use shaka_orchestrator::{AgentRuntime, CancellationToken, OrchestratorError};
 use shaka_queue::{
     AuthSource, AuthenticatedPrincipal, CircuitBreaker, CircuitConfig, CircuitSnapshot,
-    CircuitState, FinishOutcome, LeaseToken, PlanApprovalOutcome, PlanCheckpoint, PlanClaimContext,
-    PlanInspectionIssue, PlanInspectionReport, PlanInspectionStatus, PlanResolutionDecision,
-    PlanResolutionOutcome, PlanTaskReference, QueueError, QueueStore, SessionRecord, SubmitOutcome,
-    TaskRecord, TaskStatus,
+    CircuitState, FinishOutcome, LeaseToken, PlanApprovalOutcome, PlanBackupAdapter,
+    PlanCheckpoint, PlanClaimContext, PlanInspectionIssue, PlanInspectionReport,
+    PlanInspectionStatus, PlanResolutionDecision, PlanResolutionOutcome, PlanTaskReference,
+    QueueError, QueueStore, SessionRecord, SubmitOutcome, TaskRecord, TaskStatus,
 };
 use std::{
     collections::{BTreeMap, HashMap},
@@ -266,6 +266,7 @@ pub struct ApiState {
     cancellations: Arc<parking_lot::Mutex<HashMap<Uuid, CancellationToken>>>,
     shutdown: ShutdownFlag,
     telemetry: Arc<Telemetry>,
+    backup_adapter: Option<Arc<PlanBackupAdapter>>,
 }
 
 impl std::fmt::Debug for ApiState {
@@ -281,6 +282,7 @@ impl std::fmt::Debug for ApiState {
             .field("cancellations", &self.cancellations.lock().len())
             .field("shutdown", &self.shutdown.is_cancelled())
             .field("telemetry", &"Telemetry")
+            .field("backup_enabled", &self.backup_adapter.is_some())
             .finish()
     }
 }
@@ -317,7 +319,15 @@ impl ApiState {
             cancellations: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             shutdown: ShutdownFlag::default(),
             telemetry: Arc::new(Telemetry::default()),
+            backup_adapter: None,
         })
+    }
+
+    /// Anexa a integração de backup ao ciclo de vida residente da API.
+    #[must_use]
+    pub fn with_backup_adapter(mut self, adapter: Arc<PlanBackupAdapter>) -> Self {
+        self.backup_adapter = Some(adapter);
+        self
     }
 
     /// Constrói o roteador com endpoints de sessões, tarefas e Plan Engine.
@@ -1240,7 +1250,13 @@ pub async fn serve(state: ApiState) -> Result<(), ApiError> {
             error!(?error, "não foi possível abrir o listener HTTP");
             ApiError::Internal
         })?;
-    let workers = start_workers(&state).await;
+    let mut workers = start_workers(&state).await;
+    if let Some(adapter) = &state.backup_adapter {
+        workers.push(start_backup_worker(
+            state.shutdown.clone(),
+            Arc::clone(adapter),
+        ));
+    }
     info!(address = %state.config.bind_addr, workers = state.config.worker_count, "API persistente iniciada");
     let server_result = axum::serve(listener, state.router())
         .with_graceful_shutdown(shutdown_signal())
@@ -1250,9 +1266,9 @@ pub async fn serve(state: ApiState) -> Result<(), ApiError> {
     for mut worker in workers {
         match timeout(std::time::Duration::from_secs(5), &mut worker).await {
             Ok(Ok(())) => {}
-            Ok(Err(error)) => warn!(?error, "worker da fila terminou com erro"),
+            Ok(Err(error)) => warn!(?error, "worker residente terminou com erro"),
             Err(_) => {
-                warn!("worker da fila excedeu a janela de shutdown; abortando handle próprio");
+                warn!("worker residente excedeu a janela de shutdown; abortando handle próprio");
                 worker.abort();
                 let _ = worker.await;
             }
@@ -1262,6 +1278,46 @@ pub async fn serve(state: ApiState) -> Result<(), ApiError> {
         error!(?error, "servidor HTTP terminou com erro");
         ApiError::Internal
     })
+}
+
+fn start_backup_worker(
+    shutdown: ShutdownFlag,
+    adapter: Arc<PlanBackupAdapter>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        backup_loop(shutdown, adapter).await;
+    })
+}
+
+async fn backup_loop(shutdown: ShutdownFlag, adapter: Arc<PlanBackupAdapter>) {
+    let probe_interval = std::time::Duration::from_secs(1);
+    loop {
+        if shutdown.is_cancelled() {
+            return;
+        }
+        let poll_adapter = Arc::clone(&adapter);
+        match tokio::task::spawn_blocking(move || poll_adapter.poll(std::time::Instant::now()))
+            .await
+        {
+            Ok(Ok(shaka_memory::BackupRun::Completed)) => {
+                info!("backup externo confirmado pelo worker residente");
+            }
+            Ok(Ok(shaka_memory::BackupRun::AlreadyRunning | shaka_memory::BackupRun::NotDue)) => {}
+            Ok(Err(error)) => {
+                warn!(
+                    ?error,
+                    "backup externo não confirmado; próxima sondagem manterá retry"
+                );
+            }
+            Err(error) => {
+                warn!(
+                    ?error,
+                    "worker de backup terminou uma sondagem com erro de join"
+                );
+            }
+        }
+        sleep(probe_interval).await;
+    }
 }
 
 async fn queue_blocking<T, F>(operation: F) -> Result<T, QueueError>
@@ -1987,6 +2043,7 @@ mod tests {
     use shaka_memory::MemoryStore;
     use shaka_orchestrator::{AgentModel, EchoTool, LocalModel, OutboundMessageTool, ToolRegistry};
     use shaka_orchestrator::{ModelRequest, ModelResponse};
+    use shaka_queue::{PlanBackupReason, PlanBackupRequest, PlanBackupSink};
     use tower::ServiceExt;
 
     fn principal() -> Principal {
@@ -2013,6 +2070,42 @@ mod tests {
             ApiConfig::default(),
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn backup_worker_polls_snapshot_and_stops_on_shutdown() {
+        let memory = Arc::new(MemoryStore::in_memory().unwrap());
+        let destination =
+            std::env::temp_dir().join(format!("shaka-api-backup-worker-{}.db", Uuid::new_v4()));
+        let manifest = destination.with_extension("db.sha256");
+        let adapter = Arc::new(PlanBackupAdapter::new(
+            memory,
+            destination.clone(),
+            std::time::Instant::now(),
+            std::time::Duration::from_secs(300),
+        ));
+        let shutdown = ShutdownFlag::default();
+        let worker = start_backup_worker(shutdown.clone(), Arc::clone(&adapter));
+        adapter.request_backup(PlanBackupRequest {
+            tenant_id: TenantId::new("tenant-worker").unwrap(),
+            plan_id: PlanId::new(),
+            revision: 1,
+            sequence: 1,
+            state_digest: None,
+            reason: PlanBackupReason::Checkpoint,
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+        assert!(destination.exists());
+        assert!(manifest.exists());
+        shutdown.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(2), worker)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let _ = std::fs::remove_file(destination);
+        let _ = std::fs::remove_file(manifest);
     }
 
     #[derive(Debug)]
