@@ -27,10 +27,12 @@ Executar nesta ordem e salvar a saída em arquivos fora do checkout quando for n
 ```bash
 cargo fmt --all -- --check
 cargo check --workspace --locked
-cargo test --workspace --locked
+cargo test --workspace --locked --all-targets
 cargo clippy --workspace --all-targets --locked -- \
   -D warnings -A missing_docs -A clippy::missing_errors_doc
 cargo audit
+# Para a validação integrada, o executor oficial é:
+bash scripts/validate_postmerge.sh
 python3 scripts/secret_scan.py
 python3 scripts/workflow_policy_check.py
 python3 -m unittest discover -s scripts -p 'test_*.py'
@@ -62,11 +64,13 @@ Configurar a assinatura somente no repositório, usando chave privada local ao a
 
 ```bash
 git config gpg.format ssh
-git config user.signingkey "$HOME/.ssh/shaka-agente-signing.pub"
+git config user.signingkey "$HOME/.ssh/shaka-agente-auth"
 git config commit.gpgsign true
 git commit -S -m "tipo(escopo): descrição curta"
 git verify-commit HEAD
 git show -s --format='%H%n%G? %GS %GK%n%s' HEAD
+# Cadastre no GitHub somente a chave pública correspondente como Signing Key;
+# a verificação remota deve retornar verified=true.
 ```
 
 Cadastrar no GitHub apenas a chave pública como Signing Key. Após publicar, comparar SHA local e remoto e confirmar a API/página do commit com `verified: true`. Nunca copiar a chave privada para o segundo ambiente; gerar outra chave e cadastrar sua parte pública.
@@ -80,7 +84,7 @@ git push --set-upstream origin nome-da-branch
 git ls-remote origin refs/heads/nome-da-branch
 ```
 
-Não abrir PR, fazer merge, criar tag ou publicar release sem autorização separada. Se um commit remoto precisar ser substituído por correção de identidade ou assinatura, usar `git push --force-with-lease` e registrar o novo SHA e a razão.
+Não abrir PR, fazer merge, criar tag ou publicar release sem autorização separada. Não use `--admin`, bypass ou force push. Se um commit remoto precisar ser substituído por correção de identidade ou assinatura, pare e registre a razão, o novo SHA e a autorização explícita antes de qualquer operação excepcional.
 
 ## Relatório
 
